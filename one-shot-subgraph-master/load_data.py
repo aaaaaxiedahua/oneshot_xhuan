@@ -31,7 +31,7 @@ class DataLoader(Dataset):
 
         self.n_ent = n_ent
         self.n_rel = n_rel
-        self.filters = defaultdict(lambda:set())
+        self.filters = defaultdict(set)
         self.fact_triple  = self.read_triples('facts.txt')
         self.train_triple = self.read_triples('train.txt')
         self.valid_triple = self.read_triples('valid.txt')
