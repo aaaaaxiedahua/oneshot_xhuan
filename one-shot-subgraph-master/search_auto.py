@@ -26,6 +26,10 @@ HPO_search_space = {
         'decay_rate':            ('uniform', (0.8, 1)),
         'lamb':                  ('uniform', (1e-5, 1e-3)),
         'dropout':               ('uniform', (0, 0.2)),
+
+        # backward sampling
+        'alpha':                 ('uniform', (0, 0.5)),
+        'max_prototypes':        ('choice', [3, 5, 10]),
     }
 
 parser = argparse.ArgumentParser(description="Parser")
@@ -48,6 +52,9 @@ parser.add_argument('--search', action='store_true')
 parser.add_argument('--finetune', action='store_true')
 parser.add_argument('--finetune_config', type=str, default='')
 parser.add_argument('--not_shuffle_train', action='store_true')
+parser.add_argument('--use_backward', action='store_true')
+parser.add_argument('--alpha', type=float, default=0.2)
+parser.add_argument('--max_prototypes', type=int, default=5)
 args = parser.parse_args()
 
 if __name__ == '__main__':
@@ -110,6 +117,17 @@ if __name__ == '__main__':
         
     del fact_homo_edges
         
+    # build backward prototypes
+    if args.use_backward:
+        print(f'==> [Backward] enabled: alpha={args.alpha}, max_prototypes={args.max_prototypes}')
+        print('==> [Backward] building train sampler prototypes...')
+        train_sampler.buildPrototypes(loader.fact_data, args.max_prototypes)
+        print('==> [Backward] building test sampler prototypes...')
+        test_data_for_proto = loader.double_triple(loader.all_triple)
+        test_sampler.buildPrototypes(test_data_for_proto, args.max_prototypes)
+    else:
+        print('==> [Backward] disabled')
+
     # add sampler to the data loaders
     loader.addSampler(train_sampler)
     val_loader.addSampler(test_sampler)
@@ -142,7 +160,13 @@ if __name__ == '__main__':
         args.concatHidden = params['concatHidden']
         args.shortcut = params['shortcut']
         args.readout = params['readout']
-        
+        if args.use_backward:
+            args.alpha = params['alpha']
+            args.max_prototypes = int(params['max_prototypes'])
+            train_sampler.buildPrototypes(loader.fact_data, args.max_prototypes)
+            test_data_for_proto = loader.double_triple(loader.all_triple)
+            test_sampler.buildPrototypes(test_data_for_proto, args.max_prototypes)
+
         # build model
         model = BaseModel(args, loaders=(loader, val_loader, test_loader), samplers=(train_sampler, test_sampler))
         

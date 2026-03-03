@@ -25,6 +25,9 @@ parser.add_argument('--add_manual_edges', action='store_true')
 parser.add_argument('--remove_1hop_edges', action='store_true')
 parser.add_argument('--only_eval', action='store_true')
 parser.add_argument('--not_shuffle_train', action='store_true')
+parser.add_argument('--use_backward', action='store_true')
+parser.add_argument('--alpha', type=float, default=0.2)
+parser.add_argument('--max_prototypes', type=int, default=5)
 args = parser.parse_args()
 
 class Options(object):
@@ -88,6 +91,17 @@ if __name__ == '__main__':
         
     del fact_homo_edges
         
+    # build backward prototypes
+    if args.use_backward:
+        print(f'==> [Backward] enabled: alpha={args.alpha}, max_prototypes={args.max_prototypes}')
+        print('==> [Backward] building train sampler prototypes...')
+        train_sampler.buildPrototypes(loader.fact_data, args.max_prototypes)
+        print('==> [Backward] building test sampler prototypes...')
+        test_data_for_proto = loader.double_triple(loader.all_triple)
+        test_sampler.buildPrototypes(test_data_for_proto, args.max_prototypes)
+    else:
+        print('==> [Backward] disabled')
+
     # add sampler to the data loaders
     loader.addSampler(train_sampler)
     val_loader.addSampler(test_sampler)

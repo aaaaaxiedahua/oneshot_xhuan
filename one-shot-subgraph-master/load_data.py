@@ -88,7 +88,7 @@ class DataLoader(Dataset):
             obj[answer[idx]] = 1
                     
         # subgraph sampling
-        subgraph = self.getOneSubgraph(int(sub))
+        subgraph = self.getOneSubgraph(int(sub), int(rel))
         return sub, rel, obj, subgraph
         
     def collate_fn(self, data):

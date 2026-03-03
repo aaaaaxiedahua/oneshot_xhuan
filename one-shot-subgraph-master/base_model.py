@@ -109,6 +109,8 @@ class BaseModel(object):
             self.loader.shuffle_train()
             fact_data = np.concatenate([np.array(self.loader.fact_data), self.loader.idd_data], 0)
             self.train_sampler.updateEdges(fact_data)
+            if self.args.use_backward:
+                self.train_sampler.updatePrototypes(self.loader.fact_data)
         
         return valid_mrr, out_str
     

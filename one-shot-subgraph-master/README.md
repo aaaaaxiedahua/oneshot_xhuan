@@ -133,3 +133,11 @@ We also recommend these paper for reference.
 - ``ACL 2022`` KGTuner: Efficient Hyper-parameter Search for Knowledge Graph Learning. [[paper]](https://arxiv.org/pdf/2205.02460.pdf) [[code]](https://github.com/LARS-research/KGTuner)
 - ``WebConf 2022`` Knowledge Graph Reasoning with Relational Digraph. [[paper]](https://arxiv.org/pdf/2108.06040.pdf) [[code]](https://github.com/LARS-research/RED-GNN)
 
+# WN18RR
+python search_auto.py --data_path data/WN18RR/ --search --use_backward --gpu 0 --topk 0.1 --batchsize 16 --epoch 200                           
+                                                                          
+# nell                                                                  
+python search_auto.py --data_path data/nell/ --search --use_backward --gpu 0 --topk 0.1 --batchsize 16 --epoch 200                           
+                                                            
+# YAGO
+python search_auto.py --data_path data/YAGO/ --search --use_backward --gpu 0 --topk 0.1 --batchsize 16 --epoch 200

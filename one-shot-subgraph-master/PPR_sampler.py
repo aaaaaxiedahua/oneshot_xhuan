@@ -9,7 +9,7 @@ import logging
 import copy
 from tqdm import tqdm
 from scipy.sparse import csr_matrix, coo_matrix
-from collections import defaultdict
+from collections import defaultdict, Counter
 
 def checkPath(path):
     if not os.path.exists(path):
@@ -78,6 +78,28 @@ class pprSampler():
         heads, edges = [h for (h,r,t) in edge_index], list(range(len(edge_index)))
         self.sparseTrainMatrix = csr_matrix((edges, (heads, edges)), shape=(self.n_ent, len(edge_index)))
         self.edge_index = torch.LongTensor(edge_index)
+
+    def buildPrototypes(self, fact_data, max_prototypes):
+        """统计 fact_data 中每个关系的高频尾实体作为种子"""
+        self.max_prototypes = max_prototypes
+        rel_tails = defaultdict(list)
+        for h, r, t in fact_data:
+            rel_tails[int(r)].append(int(t))
+        self.prototypes = {}
+        n_empty = 0
+        for r in range(2 * self.n_rel + 1):
+            counter = Counter(rel_tails.get(r, []))
+            self.prototypes[r] = [ent for ent, _ in counter.most_common(max_prototypes)]
+            if len(self.prototypes[r]) == 0:
+                n_empty += 1
+        n_total = 2 * self.n_rel + 1
+        print(f'==> [Backward] built prototypes: max_prototypes={max_prototypes}, '
+              f'relations={n_total}, empty={n_empty}, covered={n_total - n_empty}')
+
+    def updatePrototypes(self, fact_data):
+        """shuffle_train 后重新统计种子"""
+        print('==> [Backward] updating prototypes after shuffle...')
+        self.buildPrototypes(fact_data, self.max_prototypes)
     
     def getPPRscores(self, ent):
         ent_ppr_savePath = os.path.join(self.ppr_savePath, f'{int(ent)}.pkl')
@@ -108,9 +130,20 @@ class pprSampler():
         graph.add_edges_from(edges)
         return graph
     
-    def sampleSubgraph(self, ent: int, cand=None):    
+    def sampleSubgraph(self, ent: int, rel: int = -1, cand=None):
         # sample subgraph to get the edges
         ppr_scores = np.array(list(self.getPPRscores(ent).values()))
+
+        # backward fusion
+        if self.args.use_backward and rel >= 0 and hasattr(self, 'prototypes'):
+            seeds = self.prototypes.get(rel, [])
+            if len(seeds) > 0:
+                backward_scores = np.zeros(self.n_ent)
+                for seed in seeds:
+                    seed_ppr = np.array(list(self.getPPRscores(seed).values()))
+                    backward_scores += seed_ppr
+                backward_scores /= len(seeds)
+                ppr_scores = ppr_scores + self.args.alpha * backward_scores
         
         # gurantee the candidates are sampled
         if cand != None and self.topk < self.n_ent:
@@ -168,8 +201,8 @@ class pprSampler():
         
         return topk_nodes, node_index, sampled_edges
 
-    def getOneSubgraph(self, head: int, cand=None):
-        topk_nodes, node_index, sampled_edges = self.sampleSubgraph(head, cand) 
+    def getOneSubgraph(self, head: int, rel: int = -1, cand=None):
+        topk_nodes, node_index, sampled_edges = self.sampleSubgraph(head, rel, cand)
         return [head, topk_nodes, node_index, sampled_edges]
         
     def getBatchSubgraph(self, subgraph_list: list):  
