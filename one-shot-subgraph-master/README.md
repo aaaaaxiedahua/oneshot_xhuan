@@ -141,3 +141,9 @@ python search_auto.py --data_path data/nell/ --search --use_backward --gpu 0 --t
                                                             
 # YAGO
 python search_auto.py --data_path data/YAGO/ --search --use_backward --gpu 0 --topk 0.1 --batchsize 16 --epoch 200
+
+# 默认：随机选参数开始搜索                                    
+python search_auto.py --data_path data/WN18RR/ --search --use_backward
+                                                                          
+# 加开关：第一组用已知最优参数，后面继续搜索
+python search_auto.py --data_path data/WN18RR/ --search --use_backward --use_best_start 

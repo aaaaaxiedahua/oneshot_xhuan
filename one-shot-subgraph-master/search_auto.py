@@ -52,6 +52,7 @@ parser.add_argument('--search', action='store_true')
 parser.add_argument('--finetune', action='store_true')
 parser.add_argument('--finetune_config', type=str, default='')
 parser.add_argument('--not_shuffle_train', action='store_true')
+parser.add_argument('--use_best_start', action='store_true')
 parser.add_argument('--use_backward', action='store_true')
 parser.add_argument('--alpha', type=float, default=0.2)
 parser.add_argument('--max_prototypes', type=int, default=5)
@@ -214,18 +215,26 @@ if __name__ == '__main__':
             
         return best_mrr
 
+    # known best configs per dataset (as start candidates)
+    best_configs = {
+        'WN18RR': {'lr': 0.0001, 'hidden_dim': 256, 'attn_dim': 8, 'n_layer': 8, 'act': 'idd', 'initializer': 'relation', 'concatHidden': False, 'shortcut': True, 'readout': 'multiply', 'decay_rate': 0.8662400068095666, 'lamb': 0.00039154537550520227, 'dropout': 0.004323645605227445, 'alpha': 0.2, 'max_prototypes': 5},
+        'nell': {'lr': 0.0011, 'hidden_dim': 128, 'attn_dim': 64, 'n_layer': 8, 'act': 'relu', 'initializer': 'relation', 'concatHidden': False, 'shortcut': False, 'readout': 'linear', 'decay_rate': 0.9938, 'lamb': 0.000089, 'dropout': 0.0193, 'alpha': 0.2, 'max_prototypes': 5},
+        'YAGO': {'lr': 0.001, 'hidden_dim': 64, 'attn_dim': 2, 'n_layer': 8, 'act': 'relu', 'initializer': 'binary', 'concatHidden': True, 'shortcut': False, 'readout': 'linear', 'decay_rate': 0.9429713470775948, 'lamb': 0.000946516892415447, 'dropout': 0.19456805575101324, 'alpha': 0.2, 'max_prototypes': 5},
+    }
+
     # standard HPO pipeline
     if args.search:
         print('==> HPO search mode')
         HPO_instance = RF_HPO(kgeModelName='redgnn', obj_function=run_model, dataset_name=args.dataset, HP_info=HPO_search_space, acq='EI')
-        
+
         if args.useSearchLog and os.path.exists(HPO_save_path):
             config_list, mrr_list = loadSearchLog(HPO_save_path)
             dataset_names = [args.dataset for i in range(len(config_list))]
             HPO_instance.pretrain(config_list, mrr_list, dataset_names=dataset_names)
-        
+
+        start_candidate = [best_configs[dataset]] if args.use_best_start and dataset in best_configs else None
         max_trials, sample_num = 1e10, 1e4
-        HPO_instance.runTrials(max_trials, sample_num, explore_trials=1e10)
+        HPO_instance.runTrials(max_trials, sample_num, explore_trials=1e10, start_candidate=start_candidate)
         
     elif args.finetune:
         print('==> HPO finetune mode')
