@@ -17,7 +17,11 @@ class BaseModel(object):
         self.args = args
         loader, val_loader, test_loader = loaders
         self.loader = loader
-        self.model = GNN_auto(args, loader)
+        if getattr(args, 'edge_centric', False):
+            self.model = EdgeGNN(args, loader)
+            print('==> [EdgeGNN] using edge-centric message passing')
+        else:
+            self.model = GNN_auto(args, loader)
         self.model.cuda()
         self.n_ent = loader.n_ent
         self.n_samp_ent = args.n_samp_ent

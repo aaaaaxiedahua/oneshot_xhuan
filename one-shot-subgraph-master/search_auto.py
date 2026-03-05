@@ -56,6 +56,7 @@ parser.add_argument('--use_best_start', action='store_true')
 parser.add_argument('--use_backward', action='store_true')
 parser.add_argument('--alpha', type=float, default=0.2)
 parser.add_argument('--max_prototypes', type=int, default=5)
+parser.add_argument('--edge_centric', action='store_true')
 args = parser.parse_args()
 
 if __name__ == '__main__':
@@ -220,6 +221,8 @@ if __name__ == '__main__':
         'WN18RR': {'lr': 0.0001, 'hidden_dim': 256, 'attn_dim': 8, 'n_layer': 8, 'act': 'idd', 'initializer': 'relation', 'concatHidden': False, 'shortcut': True, 'readout': 'multiply', 'decay_rate': 0.8662400068095666, 'lamb': 0.00039154537550520227, 'dropout': 0.004323645605227445, 'alpha': 0.2, 'max_prototypes': 5},
         'nell': {'lr': 0.0011, 'hidden_dim': 128, 'attn_dim': 64, 'n_layer': 8, 'act': 'relu', 'initializer': 'relation', 'concatHidden': False, 'shortcut': False, 'readout': 'linear', 'decay_rate': 0.9938, 'lamb': 0.000089, 'dropout': 0.0193, 'alpha': 0.2, 'max_prototypes': 5},
         'YAGO': {'lr': 0.001, 'hidden_dim': 64, 'attn_dim': 2, 'n_layer': 8, 'act': 'relu', 'initializer': 'binary', 'concatHidden': True, 'shortcut': False, 'readout': 'linear', 'decay_rate': 0.9429713470775948, 'lamb': 0.000946516892415447, 'dropout': 0.19456805575101324, 'alpha': 0.2, 'max_prototypes': 5},
+        'family': {'lr': 0.001, 'hidden_dim': 128, 'attn_dim': 8, 'n_layer': 6, 'act': 'relu', 'initializer': 'relation', 'concatHidden': False, 'shortcut': True, 'readout': 'multiply', 'decay_rate': 0.95, 'lamb': 0.0001, 'dropout': 0.05, 'alpha': 0.2, 'max_prototypes': 5},
+        'umls': {'lr': 0.001, 'hidden_dim': 128, 'attn_dim': 8, 'n_layer': 6, 'act': 'relu', 'initializer': 'relation', 'concatHidden': False, 'shortcut': True, 'readout': 'multiply', 'decay_rate': 0.95, 'lamb': 0.0001, 'dropout': 0.05, 'alpha': 0.2, 'max_prototypes': 5},
     }
 
     # standard HPO pipeline

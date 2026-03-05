@@ -147,3 +147,27 @@ python search_auto.py --data_path data/WN18RR/ --search --use_backward
                                                                           
 # 加开关：第一组用已知最优参数，后面继续搜索
 python search_auto.py --data_path data/WN18RR/ --search --use_backward --use_best_start 
+
+
+# family（topk=0.5）                                          
+python train_auto.py --data_path data/family/ --topk 0.5 --use_backward --alpha 0.2 --max_prototypes 5                                          
+  
+# umls（topk=0.5）                                                      
+python train_auto.py --data_path data/umls/ --topk 0.5 --use_backward --alpha 0.2 --max_prototypes 5     
+
+# 搜索模式
+python search_auto.py --data_path data/family/ --search --use_backward --topk 0.5
+
+python search_auto.py --data_path data/umls/ --search --use_backward --topk 0.5
+
+
+# 原模型（不加 --edge_centric 就是原来的节点中心 GNN）
+python3 train_auto.py --data_path ./data/WN18RR/ --gpu 0 --topk 0.1 --batchsize 16
+
+# 边中心 GNN
+python3 train_auto.py --data_path ./data/WN18RR/ --gpu 0 --topk 0.1 --batchsize 16 --edge_centric
+
+# 边中心 + 后向采样
+python3 train_auto.py --data_path ./data/WN18RR/ --gpu 0 --topk 0.1 --batchsize 16 --edge_centric --use_backward
+
+加 --edge_centric 就启用边中心消息传递，不加就是原来的节点中心GNN，互不影响。

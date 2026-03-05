@@ -28,6 +28,7 @@ parser.add_argument('--not_shuffle_train', action='store_true')
 parser.add_argument('--use_backward', action='store_true')
 parser.add_argument('--alpha', type=float, default=0.2)
 parser.add_argument('--max_prototypes', type=int, default=5)
+parser.add_argument('--edge_centric', action='store_true')
 args = parser.parse_args()
 
 class Options(object):
@@ -177,8 +178,12 @@ if __name__ == '__main__':
         # [VALID] MRR:0.5051 H@1:0.4355 H@10:0.6133        [TEST] MRR:0.5472 H@1:0.4847 H@10:0.6508
         params = {'lr': 0.0011, 'hidden_dim': 128, 'attn_dim': 64, 'n_layer': 8, 'act': 'relu', 'initializer': 'relation', 'concatHidden': False, 'shortcut': False, 'readout': 'linear', 'decay_rate': 0.9938, 'lamb': 0.000089, 'dropout': 0.0193}
     elif dataset == 'YAGO':
-        # [VALID] MRR:0.6117 H@1:0.5477 H@10:0.7273        [TEST] MRR:0.6064 H@1:0.5403 H@10:0.7218 
+        # [VALID] MRR:0.6117 H@1:0.5477 H@10:0.7273        [TEST] MRR:0.6064 H@1:0.5403 H@10:0.7218
         params = {'lr': 0.001, 'hidden_dim': 64, 'attn_dim': 2, 'n_layer': 8, 'act': 'relu', 'initializer': 'binary', 'concatHidden': True, 'shortcut': False, 'readout': 'linear', 'decay_rate': 0.9429713470775948, 'lamb': 0.000946516892415447, 'dropout': 0.19456805575101324}
+    elif dataset == 'family':
+        params = {'lr': 0.001, 'hidden_dim': 128, 'attn_dim': 8, 'n_layer': 6, 'act': 'relu', 'initializer': 'relation', 'concatHidden': False, 'shortcut': True, 'readout': 'multiply', 'decay_rate': 0.95, 'lamb': 0.0001, 'dropout': 0.05}
+    elif dataset == 'umls':
+        params = {'lr': 0.001, 'hidden_dim': 128, 'attn_dim': 8, 'n_layer': 6, 'act': 'relu', 'initializer': 'relation', 'concatHidden': False, 'shortcut': True, 'readout': 'multiply', 'decay_rate': 0.95, 'lamb': 0.0001, 'dropout': 0.05}
     else:
         exit()
         
