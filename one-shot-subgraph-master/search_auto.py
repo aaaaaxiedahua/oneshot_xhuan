@@ -171,7 +171,12 @@ if __name__ == '__main__':
 
         # build model
         model = BaseModel(args, loaders=(loader, val_loader, test_loader), samplers=(train_sampler, test_sampler))
-        
+
+        # load pretrained weight (only for first trial)
+        if args.weight != '':
+            model.loadModel(args.weight)
+            args.weight = ''
+
         # training
         best_mrr, best_test_mrr, bearing = 0, 0, 0
         for epoch in range(args.epoch):
