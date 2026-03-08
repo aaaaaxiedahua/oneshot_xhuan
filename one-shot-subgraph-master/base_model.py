@@ -17,11 +17,7 @@ class BaseModel(object):
         self.args = args
         loader, val_loader, test_loader = loaders
         self.loader = loader
-        if getattr(args, 'edge_centric', False):
-            self.model = EdgeGNN(args, loader)
-            print('==> [EdgeGNN] using edge-centric message passing')
-        else:
-            self.model = GNN_auto(args, loader)
+        self.model = GNN_auto(args, loader)
         self.model.cuda()
         self.n_ent = loader.n_ent
         self.n_samp_ent = args.n_samp_ent
@@ -113,9 +109,13 @@ class BaseModel(object):
             self.loader.shuffle_train()
             fact_data = np.concatenate([np.array(self.loader.fact_data), self.loader.idd_data], 0)
             self.train_sampler.updateEdges(fact_data)
-            if self.args.use_backward:
-                self.train_sampler.updatePrototypes(self.loader.fact_data)
-        
+            # ========== Module 1: Update relation prior after shuffle ==========
+            # Re-build P(v|r) from the new fact partition since shuffle_train
+            # re-partitions edges between fact_data and train_data each epoch
+            if hasattr(self.args, 'use_rel_prior') and self.args.use_rel_prior:
+                self.train_sampler.updateRelationPrior(fact_data)
+            # ========== End Module 1 ==========
+
         return valid_mrr, out_str
     
     @torch.no_grad()

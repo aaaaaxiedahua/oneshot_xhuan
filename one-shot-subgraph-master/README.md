@@ -134,40 +134,41 @@ We also recommend these paper for reference.
 - ``WebConf 2022`` Knowledge Graph Reasoning with Relational Digraph. [[paper]](https://arxiv.org/pdf/2108.06040.pdf) [[code]](https://github.com/LARS-research/RED-GNN)
 
 # WN18RR
-python search_auto.py --data_path data/WN18RR/ --search --use_backward --gpu 0 --topk 0.1 --batchsize 16 --epoch 200                           
-                                                                          
-# nell                                                                  
-python search_auto.py --data_path data/nell/ --search --use_backward --gpu 0 --topk 0.1 --batchsize 16 --epoch 200                           
-                                                            
+python search_auto.py --data_path data/WN18RR/ --search --gpu 0 --topk 0.1 --batchsize 16 --epoch 200
+
+# nell
+python search_auto.py --data_path data/nell/ --search --gpu 0 --topk 0.1 --batchsize 16 --epoch 200
+
 # YAGO
-python search_auto.py --data_path data/YAGO/ --search --use_backward --gpu 0 --topk 0.1 --batchsize 16 --epoch 200
+python search_auto.py --data_path data/YAGO/ --search --gpu 0 --topk 0.1 --batchsize 16 --epoch 200
 
-# 默认：随机选参数开始搜索                                    
-python search_auto.py --data_path data/WN18RR/ --search --use_backward
-                                                                          
-# 加开关：第一组用已知最优参数，后面继续搜索
-python search_auto.py --data_path data/WN18RR/ --search --use_backward --use_best_start 
+# family（topk=0.5）
+python train_auto.py --data_path data/family/ --topk 0.5
 
-
-# family（topk=0.5）                                          
-python train_auto.py --data_path data/family/ --topk 0.5 --use_backward --alpha 0.2 --max_prototypes 5                                          
-  
-# umls（topk=0.5）                                                      
-python train_auto.py --data_path data/umls/ --topk 0.5 --use_backward --alpha 0.2 --max_prototypes 5     
+# umls（topk=0.5）
+python train_auto.py --data_path data/umls/ --topk 0.5
 
 # 搜索模式
-python search_auto.py --data_path data/family/ --search --use_backward --topk 0.5
+python search_auto.py --data_path data/family/ --search --topk 0.5
+python search_auto.py --data_path data/umls/ --search --topk 0.5
 
-python search_auto.py --data_path data/umls/ --search --use_backward --topk 0.5
+## New Modules
 
+### Module 1: Relation-Aware Sampling
+Fuses learned relation prior P(v|r) with PPR scores to make subgraph extraction query-relation-aware.
+```
+# Enable with --use_rel_prior, adjust fusion weight with --rel_prior_lambda
+python train_auto.py --data_path data/family/ --topk 0.5 --use_rel_prior --rel_prior_lambda 0.5
+```
 
-# 原模型（不加 --edge_centric 就是原来的节点中心 GNN）
-python3 train_auto.py --data_path ./data/WN18RR/ --gpu 0 --topk 0.1 --batchsize 16
+### Module 2: Relation Composition Augmentation (RCA)
+Learns relation composition patterns from 2-hop paths and adds weighted virtual edges to address graph incompleteness.
+```
+# Enable with --use_rca, adjust compose_dim and max_virtual
+python train_auto.py --data_path data/family/ --topk 0.5 --use_rca --compose_dim 32 --max_virtual 50
+```
 
-# 边中心 GNN
-python3 train_auto.py --data_path ./data/WN18RR/ --gpu 0 --topk 0.1 --batchsize 16 --edge_centric
-
-# 边中心 + 后向采样
-python3 train_auto.py --data_path ./data/WN18RR/ --gpu 0 --topk 0.1 --batchsize 16 --edge_centric --use_backward
-
-加 --edge_centric 就启用边中心消息传递，不加就是原来的节点中心GNN，互不影响。
+### Both Modules Together
+```
+python train_auto.py --data_path data/family/ --topk 0.5 --use_rel_prior --rel_prior_lambda 0.5 --use_rca --compose_dim 32 --max_virtual 50
+```

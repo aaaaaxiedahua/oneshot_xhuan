@@ -12,7 +12,7 @@ from PPR_sampler import pprSampler
 
 HPO_search_space = {
         # discrete
-        'lr':                    ('choice', [1e-2, 1e-3, 1e-4, 1e-5, 1e-6]), 
+        'lr':                    ('choice', [0.1, 1e-2, 1e-3, 1e-4, 1e-5, 1e-6]),
         'hidden_dim':            ('choice', [16, 32, 48, 64, 128, 256]),
         'attn_dim':              ('choice', [2, 4, 8, 16, 32, 64]),
         'n_layer':               ('choice', [4, 6, 8, 10]),
@@ -21,15 +21,28 @@ HPO_search_space = {
         'concatHidden':          ('choice', [True, False]),
         'shortcut':              ('choice', [True, False]),
         'readout':               ('choice', ['linear', 'multiply']),
-        
-        # continuous
-        'decay_rate':            ('uniform', (0.8, 1)),
-        'lamb':                  ('uniform', (1e-5, 1e-3)),
-        'dropout':               ('uniform', (0, 0.2)),
 
-        # backward sampling
-        'alpha':                 ('uniform', (0, 0.5)),
-        'max_prototypes':        ('choice', [3, 5, 10]),
+        # continuous
+        'decay_rate':            ('uniform', (0.0, 0.9)),
+        'lamb':                  ('choice', [0.0, 0.5, 0.05, 0.0005, 0.005, 0.1, 0.0001]),
+        'dropout':               ('uniform', (0, 0.9)),
+    }
+
+# ========== Module 1: Relation-Aware Sampling search space ==========
+HPO_search_space_M1 = {
+        'rel_prior_lambda':      ('uniform', (0.1, 1.0)),
+        'prior_temperature':     ('uniform', (0.5, 2.0)),
+        'fusion_mode':           ('choice', ['add', 'multiply']),
+    }
+
+# ========== Module 2: Relation Composition Augmentation search space ==========
+HPO_search_space_M2 = {
+        'compose_dim':           ('choice', [16, 32, 64, 128]),
+        'max_virtual':           ('choice', [20, 50, 100, 200]),
+        'compose_aware':         ('choice', [True, False]),
+        'rca_dropout':           ('uniform', (0, 0.9)),
+        'rca_mode':              ('choice', ['shared', 'per_layer']),
+        'compose_max_hop':       ('choice', [2, 3]),
     }
 
 parser = argparse.ArgumentParser(description="Parser")
@@ -52,11 +65,19 @@ parser.add_argument('--search', action='store_true')
 parser.add_argument('--finetune', action='store_true')
 parser.add_argument('--finetune_config', type=str, default='')
 parser.add_argument('--not_shuffle_train', action='store_true')
-parser.add_argument('--use_best_start', action='store_true')
-parser.add_argument('--use_backward', action='store_true')
-parser.add_argument('--alpha', type=float, default=0.2)
-parser.add_argument('--max_prototypes', type=int, default=5)
-parser.add_argument('--edge_centric', action='store_true')
+# ========== Module 1: Relation-Aware Sampling args ==========
+parser.add_argument('--use_rel_prior', action='store_true')         # enable relation prior fusion
+parser.add_argument('--rel_prior_lambda', type=float, default=0.5)  # weight for P(v|r) in fusion
+parser.add_argument('--prior_temperature', type=float, default=1.0) # temperature for P(v|r): <1 sharper, >1 flatter
+parser.add_argument('--fusion_mode', type=str, default='add')       # fusion: add / multiply
+# ========== Module 2: Relation Composition Augmentation args ==========
+parser.add_argument('--use_rca', action='store_true')               # enable RCA virtual edges
+parser.add_argument('--compose_dim', type=int, default=32)          # embedding dim for composition
+parser.add_argument('--max_virtual', type=int, default=50)          # max virtual edges per subgraph
+parser.add_argument('--compose_aware', action='store_true')         # composition-aware virtual edge embedding
+parser.add_argument('--rca_dropout', type=float, default=0.1)       # dropout in composition scorer
+parser.add_argument('--rca_mode', type=str, default='shared')       # shared / per_layer
+parser.add_argument('--compose_max_hop', type=int, default=2)       # max composition hops: 2 or 3
 args = parser.parse_args()
 
 if __name__ == '__main__':
@@ -91,6 +112,14 @@ if __name__ == '__main__':
     
     assert args.search or args.finetune
 
+    # conditionally extend search space based on enabled modules
+    if args.use_rel_prior:
+        HPO_search_space.update(HPO_search_space_M1)
+        print('==> HPO: added Module 1 (Relation-Aware Sampling) search space')
+    if args.use_rca:
+        HPO_search_space.update(HPO_search_space_M2)
+        print('==> HPO: added Module 2 (RCA) search space')
+
     with open(args.perf_file, 'a+') as f:
         f.write(str(args))
     
@@ -118,17 +147,6 @@ if __name__ == '__main__':
         fact_homo_edges, fact_data, args.data_path, split='train', args=args)
         
     del fact_homo_edges
-        
-    # build backward prototypes
-    if args.use_backward:
-        print(f'==> [Backward] enabled: alpha={args.alpha}, max_prototypes={args.max_prototypes}')
-        print('==> [Backward] building train sampler prototypes...')
-        train_sampler.buildPrototypes(loader.fact_data, args.max_prototypes)
-        print('==> [Backward] building test sampler prototypes...')
-        test_data_for_proto = loader.double_triple(loader.all_triple)
-        test_sampler.buildPrototypes(test_data_for_proto, args.max_prototypes)
-    else:
-        print('==> [Backward] disabled')
 
     # add sampler to the data loaders
     loader.addSampler(train_sampler)
@@ -162,12 +180,21 @@ if __name__ == '__main__':
         args.concatHidden = params['concatHidden']
         args.shortcut = params['shortcut']
         args.readout = params['readout']
-        if args.use_backward:
-            args.alpha = params['alpha']
-            args.max_prototypes = int(params['max_prototypes'])
-            train_sampler.buildPrototypes(loader.fact_data, args.max_prototypes)
-            test_data_for_proto = loader.double_triple(loader.all_triple)
-            test_sampler.buildPrototypes(test_data_for_proto, args.max_prototypes)
+
+        # Module 1: Relation-Aware Sampling params
+        if args.use_rel_prior:
+            args.rel_prior_lambda = params['rel_prior_lambda']
+            args.prior_temperature = params['prior_temperature']
+            args.fusion_mode = params['fusion_mode']
+
+        # Module 2: RCA params
+        if args.use_rca:
+            args.compose_dim = int(params['compose_dim'])
+            args.max_virtual = int(params['max_virtual'])
+            args.compose_aware = params['compose_aware']
+            args.rca_dropout = params['rca_dropout']
+            args.rca_mode = params['rca_mode']
+            args.compose_max_hop = int(params['compose_max_hop'])
 
         # build model
         model = BaseModel(args, loaders=(loader, val_loader, test_loader), samplers=(train_sampler, test_sampler))
@@ -221,18 +248,9 @@ if __name__ == '__main__':
             
         return best_mrr
 
-    # known best configs per dataset (as start candidates)
-    best_configs = {
-        'WN18RR': {'lr': 0.0001, 'hidden_dim': 256, 'attn_dim': 8, 'n_layer': 8, 'act': 'idd', 'initializer': 'relation', 'concatHidden': False, 'shortcut': True, 'readout': 'multiply', 'decay_rate': 0.8662400068095666, 'lamb': 0.00039154537550520227, 'dropout': 0.004323645605227445, 'alpha': 0.2, 'max_prototypes': 5},
-        'nell': {'lr': 0.0011, 'hidden_dim': 128, 'attn_dim': 64, 'n_layer': 8, 'act': 'relu', 'initializer': 'relation', 'concatHidden': False, 'shortcut': False, 'readout': 'linear', 'decay_rate': 0.9938, 'lamb': 0.000089, 'dropout': 0.0193, 'alpha': 0.2, 'max_prototypes': 5},
-        'YAGO': {'lr': 0.001, 'hidden_dim': 64, 'attn_dim': 2, 'n_layer': 8, 'act': 'relu', 'initializer': 'binary', 'concatHidden': True, 'shortcut': False, 'readout': 'linear', 'decay_rate': 0.9429713470775948, 'lamb': 0.000946516892415447, 'dropout': 0.19456805575101324, 'alpha': 0.2, 'max_prototypes': 5},
-        'family': {'lr': 0.001, 'hidden_dim': 128, 'attn_dim': 8, 'n_layer': 6, 'act': 'relu', 'initializer': 'relation', 'concatHidden': False, 'shortcut': True, 'readout': 'multiply', 'decay_rate': 0.95, 'lamb': 0.0001, 'dropout': 0.05, 'alpha': 0.2, 'max_prototypes': 5},
-        'umls': {'lr': 0.001, 'hidden_dim': 128, 'attn_dim': 8, 'n_layer': 6, 'act': 'relu', 'initializer': 'relation', 'concatHidden': False, 'shortcut': True, 'readout': 'multiply', 'decay_rate': 0.95, 'lamb': 0.0001, 'dropout': 0.05, 'alpha': 0.2, 'max_prototypes': 5},
-    }
-
-    # standard HPO pipeline
+    # standard HPO pipeline (no best_configs start, random exploration for new model)
     if args.search:
-        print('==> HPO search mode')
+        print('==> HPO search mode (random start)')
         HPO_instance = RF_HPO(kgeModelName='redgnn', obj_function=run_model, dataset_name=args.dataset, HP_info=HPO_search_space, acq='EI')
 
         if args.useSearchLog and os.path.exists(HPO_save_path):
@@ -240,9 +258,8 @@ if __name__ == '__main__':
             dataset_names = [args.dataset for i in range(len(config_list))]
             HPO_instance.pretrain(config_list, mrr_list, dataset_names=dataset_names)
 
-        start_candidate = [best_configs[dataset]] if args.use_best_start and dataset in best_configs else None
         max_trials, sample_num = 1e10, 1e4
-        HPO_instance.runTrials(max_trials, sample_num, explore_trials=1e10, start_candidate=start_candidate)
+        HPO_instance.runTrials(max_trials, sample_num, explore_trials=1e10, start_candidate=None)
         
     elif args.finetune:
         print('==> HPO finetune mode')

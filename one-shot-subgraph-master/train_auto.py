@@ -25,10 +25,19 @@ parser.add_argument('--add_manual_edges', action='store_true')
 parser.add_argument('--remove_1hop_edges', action='store_true')
 parser.add_argument('--only_eval', action='store_true')
 parser.add_argument('--not_shuffle_train', action='store_true')
-parser.add_argument('--use_backward', action='store_true')
-parser.add_argument('--alpha', type=float, default=0.2)
-parser.add_argument('--max_prototypes', type=int, default=5)
-parser.add_argument('--edge_centric', action='store_true')
+# ========== Module 1: Relation-Aware Sampling args ==========
+parser.add_argument('--use_rel_prior', action='store_true')         # enable relation prior fusion
+parser.add_argument('--rel_prior_lambda', type=float, default=0.5)  # weight for P(v|r) in fusion
+parser.add_argument('--prior_temperature', type=float, default=1.0) # temperature for P(v|r): <1 sharper, >1 flatter
+parser.add_argument('--fusion_mode', type=str, default='add')       # fusion: add / multiply
+# ========== Module 2: Relation Composition Augmentation args ==========
+parser.add_argument('--use_rca', action='store_true')               # enable RCA virtual edges
+parser.add_argument('--compose_dim', type=int, default=32)          # embedding dim for composition
+parser.add_argument('--max_virtual', type=int, default=50)          # max virtual edges per subgraph
+parser.add_argument('--compose_aware', action='store_true')         # composition-aware virtual edge embedding
+parser.add_argument('--rca_dropout', type=float, default=0.1)       # dropout in composition scorer
+parser.add_argument('--rca_mode', type=str, default='shared')       # shared / per_layer
+parser.add_argument('--compose_max_hop', type=int, default=2)       # max composition hops: 2 or 3
 args = parser.parse_args()
 
 class Options(object):
@@ -91,17 +100,6 @@ if __name__ == '__main__':
         fact_homo_edges, fact_data, args.data_path, split='train', args=args)
         
     del fact_homo_edges
-        
-    # build backward prototypes
-    if args.use_backward:
-        print(f'==> [Backward] enabled: alpha={args.alpha}, max_prototypes={args.max_prototypes}')
-        print('==> [Backward] building train sampler prototypes...')
-        train_sampler.buildPrototypes(loader.fact_data, args.max_prototypes)
-        print('==> [Backward] building test sampler prototypes...')
-        test_data_for_proto = loader.double_triple(loader.all_triple)
-        test_sampler.buildPrototypes(test_data_for_proto, args.max_prototypes)
-    else:
-        print('==> [Backward] disabled')
 
     # add sampler to the data loaders
     loader.addSampler(train_sampler)

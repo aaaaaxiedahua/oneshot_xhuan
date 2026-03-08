@@ -9,7 +9,7 @@ import logging
 import copy
 from tqdm import tqdm
 from scipy.sparse import csr_matrix, coo_matrix
-from collections import defaultdict, Counter
+from collections import defaultdict
 
 def checkPath(path):
     if not os.path.exists(path):
@@ -71,6 +71,13 @@ class pprSampler():
         del tmp_adj; del tmp_degree
         '''
         
+        # ========== Module 1: Build relation prior P(v|r) ==========
+        # Makes subgraph extraction query-relation-aware by fusing learned
+        # relation prior with PPR scores. To disable: set --use_rel_prior to False
+        if hasattr(args, 'use_rel_prior') and args.use_rel_prior:
+            self.buildRelationPrior(edge_index)
+        # ========== End Module 1 ==========
+
         print('==> finish sampler initilization.')
 
     def updateEdges(self, edge_index):
@@ -79,28 +86,6 @@ class pprSampler():
         self.sparseTrainMatrix = csr_matrix((edges, (heads, edges)), shape=(self.n_ent, len(edge_index)))
         self.edge_index = torch.LongTensor(edge_index)
 
-    def buildPrototypes(self, fact_data, max_prototypes):
-        """统计 fact_data 中每个关系的高频尾实体作为种子"""
-        self.max_prototypes = max_prototypes
-        rel_tails = defaultdict(list)
-        for h, r, t in fact_data:
-            rel_tails[int(r)].append(int(t))
-        self.prototypes = {}
-        n_empty = 0
-        for r in range(2 * self.n_rel + 1):
-            counter = Counter(rel_tails.get(r, []))
-            self.prototypes[r] = [ent for ent, _ in counter.most_common(max_prototypes)]
-            if len(self.prototypes[r]) == 0:
-                n_empty += 1
-        n_total = 2 * self.n_rel + 1
-        print(f'==> [Backward] built prototypes: max_prototypes={max_prototypes}, '
-              f'relations={n_total}, empty={n_empty}, covered={n_total - n_empty}')
-
-    def updatePrototypes(self, fact_data):
-        """shuffle_train 后重新统计种子"""
-        print('==> [Backward] updating prototypes after shuffle...')
-        self.buildPrototypes(fact_data, self.max_prototypes)
-    
     def getPPRscores(self, ent):
         ent_ppr_savePath = os.path.join(self.ppr_savePath, f'{int(ent)}.pkl')
         scores = pkl.load(open(ent_ppr_savePath, 'rb'))
@@ -130,30 +115,88 @@ class pprSampler():
         graph.add_edges_from(edges)
         return graph
     
+    # ========== Module 1: Relation-Aware Sampling ==========
+    # Enhancements:
+    #   --prior_temperature : controls P(v|r) distribution sharpness
+    #   --fusion_mode       : add / multiply fusion with PPR
+    def buildRelationPrior(self, edge_index):
+        """
+        Build relation prior P(v|r): for each relation r, compute the
+        normalized frequency of each entity appearing as tail.
+
+        This addresses the Principle-2 gap: PPR is purely structural and
+        ignores relation types, but different relations have different
+        answer distributions. For example, "born_in" tends to point to
+        locations, while "father_of" tends to point to persons.
+
+        Args:
+            edge_index: array/list of triples [(h, r, t), ...] including inverse relations
+        """
+        print('==> building relation prior P(v|r)...')
+        self.relation_prior = np.zeros((2 * self.n_rel + 1, self.n_ent))
+
+        for triple in edge_index:
+            h, r, t = int(triple[0]), int(triple[1]), int(triple[2])
+            self.relation_prior[r][t] += 1
+
+        # Normalize per relation
+        for r in range(2 * self.n_rel + 1):
+            total = self.relation_prior[r].sum()
+            if total > 0:
+                self.relation_prior[r] /= total
+
+        # Temperature scaling: P_temp(v|r) = P(v|r)^(1/T) / Z
+        # T < 1 → sharper (more concentrated), T > 1 → flatter (more uniform)
+        T = getattr(self.args, 'prior_temperature', 1.0)
+        if T != 1.0:
+            for r in range(2 * self.n_rel + 1):
+                p = self.relation_prior[r]
+                if p.sum() > 0:
+                    p_scaled = np.power(p + 1e-10, 1.0 / T)
+                    self.relation_prior[r] = p_scaled / p_scaled.sum()
+
+        print('==> relation prior built.')
+
+    def updateRelationPrior(self, edge_index):
+        """Update relation prior after shuffle_train re-partitions edges."""
+        self.buildRelationPrior(edge_index)
+    # ========== End Module 1 ==========
+
     def sampleSubgraph(self, ent: int, rel: int = -1, cand=None):
         # sample subgraph to get the edges
         ppr_scores = np.array(list(self.getPPRscores(ent).values()))
 
-        # backward fusion
-        if self.args.use_backward and rel >= 0 and hasattr(self, 'prototypes'):
-            seeds = self.prototypes.get(rel, [])
-            if len(seeds) > 0:
-                backward_scores = np.zeros(self.n_ent)
-                for seed in seeds:
-                    seed_ppr = np.array(list(self.getPPRscores(seed).values()))
-                    backward_scores += seed_ppr
-                backward_scores /= len(seeds)
-                ppr_scores = ppr_scores + self.args.alpha * backward_scores
-        
+        # ========== Module 1: Fuse relation prior with PPR scores ==========
+        # When enabled, the node selection combines structural proximity (PPR)
+        # with relation-specific entity relevance P(v|r).
+        if hasattr(self.args, 'use_rel_prior') and self.args.use_rel_prior and rel != -1:
+            rel_prior = self.relation_prior[rel]
+
+            lam = self.args.rel_prior_lambda
+
+            # Fusion mode: how to combine PPR and relation prior
+            fusion_mode = getattr(self.args, 'fusion_mode', 'add')
+            if fusion_mode == 'add':
+                # fused(v) = PPR(v|h) + λ * P(v|r)
+                fused_scores = ppr_scores + lam * rel_prior
+            elif fusion_mode == 'multiply':
+                # fused(v) = PPR(v|h) * P(v|r)^λ  (both high → selected)
+                fused_scores = ppr_scores * np.power(rel_prior + 1e-10, lam)
+            else:
+                fused_scores = ppr_scores + lam * rel_prior
+        else:
+            fused_scores = ppr_scores
+        # ========== End Module 1 ==========
+
         # gurantee the candidates are sampled
         if cand != None and self.topk < self.n_ent:
-            tmp_ppr_scores = copy.deepcopy(ppr_scores)
-            tmp_ppr_scores[cand] = 1e8
-            topk_nodes = sorted(list(set([ent] + np.argsort(tmp_ppr_scores)[::-1][:self.topk].tolist())))
+            tmp_scores = copy.deepcopy(fused_scores)
+            tmp_scores[cand] = 1e8
+            topk_nodes = sorted(list(set([ent] + np.argsort(tmp_scores)[::-1][:self.topk].tolist())))
         else:
             # topk sampling
-            if self.topk < self.n_ent:    
-                topk_nodes = sorted(list(set([ent] + np.argsort(ppr_scores)[::-1][:self.topk].tolist())))
+            if self.topk < self.n_ent:
+                topk_nodes = sorted(list(set([ent] + np.argsort(fused_scores)[::-1][:self.topk].tolist())))
             else:
                 # no sampling
                 topk_nodes = list(range(self.n_ent))
