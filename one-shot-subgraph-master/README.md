@@ -171,4 +171,30 @@ python train_auto.py --data_path data/family/ --topk 0.5 --use_rca --compose_dim
 ### Both Modules Together
 ```
 python train_auto.py --data_path data/family/ --topk 0.5 --use_rel_prior --rel_prior_lambda 0.5 --use_rca --compose_dim 32 --max_virtual 50
+
+# 基线（不开模块）                                                      
+python train_auto.py --data_path data/family/ --topk 0.5                
+                                                                          
+# 开 Module 1                                                           
+python train_auto.py --data_path data/family/ --topk 0.5 --use_rel_prior
+
+# 开 Module 2
+python train_auto.py --data_path data/family/ --topk 0.5 --use_rca
+
+# 两个模块都开
+python train_auto.py --data_path data/family/ --topk 0.5 --use_rel_prior --use_rca
+
+搜索（search_auto.py）：
+# 基线搜索
+python search_auto.py --data_path data/family/ --search --topk 0.5
+
+# 开 M1 搜索（多搜3个参数）
+python search_auto.py --data_path data/family/ --search --topk 0.5 --use_rel_prior
+
+# 开 M2 搜索（多搜6个参数）
+python search_auto.py --data_path data/family/ --search --topk 0.5 --use_rca
+
+# 两个都开（多搜9个参数）
+python search_auto.py --data_path data/family/ --search --topk 0.5 --use_rel_prior --use_rca
+
 ```
