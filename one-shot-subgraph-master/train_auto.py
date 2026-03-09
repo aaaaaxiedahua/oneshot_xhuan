@@ -25,10 +25,10 @@ parser.add_argument('--add_manual_edges', action='store_true')
 parser.add_argument('--remove_1hop_edges', action='store_true')
 parser.add_argument('--only_eval', action='store_true')
 parser.add_argument('--not_shuffle_train', action='store_true')
-# ========== Module 1: Relation-Aware Sampling args ==========
-parser.add_argument('--use_rel_prior', action='store_true')         # enable relation prior fusion
-parser.add_argument('--rel_prior_lambda', type=float, default=0.5)  # weight for P(v|r) in fusion
-parser.add_argument('--prior_temperature', type=float, default=1.0) # temperature for P(v|r): <1 sharper, >1 flatter
+# ========== Module 1: Relation-Path Conditioned Sampling args ==========
+parser.add_argument('--use_rel_prior', action='store_true')         # enable path-based relation prior
+parser.add_argument('--path_lambda', type=float, default=0.5)       # weight for path prior in fusion
+parser.add_argument('--rel_path_topk', type=int, default=10)        # top-K relation path patterns per relation
 parser.add_argument('--fusion_mode', type=str, default='add')       # fusion: add / multiply
 # ========== Module 2: Relation Composition Augmentation args ==========
 parser.add_argument('--use_rca', action='store_true')               # enable RCA virtual edges

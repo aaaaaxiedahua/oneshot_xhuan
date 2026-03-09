@@ -109,11 +109,10 @@ class BaseModel(object):
             self.loader.shuffle_train()
             fact_data = np.concatenate([np.array(self.loader.fact_data), self.loader.idd_data], 0)
             self.train_sampler.updateEdges(fact_data)
-            # ========== Module 1: Update relation prior after shuffle ==========
-            # Re-build P(v|r) from the new fact partition since shuffle_train
-            # re-partitions edges between fact_data and train_data each epoch
+            # ========== Module 1: Update adjacency lists after shuffle ==========
+            # Rebuild adj_by_rel from the new fact partition (patterns stay the same)
             if hasattr(self.args, 'use_rel_prior') and self.args.use_rel_prior:
-                self.train_sampler.updateRelationPrior(fact_data)
+                self.train_sampler.updateRelationPatterns(fact_data)
             # ========== End Module 1 ==========
 
         return valid_mrr, out_str

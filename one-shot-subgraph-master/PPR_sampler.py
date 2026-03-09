@@ -75,7 +75,7 @@ class pprSampler():
         # Makes subgraph extraction query-relation-aware by fusing learned
         # relation prior with PPR scores. To disable: set --use_rel_prior to False
         if hasattr(args, 'use_rel_prior') and args.use_rel_prior:
-            self.buildRelationPrior(edge_index)
+            self.mineRelationPatterns(edge_index)
         # ========== End Module 1 ==========
 
         print('==> finish sampler initilization.')
@@ -115,75 +115,133 @@ class pprSampler():
         graph.add_edges_from(edges)
         return graph
     
-    # ========== Module 1: Relation-Aware Sampling ==========
-    # Enhancements:
-    #   --prior_temperature : controls P(v|r) distribution sharpness
-    #   --fusion_mode       : add / multiply fusion with PPR
-    def buildRelationPrior(self, edge_index):
+    # ========== Module 1: Relation-Path Conditioned Sampling ==========
+    # Mines frequent 2-hop relation path patterns for each relation
+    # and uses path reachability to condition subgraph extraction.
+    #   --rel_path_topk    : top-K patterns per relation
+    #   --path_lambda      : fusion weight for path-based prior
+    #   --fusion_mode      : add / multiply fusion with PPR
+    def mineRelationPatterns(self, edge_index):
         """
-        Build relation prior P(v|r): for each relation r, compute the
-        normalized frequency of each entity appearing as tail.
+        Mine frequent 2-hop relation path patterns for each relation.
 
-        This addresses the Principle-2 gap: PPR is purely structural and
-        ignores relation types, but different relations have different
-        answer distributions. For example, "born_in" tends to point to
-        locations, while "father_of" tends to point to persons.
+        For relation r_q, examines training triples (h, r_q, t) and finds
+        2-hop paths h --(r1)--> m --(r2)--> t in the graph. Frequent
+        patterns (r1, r2) indicate common reasoning paths for r_q.
+
+        Example: for 'grandfather_of', frequent pattern might be
+                 (father_of, father_of) since grandfather = father + father.
+
+        Also builds per-entity adjacency lists for online path scoring.
 
         Args:
-            edge_index: array/list of triples [(h, r, t), ...] including inverse relations
+            edge_index: array of triples [(h, r, t), ...]
         """
-        print('==> building relation prior P(v|r)...')
-        self.relation_prior = np.zeros((2 * self.n_rel + 1, self.n_ent))
+        print('==> mining relation path patterns...')
+
+        n_total_rel = 2 * self.n_rel + 1
+        topk = getattr(self.args, 'rel_path_topk', 10)
+
+        # Build adjacency lists: adj_by_rel[entity][rel] = set(neighbors)
+        self.adj_by_rel = defaultdict(lambda: defaultdict(set))
+        # Build incoming adjacency: tail_in[entity][neighbor] = set(rels)
+        tail_in = defaultdict(lambda: defaultdict(set))
 
         for triple in edge_index:
             h, r, t = int(triple[0]), int(triple[1]), int(triple[2])
-            self.relation_prior[r][t] += 1
+            self.adj_by_rel[h][r].add(t)
+            tail_in[t][h].add(r)
 
-        # Normalize per relation
-        for r in range(2 * self.n_rel + 1):
-            total = self.relation_prior[r].sum()
-            if total > 0:
-                self.relation_prior[r] /= total
+        # Group triples by relation
+        triples_by_rel = defaultdict(list)
+        for triple in edge_index:
+            h, r, t = int(triple[0]), int(triple[1]), int(triple[2])
+            triples_by_rel[r].append((h, t))
 
-        # Temperature scaling: P_temp(v|r) = P(v|r)^(1/T) / Z
-        # T < 1 → sharper (more concentrated), T > 1 → flatter (more uniform)
-        T = getattr(self.args, 'prior_temperature', 1.0)
-        if T != 1.0:
-            for r in range(2 * self.n_rel + 1):
-                p = self.relation_prior[r]
-                if p.sum() > 0:
-                    p_scaled = np.power(p + 1e-10, 1.0 / T)
-                    self.relation_prior[r] = p_scaled / p_scaled.sum()
+        # Mine patterns for each relation
+        self.relation_patterns = {}
 
-        print('==> relation prior built.')
+        for r_q in tqdm(range(n_total_rel), ncols=50, leave=False, desc='mining'):
+            if r_q not in triples_by_rel:
+                self.relation_patterns[r_q] = []
+                continue
 
-    def updateRelationPrior(self, edge_index):
-        """Update relation prior after shuffle_train re-partitions edges."""
-        self.buildRelationPrior(edge_index)
+            ht_pairs = triples_by_rel[r_q]
+
+            # Subsample if too many triples per relation
+            if len(ht_pairs) > 1000:
+                indices = np.random.choice(len(ht_pairs), 1000, replace=False)
+                ht_pairs = [ht_pairs[i] for i in indices]
+
+            pattern_counts = defaultdict(int)
+
+            for h, t in ht_pairs:
+                # Find intermediate nodes m: h --(r1)--> m --(r2)--> t
+                for r1, m_set in self.adj_by_rel[h].items():
+                    for m in m_set:
+                        if m == h or m == t:
+                            continue
+                        # Check if m connects to t
+                        if m in tail_in[t]:
+                            for r2 in tail_in[t][m]:
+                                pattern_counts[(r1, r2)] += 1
+
+            # Sort by frequency and keep top-K
+            sorted_patterns = sorted(pattern_counts.items(), key=lambda x: -x[1])[:topk]
+
+            # Normalize weights
+            if sorted_patterns:
+                total = sum(c for _, c in sorted_patterns)
+                self.relation_patterns[r_q] = [((r1, r2), c / total) for (r1, r2), c in sorted_patterns]
+            else:
+                self.relation_patterns[r_q] = []
+
+        print(f'==> relation patterns mined.')
+
+    def updateRelationPatterns(self, edge_index):
+        """Update adjacency lists after shuffle_train. Patterns stay the same."""
+        self.adj_by_rel = defaultdict(lambda: defaultdict(set))
+        for triple in edge_index:
+            h, r, t = int(triple[0]), int(triple[1]), int(triple[2])
+            self.adj_by_rel[h][r].add(t)
     # ========== End Module 1 ==========
 
     def sampleSubgraph(self, ent: int, rel: int = -1, cand=None):
         # sample subgraph to get the edges
         ppr_scores = np.array(list(self.getPPRscores(ent).values()))
 
-        # ========== Module 1: Fuse relation prior with PPR scores ==========
+        # ========== Module 1: Fuse path-based prior with PPR scores ==========
         # When enabled, the node selection combines structural proximity (PPR)
-        # with relation-specific entity relevance P(v|r).
+        # with path reachability scores based on mined relation patterns.
+        # PathScore(v|h, r_q) = sum of pattern weights for patterns that
+        # can reach v from h through 2-hop paths.
         if hasattr(self.args, 'use_rel_prior') and self.args.use_rel_prior and rel != -1:
-            rel_prior = self.relation_prior[rel]
+            path_scores = np.zeros(self.n_ent)
+            patterns = self.relation_patterns.get(rel, [])
 
-            lam = self.args.rel_prior_lambda
+            for (r1, r2), weight in patterns:
+                # Find entities reachable from ent via pattern (r1, r2)
+                m_set = self.adj_by_rel.get(ent, {}).get(r1, set())
+                for m in m_set:
+                    v_set = self.adj_by_rel.get(m, {}).get(r2, set())
+                    for v in v_set:
+                        path_scores[v] += weight
 
-            # Fusion mode: how to combine PPR and relation prior
+            # Normalize to [0, 1]
+            max_ps = path_scores.max()
+            if max_ps > 0:
+                path_scores /= max_ps
+
+            lam = self.args.path_lambda
             fusion_mode = getattr(self.args, 'fusion_mode', 'add')
             if fusion_mode == 'add':
-                # fused(v) = PPR(v|h) + λ * P(v|r)
-                fused_scores = ppr_scores + lam * rel_prior
+                # fused(v) = PPR(v|h) + λ · PathScore(v|h, r_q)
+                fused_scores = ppr_scores + lam * path_scores
             elif fusion_mode == 'multiply':
-                # fused(v) = PPR(v|h) * P(v|r)^λ  (both high → selected)
-                fused_scores = ppr_scores * np.power(rel_prior + 1e-10, lam)
+                # fused(v) = PPR(v|h) · PathScore(v|h, r_q)^λ
+                fused_scores = ppr_scores * np.power(path_scores + 1e-10, lam)
             else:
-                fused_scores = ppr_scores + lam * rel_prior
+                fused_scores = ppr_scores + lam * path_scores
         else:
             fused_scores = ppr_scores
         # ========== End Module 1 ==========

@@ -12,7 +12,7 @@ from PPR_sampler import pprSampler
 
 HPO_search_space = {
         # discrete
-        'lr':                    ('choice', [0.1, 1e-2, 1e-3, 1e-4, 1e-5, 1e-6]),
+        'lr':                    ('choice', [1e-2, 1e-3, 1e-4, 1e-5]),
         'hidden_dim':            ('choice', [16, 32, 48, 64, 128, 256]),
         'attn_dim':              ('choice', [2, 4, 8, 16, 32, 64]),
         'n_layer':               ('choice', [4, 6, 8, 10]),
@@ -28,10 +28,10 @@ HPO_search_space = {
         'dropout':               ('uniform', (0, 0.2)),
     }
 
-# ========== Module 1: Relation-Aware Sampling search space ==========
+# ========== Module 1: Relation-Path Conditioned Sampling search space ==========
 HPO_search_space_M1 = {
-        'rel_prior_lambda':      ('uniform', (0.1, 1.0)),
-        'prior_temperature':     ('uniform', (0.5, 2.0)),
+        'path_lambda':           ('uniform', (0.1, 2.0)),
+        'rel_path_topk':         ('choice', [5, 10, 20, 50]),
         'fusion_mode':           ('choice', ['add', 'multiply']),
     }
 
@@ -65,10 +65,10 @@ parser.add_argument('--search', action='store_true')
 parser.add_argument('--finetune', action='store_true')
 parser.add_argument('--finetune_config', type=str, default='')
 parser.add_argument('--not_shuffle_train', action='store_true')
-# ========== Module 1: Relation-Aware Sampling args ==========
-parser.add_argument('--use_rel_prior', action='store_true')         # enable relation prior fusion
-parser.add_argument('--rel_prior_lambda', type=float, default=0.5)  # weight for P(v|r) in fusion
-parser.add_argument('--prior_temperature', type=float, default=1.0) # temperature for P(v|r): <1 sharper, >1 flatter
+# ========== Module 1: Relation-Path Conditioned Sampling args ==========
+parser.add_argument('--use_rel_prior', action='store_true')         # enable path-based relation prior
+parser.add_argument('--path_lambda', type=float, default=0.5)       # weight for path prior in fusion
+parser.add_argument('--rel_path_topk', type=int, default=10)        # top-K relation path patterns per relation
 parser.add_argument('--fusion_mode', type=str, default='add')       # fusion: add / multiply
 # ========== Module 2: Relation Composition Augmentation args ==========
 parser.add_argument('--use_rca', action='store_true')               # enable RCA virtual edges
@@ -181,10 +181,10 @@ if __name__ == '__main__':
         args.shortcut = params['shortcut']
         args.readout = params['readout']
 
-        # Module 1: Relation-Aware Sampling params
+        # Module 1: Relation-Path Conditioned Sampling params
         if args.use_rel_prior:
-            args.rel_prior_lambda = params['rel_prior_lambda']
-            args.prior_temperature = params['prior_temperature']
+            args.path_lambda = params['path_lambda']
+            args.rel_path_topk = int(params['rel_path_topk'])
             args.fusion_mode = params['fusion_mode']
 
         # Module 2: RCA params
