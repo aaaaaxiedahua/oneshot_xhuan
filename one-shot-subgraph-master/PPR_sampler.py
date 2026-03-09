@@ -143,13 +143,21 @@ class pprSampler():
         topk = getattr(self.args, 'rel_path_topk', 10)
 
         # Build adjacency lists: adj_by_rel[entity][rel] = set(neighbors)
-        self.adj_by_rel = defaultdict(lambda: defaultdict(set))
+        self.adj_by_rel = {}
         # Build incoming adjacency: tail_in[entity][neighbor] = set(rels)
-        tail_in = defaultdict(lambda: defaultdict(set))
+        tail_in = {}
 
         for triple in edge_index:
             h, r, t = int(triple[0]), int(triple[1]), int(triple[2])
+            if h not in self.adj_by_rel:
+                self.adj_by_rel[h] = {}
+            if r not in self.adj_by_rel[h]:
+                self.adj_by_rel[h][r] = set()
             self.adj_by_rel[h][r].add(t)
+            if t not in tail_in:
+                tail_in[t] = {}
+            if h not in tail_in[t]:
+                tail_in[t][h] = set()
             tail_in[t][h].add(r)
 
         # Group triples by relation
@@ -200,9 +208,13 @@ class pprSampler():
 
     def updateRelationPatterns(self, edge_index):
         """Update adjacency lists after shuffle_train. Patterns stay the same."""
-        self.adj_by_rel = defaultdict(lambda: defaultdict(set))
+        self.adj_by_rel = {}
         for triple in edge_index:
             h, r, t = int(triple[0]), int(triple[1]), int(triple[2])
+            if h not in self.adj_by_rel:
+                self.adj_by_rel[h] = {}
+            if r not in self.adj_by_rel[h]:
+                self.adj_by_rel[h][r] = set()
             self.adj_by_rel[h][r].add(t)
     # ========== End Module 1 ==========
 
