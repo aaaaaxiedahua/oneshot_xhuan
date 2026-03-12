@@ -88,7 +88,11 @@ class DataLoader(Dataset):
             obj[answer[idx]] = 1
                     
         # subgraph sampling
-        subgraph = self.getOneSubgraph(int(sub), int(rel))
+        # For R-BiPPR training, pass the ground-truth tail as optional candidate.
+        cand = None
+        if self.mode == 'train' and hasattr(self.args, 'use_bippr') and self.args.use_bippr:
+            cand = int(obj)
+        subgraph = self.getOneSubgraph(int(sub), int(rel), cand)
         return sub, rel, obj, subgraph
         
     def collate_fn(self, data):

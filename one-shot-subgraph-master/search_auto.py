@@ -28,22 +28,35 @@ HPO_search_space = {
         'dropout':               ('uniform', (0, 0.2)),
     }
 
-# ========== Module 1: Relation-Path Conditioned Sampling search space ==========
-HPO_search_space_M1 = {
-        'path_lambda':           ('uniform', (0.1, 2.0)),
-        'rel_path_topk':         ('choice', [5, 10, 20, 50]),
-        'fusion_mode':           ('choice', ['add', 'multiply']),
+# ========== R-BiPPR search space ==========
+HPO_search_space_BIPPR = {
+        'kge_topk':              ('choice', [50, 100, 200, 500]),
+        'collision_lambda':      ('uniform', (0.1, 3.0)),
     }
 
-# ========== Module 2: Relation Composition Augmentation search space ==========
-HPO_search_space_M2 = {
-        'compose_dim':           ('choice', [16, 32, 64, 128]),
-        'max_virtual':           ('choice', [20, 50, 100, 200]),
-        'compose_aware':         ('choice', [True, False]),
-        'rca_dropout':           ('uniform', (0, 0.9)),
-        'rca_mode':              ('choice', ['shared', 'per_layer']),
-        'compose_max_hop':       ('choice', [2, 3]),
+# ========== QTAR search space ==========
+HPO_search_space_QTAR = {
+        'qtar_ratio_end':        ('choice', [0.5, 0.6, 0.7, 0.8, 0.9, 1.0]),
+        'qtar_router_hidden':    ('choice', [32, 64, 128]),
+        'qtar_budget_lambda':    ('uniform', (0.0, 0.05)),
     }
+
+# # ========== Module 1: Relation-Path Conditioned Sampling search space ==========
+# HPO_search_space_M1 = {
+#         'path_lambda':           ('uniform', (0.1, 2.0)),
+#         'rel_path_topk':         ('choice', [5, 10, 20, 50]),
+#         'fusion_mode':           ('choice', ['add', 'multiply']),
+#     }
+#
+# # ========== Module 2: Relation Composition Augmentation search space ==========
+# HPO_search_space_M2 = {
+#         'compose_dim':           ('choice', [16, 32, 64, 128]),
+#         'max_virtual':           ('choice', [20, 50, 100, 200]),
+#         'compose_aware':         ('choice', [True, False]),
+#         'rca_dropout':           ('uniform', (0, 0.9)),
+#         'rca_mode':              ('choice', ['shared', 'per_layer']),
+#         'compose_max_hop':       ('choice', [2, 3]),
+#     }
 
 parser = argparse.ArgumentParser(description="Parser")
 parser.add_argument('--data_path', type=str, default='data/WN18RR/')
@@ -65,19 +78,36 @@ parser.add_argument('--search', action='store_true')
 parser.add_argument('--finetune', action='store_true')
 parser.add_argument('--finetune_config', type=str, default='')
 parser.add_argument('--not_shuffle_train', action='store_true')
-# ========== Module 1: Relation-Path Conditioned Sampling args ==========
-parser.add_argument('--use_rel_prior', action='store_true')         # enable path-based relation prior
-parser.add_argument('--path_lambda', type=float, default=0.5)       # weight for path prior in fusion
-parser.add_argument('--rel_path_topk', type=int, default=10)        # top-K relation path patterns per relation
-parser.add_argument('--fusion_mode', type=str, default='add')       # fusion: add / multiply
-# ========== Module 2: Relation Composition Augmentation args ==========
-parser.add_argument('--use_rca', action='store_true')               # enable RCA virtual edges
-parser.add_argument('--compose_dim', type=int, default=32)          # embedding dim for composition
-parser.add_argument('--max_virtual', type=int, default=50)          # max virtual edges per subgraph
-parser.add_argument('--compose_aware', action='store_true')         # composition-aware virtual edge embedding
-parser.add_argument('--rca_dropout', type=float, default=0.1)       # dropout in composition scorer
-parser.add_argument('--rca_mode', type=str, default='shared')       # shared / per_layer
-parser.add_argument('--compose_max_hop', type=int, default=2)       # max composition hops: 2 or 3
+# ========== R-BiPPR args ==========
+parser.add_argument('--use_bippr', action='store_true')
+parser.add_argument('--retriever_type', type=str, default='distmult')
+parser.add_argument('--retriever_ckpt', type=str, default='')
+parser.add_argument('--kge_topk', type=int, default=100)
+parser.add_argument('--collision_lambda', type=float, default=1.0)
+parser.add_argument('--train_include_gt_prob', type=float, default=1.0)
+parser.add_argument('--bippr_cache_size', type=int, default=256)
+# ========== QTAR args ==========
+parser.add_argument('--use_qtar', action='store_true')
+parser.add_argument('--qtar_ratio_start', type=float, default=1.0)
+parser.add_argument('--qtar_ratio_end', type=float, default=0.8)
+parser.add_argument('--qtar_warmup', type=int, default=5)
+parser.add_argument('--qtar_router_hidden', type=int, default=64)
+parser.add_argument('--qtar_budget_lambda', type=float, default=0.01)
+parser.add_argument('--qtar_min_edges', type=int, default=64)
+parser.add_argument('--qtar_soft_only', action='store_true')
+# # ========== Module 1: Relation-Path Conditioned Sampling args ==========
+# parser.add_argument('--use_rel_prior', action='store_true')         # enable path-based relation prior
+# parser.add_argument('--path_lambda', type=float, default=0.5)       # weight for path prior in fusion
+# parser.add_argument('--rel_path_topk', type=int, default=10)        # top-K relation path patterns per relation
+# parser.add_argument('--fusion_mode', type=str, default='add')       # fusion: add / multiply
+# # ========== Module 2: Relation Composition Augmentation args ==========
+# parser.add_argument('--use_rca', action='store_true')               # enable RCA virtual edges
+# parser.add_argument('--compose_dim', type=int, default=32)          # embedding dim for composition
+# parser.add_argument('--max_virtual', type=int, default=50)          # max virtual edges per subgraph
+# parser.add_argument('--compose_aware', action='store_true')         # composition-aware virtual edge embedding
+# parser.add_argument('--rca_dropout', type=float, default=0.1)       # dropout in composition scorer
+# parser.add_argument('--rca_mode', type=str, default='shared')       # shared / per_layer
+# parser.add_argument('--compose_max_hop', type=int, default=2)       # max composition hops: 2 or 3
 args = parser.parse_args()
 
 if __name__ == '__main__':
@@ -112,13 +142,20 @@ if __name__ == '__main__':
     
     assert args.search or args.finetune
 
-    # conditionally extend search space based on enabled modules
-    if args.use_rel_prior:
-        HPO_search_space.update(HPO_search_space_M1)
-        print('==> HPO: added Module 1 (Relation-Aware Sampling) search space')
-    if args.use_rca:
-        HPO_search_space.update(HPO_search_space_M2)
-        print('==> HPO: added Module 2 (RCA) search space')
+    if args.use_bippr:
+        HPO_search_space.update(HPO_search_space_BIPPR)
+        print('==> HPO: added R-BiPPR search space')
+    if args.use_qtar:
+        HPO_search_space.update(HPO_search_space_QTAR)
+        print('==> HPO: added QTAR search space')
+
+    # # conditionally extend search space based on enabled modules
+    # if args.use_rel_prior:
+    #     HPO_search_space.update(HPO_search_space_M1)
+    #     print('==> HPO: added Module 1 (Relation-Aware Sampling) search space')
+    # if args.use_rca:
+    #     HPO_search_space.update(HPO_search_space_M2)
+    #     print('==> HPO: added Module 2 (RCA) search space')
 
     with open(args.perf_file, 'a+') as f:
         f.write(str(args))
@@ -181,20 +218,29 @@ if __name__ == '__main__':
         args.shortcut = params['shortcut']
         args.readout = params['readout']
 
-        # Module 1: Relation-Path Conditioned Sampling params
-        if args.use_rel_prior:
-            args.path_lambda = params['path_lambda']
-            args.rel_path_topk = int(params['rel_path_topk'])
-            args.fusion_mode = params['fusion_mode']
+        if args.use_bippr:
+            args.kge_topk = int(params['kge_topk'])
+            args.collision_lambda = params['collision_lambda']
 
-        # Module 2: RCA params
-        if args.use_rca:
-            args.compose_dim = int(params['compose_dim'])
-            args.max_virtual = int(params['max_virtual'])
-            args.compose_aware = params['compose_aware']
-            args.rca_dropout = params['rca_dropout']
-            args.rca_mode = params['rca_mode']
-            args.compose_max_hop = int(params['compose_max_hop'])
+        if args.use_qtar:
+            args.qtar_ratio_end = params['qtar_ratio_end']
+            args.qtar_router_hidden = int(params['qtar_router_hidden'])
+            args.qtar_budget_lambda = params['qtar_budget_lambda']
+
+        # # Module 1: Relation-Path Conditioned Sampling params
+        # if args.use_rel_prior:
+        #     args.path_lambda = params['path_lambda']
+        #     args.rel_path_topk = int(params['rel_path_topk'])
+        #     args.fusion_mode = params['fusion_mode']
+        #
+        # # Module 2: RCA params
+        # if args.use_rca:
+        #     args.compose_dim = int(params['compose_dim'])
+        #     args.max_virtual = int(params['max_virtual'])
+        #     args.compose_aware = params['compose_aware']
+        #     args.rca_dropout = params['rca_dropout']
+        #     args.rca_mode = params['rca_mode']
+        #     args.compose_max_hop = int(params['compose_max_hop'])
 
         # build model
         model = BaseModel(args, loaders=(loader, val_loader, test_loader), samplers=(train_sampler, test_sampler))
@@ -280,6 +326,5 @@ if __name__ == '__main__':
             print(idx, param)
             if idx == -1: break
             run_model(param, finetune_idx=idx)
-
 
 

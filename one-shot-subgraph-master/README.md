@@ -197,4 +197,20 @@ python search_auto.py --data_path data/family/ --search --topk 0.5 --use_rca
 # 两个都开（多搜9个参数）
 python search_auto.py --data_path data/family/ --search --topk 0.5 --use_rel_prior --use_rca
 
+
+python kge_pretrain.py --data_path data/WN18RR/ --score_fn distmult --emb_dim 128 --batch_size 1024 --neg_size 32 --lr 1e-3 --steps_per_epoch 1000 --max_epoch 200 --eval_every 5 --patience 4 --recall_k 100 --save_root savedModels/retrievers
+
+# 默认参数版（只指定数据集）
+python kge_pretrain.py --data_path data/WN18RR/
+
+
+# 2) 训练主模型（R-BiPPR + QTAR soft-only）
+python train_auto.py --data_path data/WN18RR/ --gpu 0 --topk 0.1 --batchsize 16 --epoch 200 --use_bippr --retriever_type distmult --retriever_ckpt savedModels/retrievers/WN18RR/distmult/retriever_distmult.ckpt --kge_topk 100 --collision_lambda 1.0 --train_include_gt_prob 1.0 --use_qtar --qtar_ratio_start 1.0 --qtar_ratio_end 0.8 --qtar_warmup 5 --qtar_router_hidden 64 --qtar_budget_lambda 0.01 --qtar_min_edges 64 --qtar_soft_only
+
+# 自动调参（推荐，参数显式版）
+python search_auto.py --data_path data/WN18RR/ --search --use_bippr --retriever_type distmult --retriever_ckpt savedModels/retrievers/WN18RR/distmult/retriever_distmult.ckpt --use_qtar --qtar_soft_only
+
+python search_auto.py --data_path data/WN18RR/ --search --fact_ratio 0.95 --use_bippr --retriever_type distmult --retriever_ckpt savedModels/retrievers/WN18RR/distmult/retriever_distmult.ckpt --train_include_gt_prob 1.0 --bippr_cache_size 256 --use_qtar --qtar_ratio_start 1.0 --qtar_warmup 5 --qtar_min_edges 64 --qtar_soft_only
+
+
 ```

@@ -25,19 +25,36 @@ parser.add_argument('--add_manual_edges', action='store_true')
 parser.add_argument('--remove_1hop_edges', action='store_true')
 parser.add_argument('--only_eval', action='store_true')
 parser.add_argument('--not_shuffle_train', action='store_true')
-# ========== Module 1: Relation-Path Conditioned Sampling args ==========
-parser.add_argument('--use_rel_prior', action='store_true')         # enable path-based relation prior
-parser.add_argument('--path_lambda', type=float, default=0.5)       # weight for path prior in fusion
-parser.add_argument('--rel_path_topk', type=int, default=10)        # top-K relation path patterns per relation
-parser.add_argument('--fusion_mode', type=str, default='add')       # fusion: add / multiply
-# ========== Module 2: Relation Composition Augmentation args ==========
-parser.add_argument('--use_rca', action='store_true')               # enable RCA virtual edges
-parser.add_argument('--compose_dim', type=int, default=32)          # embedding dim for composition
-parser.add_argument('--max_virtual', type=int, default=50)          # max virtual edges per subgraph
-parser.add_argument('--compose_aware', action='store_true')         # composition-aware virtual edge embedding
-parser.add_argument('--rca_dropout', type=float, default=0.1)       # dropout in composition scorer
-parser.add_argument('--rca_mode', type=str, default='shared')       # shared / per_layer
-parser.add_argument('--compose_max_hop', type=int, default=2)       # max composition hops: 2 or 3
+# ========== R-BiPPR args ==========
+parser.add_argument('--use_bippr', action='store_true')                  # enable bidirectional ppr collision
+parser.add_argument('--retriever_type', type=str, default='distmult')    # distmult / transe
+parser.add_argument('--retriever_ckpt', type=str, default='')            # retriever checkpoint path
+parser.add_argument('--kge_topk', type=int, default=100)                 # candidate size for reverse ppr
+parser.add_argument('--collision_lambda', type=float, default=1.0)       # reverse ppr fusion strength
+parser.add_argument('--train_include_gt_prob', type=float, default=1.0)  # train-time gt candidate injection prob
+parser.add_argument('--bippr_cache_size', type=int, default=256)         # ppr vector cache size
+# ========== QTAR args ==========
+parser.add_argument('--use_qtar', action='store_true')                   # enable query-target adaptive routing
+parser.add_argument('--qtar_ratio_start', type=float, default=1.0)       # keep ratio at first layer
+parser.add_argument('--qtar_ratio_end', type=float, default=0.8)         # keep ratio at last layer
+parser.add_argument('--qtar_warmup', type=int, default=5)                # warmup epochs before routing
+parser.add_argument('--qtar_router_hidden', type=int, default=64)        # hidden dim of router mlp
+parser.add_argument('--qtar_budget_lambda', type=float, default=0.01)    # budget regularization weight
+parser.add_argument('--qtar_min_edges', type=int, default=64)            # minimum kept edges per layer
+parser.add_argument('--qtar_soft_only', action='store_true')             # only apply soft routing, no hard pruning
+# # ========== Module 1: Relation-Path Conditioned Sampling args ==========
+# parser.add_argument('--use_rel_prior', action='store_true')         # enable path-based relation prior
+# parser.add_argument('--path_lambda', type=float, default=0.5)       # weight for path prior in fusion
+# parser.add_argument('--rel_path_topk', type=int, default=10)        # top-K relation path patterns per relation
+# parser.add_argument('--fusion_mode', type=str, default='add')       # fusion: add / multiply
+# # ========== Module 2: Relation Composition Augmentation args ==========
+# parser.add_argument('--use_rca', action='store_true')               # enable RCA virtual edges
+# parser.add_argument('--compose_dim', type=int, default=32)          # embedding dim for composition
+# parser.add_argument('--max_virtual', type=int, default=50)          # max virtual edges per subgraph
+# parser.add_argument('--compose_aware', action='store_true')         # composition-aware virtual edge embedding
+# parser.add_argument('--rca_dropout', type=float, default=0.1)       # dropout in composition scorer
+# parser.add_argument('--rca_mode', type=str, default='shared')       # shared / per_layer
+# parser.add_argument('--compose_max_hop', type=int, default=2)       # max composition hops: 2 or 3
 args = parser.parse_args()
 
 class Options(object):

@@ -31,6 +31,7 @@ class BaseModel(object):
         self.smooth = 1e-5
         self.t_time = 0
         self.mean_rank_dict = {}
+        self.epoch_idx = 0
         
     def saveModelToFiles(self, args, best_metric, deleteLastFile=True):
         if args.val_num == -1:
@@ -66,6 +67,8 @@ class BaseModel(object):
         reach_tails_list = []
         t_time = time.time()
         self.model.train()
+        if hasattr(self.model, 'set_epoch'):
+            self.model.set_epoch(self.epoch_idx)
         
         for batch_data in tqdm(self.trainLoader, ncols=50, leave=False):                      
             # prepare data    
@@ -74,11 +77,15 @@ class BaseModel(object):
             # forward
             self.model.zero_grad()
             scores = self.model(subs, rels, subgraph_data)
+            aux_loss = getattr(self.model, 'latest_aux_loss', 0.0)
+            if not torch.is_tensor(aux_loss):
+                aux_loss = torch.tensor(float(aux_loss), device=scores.device)
             
             # loss calculation
             pos_scores = scores[[torch.arange(len(scores)).cuda(), objs.flatten()]]
             max_n = torch.max(scores, 1, keepdim=True)[0]
-            loss = torch.sum(- pos_scores + max_n + torch.log(torch.sum(torch.exp(scores - max_n),1))) 
+            loss = torch.sum(- pos_scores + max_n + torch.log(torch.sum(torch.exp(scores - max_n),1)))
+            loss = loss + aux_loss
 
             # loss backward
             loss.backward()
@@ -109,12 +116,13 @@ class BaseModel(object):
             self.loader.shuffle_train()
             fact_data = np.concatenate([np.array(self.loader.fact_data), self.loader.idd_data], 0)
             self.train_sampler.updateEdges(fact_data)
-            # ========== Module 1: Update adjacency lists after shuffle ==========
-            # Rebuild adj_by_rel from the new fact partition (patterns stay the same)
-            if hasattr(self.args, 'use_rel_prior') and self.args.use_rel_prior:
-                self.train_sampler.updateRelationPatterns(fact_data)
-            # ========== End Module 1 ==========
+            # # ========== Module 1: Update adjacency lists after shuffle ==========
+            # # Rebuild adj_by_rel from the new fact partition (patterns stay the same)
+            # if hasattr(self.args, 'use_rel_prior') and self.args.use_rel_prior:
+            #     self.train_sampler.updateRelationPatterns(fact_data)
+            # # ========== End Module 1 ==========
 
+        self.epoch_idx += 1
         return valid_mrr, out_str
     
     @torch.no_grad()
