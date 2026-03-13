@@ -48,9 +48,11 @@ def build_query_answers(triples):
 
 
 class KGEScorer(nn.Module):
-    def __init__(self, n_ent, n_rel, dim, score_fn):
+    def __init__(self, n_ent, n_rel, dim, score_fn, transe_dist="l1"):
         super().__init__()
         self.score_fn = score_fn
+        self.transe_dist = transe_dist
+        self.transe_p = 1 if transe_dist == "l1" else 2
         self.entity_emb = nn.Embedding(n_ent, dim)
         self.relation_emb = nn.Embedding(n_rel, dim)
         nn.init.xavier_uniform_(self.entity_emb.weight)
@@ -61,7 +63,7 @@ class KGEScorer(nn.Module):
         er = self.relation_emb(r_idx)
         et = self.entity_emb(t_idx)
         if self.score_fn == "transe":
-            return -torch.norm(eh + er - et, p=1, dim=-1)
+            return -torch.norm(eh + er - et, p=self.transe_p, dim=-1)
         return torch.sum(eh * er * et, dim=-1)
 
     def score_all_tails(self, h_idx, r_idx):
@@ -69,7 +71,7 @@ class KGEScorer(nn.Module):
         er = self.relation_emb(r_idx)  # [d]
         all_t = self.entity_emb.weight  # [n_ent, d]
         if self.score_fn == "transe":
-            return -torch.norm((eh + er).unsqueeze(0) - all_t, p=1, dim=-1)
+            return -torch.norm((eh + er).unsqueeze(0) - all_t, p=self.transe_p, dim=-1)
         return torch.sum(all_t * (eh * er), dim=-1)
 
 
@@ -116,7 +118,36 @@ def sample_corrupted_triples(h, r, t, n_ent, neg_size, device):
 
     neg_h[corrupt_head] = rand_ent[corrupt_head]
     neg_t[~corrupt_head] = rand_ent[~corrupt_head]
-    return neg_h, neg_r, neg_t
+    return neg_h, neg_r, neg_t, corrupt_head
+
+
+def encode_triple_ids(h, r, t, n_ent, n_rel_total):
+    return (h * n_rel_total + r) * n_ent + t
+
+
+def filter_false_negatives(neg_h, neg_r, neg_t, corrupt_head, known_ids, n_ent, n_rel_total, max_trials=10):
+    if known_ids is None:
+        return neg_h, neg_r, neg_t
+    shape = neg_h.shape
+    flat_h = neg_h.reshape(-1)
+    flat_r = neg_r.reshape(-1)
+    flat_t = neg_t.reshape(-1)
+    flat_ch = corrupt_head.reshape(-1)
+
+    for _ in range(max_trials):
+        neg_ids = encode_triple_ids(flat_h, flat_r, flat_t, n_ent, n_rel_total)
+        invalid = torch.isin(neg_ids, known_ids)
+        if not torch.any(invalid):
+            break
+        idx = torch.nonzero(invalid, as_tuple=False).squeeze(-1)
+        new_entities = torch.randint(0, n_ent, (idx.numel(),), device=flat_h.device)
+        head_mask = flat_ch[idx]
+        if torch.any(head_mask):
+            flat_h[idx[head_mask]] = new_entities[head_mask]
+        if torch.any(~head_mask):
+            flat_t[idx[~head_mask]] = new_entities[~head_mask]
+
+    return flat_h.view(shape), flat_r.view(shape), flat_t.view(shape)
 
 
 def auto_optimizer_and_lr(score_fn, opt_name, lr):
@@ -145,6 +176,7 @@ def main():
     parser = argparse.ArgumentParser(description="Train lightweight DistMult/TransE retriever for R-BiPPR")
     parser.add_argument("--data_path", type=str, default="data/WN18RR/")
     parser.add_argument("--score_fn", type=str, default="distmult", choices=["distmult", "transe"])
+    parser.add_argument("--transe_dist", type=str, default="l1", choices=["l1", "l2"])
     parser.add_argument("--emb_dim", type=int, default=128)
     parser.add_argument("--batch_size", type=int, default=1024)
     parser.add_argument("--neg_size", type=int, default=32)
@@ -154,6 +186,8 @@ def main():
     parser.add_argument("--margin", type=float, default=1.0)
     parser.add_argument("--adv_temp", type=float, default=1.0)
     parser.add_argument("--entity_norm", action="store_true")
+    parser.add_argument("--filtered_neg", action="store_true")
+    parser.add_argument("--max_filtered_trials", type=int, default=10)
     parser.add_argument("--steps_per_epoch", type=int, default=1000)
     parser.add_argument("--max_epoch", type=int, default=200)
     parser.add_argument("--eval_every", type=int, default=5)
@@ -194,7 +228,9 @@ def main():
     print(f"==> training loss: {loss_name}")
     use_entity_norm = (args.score_fn == "transe") or args.entity_norm
 
-    model = KGEScorer(n_ent=n_ent, n_rel=n_rel_total, dim=args.emb_dim, score_fn=args.score_fn).to(device)
+    model = KGEScorer(
+        n_ent=n_ent, n_rel=n_rel_total, dim=args.emb_dim, score_fn=args.score_fn, transe_dist=args.transe_dist
+    ).to(device)
     if use_entity_norm:
         with torch.no_grad():
             model.entity_emb.weight.data = F.normalize(model.entity_emb.weight.data, p=2, dim=1)
@@ -206,6 +242,15 @@ def main():
     else:
         optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=args.weight_decay)
     print(f"==> optimizer: {opt_name}, lr={lr:g}, entity_norm={use_entity_norm}")
+
+    known_ids = None
+    if args.filtered_neg:
+        train_arr = np.array(train_pos, dtype=np.int64)
+        train_ids = ((train_arr[:, 0] * n_rel_total + train_arr[:, 1]) * n_ent + train_arr[:, 2]).astype(np.int64)
+        known_ids = torch.from_numpy(np.unique(train_ids)).to(device)
+        print(f"==> filtered_neg: on (known_triples={known_ids.numel()})")
+    else:
+        print("==> filtered_neg: off")
 
     best_recall = -1.0
     best_state = None
@@ -221,9 +266,14 @@ def main():
             r = r.to(device)
             t = t.to(device)
 
-            neg_h, neg_r, neg_t = sample_corrupted_triples(
+            neg_h, neg_r, neg_t, corrupt_head = sample_corrupted_triples(
                 h=h, r=r, t=t, n_ent=n_ent, neg_size=args.neg_size, device=device
             )
+            if args.filtered_neg:
+                neg_h, neg_r, neg_t = filter_false_negatives(
+                    neg_h, neg_r, neg_t, corrupt_head, known_ids, n_ent, n_rel_total,
+                    max_trials=args.max_filtered_trials
+                )
 
             pos_score = model.score(h, r, t).unsqueeze(1)  # [B, 1]
             neg_score = model.score(
@@ -273,6 +323,7 @@ def main():
                 "entity_emb": model.entity_emb.weight.detach().cpu().clone(),
                 "relation_emb": model.relation_emb.weight.detach().cpu().clone(),
                 "score_fn": args.score_fn,
+                "transe_dist": args.transe_dist,
                 "optimizer": opt_name,
                 "lr": lr,
                 "emb_dim": args.emb_dim,
@@ -282,6 +333,7 @@ def main():
                 "margin": args.margin,
                 "adv_temp": args.adv_temp,
                 "entity_norm": use_entity_norm,
+                "filtered_neg": args.filtered_neg,
             }
             bad_eval_count = 0
             print(f"==> new best Recall@{args.recall_k}: {best_recall:.4f}")
@@ -307,6 +359,7 @@ def main():
             "entity_emb": model.entity_emb.weight.detach().cpu().clone(),
             "relation_emb": model.relation_emb.weight.detach().cpu().clone(),
             "score_fn": args.score_fn,
+            "transe_dist": args.transe_dist,
             "optimizer": opt_name,
             "lr": lr,
             "emb_dim": args.emb_dim,
@@ -316,6 +369,7 @@ def main():
             "margin": args.margin,
             "adv_temp": args.adv_temp,
             "entity_norm": use_entity_norm,
+            "filtered_neg": args.filtered_neg,
         }
         print(f"==> fallback save with Recall@{args.recall_k}: {recall:.4f}")
 
