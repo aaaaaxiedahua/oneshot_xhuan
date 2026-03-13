@@ -118,36 +118,7 @@ def sample_corrupted_triples(h, r, t, n_ent, neg_size, device):
 
     neg_h[corrupt_head] = rand_ent[corrupt_head]
     neg_t[~corrupt_head] = rand_ent[~corrupt_head]
-    return neg_h, neg_r, neg_t, corrupt_head
-
-
-def encode_triple_ids(h, r, t, n_ent, n_rel_total):
-    return (h * n_rel_total + r) * n_ent + t
-
-
-def filter_false_negatives(neg_h, neg_r, neg_t, corrupt_head, known_ids, n_ent, n_rel_total, max_trials=10):
-    if known_ids is None:
-        return neg_h, neg_r, neg_t
-    shape = neg_h.shape
-    flat_h = neg_h.reshape(-1)
-    flat_r = neg_r.reshape(-1)
-    flat_t = neg_t.reshape(-1)
-    flat_ch = corrupt_head.reshape(-1)
-
-    for _ in range(max_trials):
-        neg_ids = encode_triple_ids(flat_h, flat_r, flat_t, n_ent, n_rel_total)
-        invalid = torch.isin(neg_ids, known_ids)
-        if not torch.any(invalid):
-            break
-        idx = torch.nonzero(invalid, as_tuple=False).squeeze(-1)
-        new_entities = torch.randint(0, n_ent, (idx.numel(),), device=flat_h.device)
-        head_mask = flat_ch[idx]
-        if torch.any(head_mask):
-            flat_h[idx[head_mask]] = new_entities[head_mask]
-        if torch.any(~head_mask):
-            flat_t[idx[~head_mask]] = new_entities[~head_mask]
-
-    return flat_h.view(shape), flat_r.view(shape), flat_t.view(shape)
+    return neg_h, neg_r, neg_t
 
 
 def auto_optimizer_and_lr(score_fn, opt_name, lr):
@@ -186,8 +157,6 @@ def main():
     parser.add_argument("--margin", type=float, default=1.0)
     parser.add_argument("--adv_temp", type=float, default=1.0)
     parser.add_argument("--entity_norm", action="store_true")
-    parser.add_argument("--filtered_neg", action="store_true")
-    parser.add_argument("--max_filtered_trials", type=int, default=10)
     parser.add_argument("--steps_per_epoch", type=int, default=1000)
     parser.add_argument("--max_epoch", type=int, default=200)
     parser.add_argument("--eval_every", type=int, default=5)
@@ -243,15 +212,6 @@ def main():
         optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=args.weight_decay)
     print(f"==> optimizer: {opt_name}, lr={lr:g}, entity_norm={use_entity_norm}")
 
-    known_ids = None
-    if args.filtered_neg:
-        train_arr = np.array(train_pos, dtype=np.int64)
-        train_ids = ((train_arr[:, 0] * n_rel_total + train_arr[:, 1]) * n_ent + train_arr[:, 2]).astype(np.int64)
-        known_ids = torch.from_numpy(np.unique(train_ids)).to(device)
-        print(f"==> filtered_neg: on (known_triples={known_ids.numel()})")
-    else:
-        print("==> filtered_neg: off")
-
     best_recall = -1.0
     best_state = None
     bad_eval_count = 0
@@ -266,14 +226,9 @@ def main():
             r = r.to(device)
             t = t.to(device)
 
-            neg_h, neg_r, neg_t, corrupt_head = sample_corrupted_triples(
+            neg_h, neg_r, neg_t = sample_corrupted_triples(
                 h=h, r=r, t=t, n_ent=n_ent, neg_size=args.neg_size, device=device
             )
-            if args.filtered_neg:
-                neg_h, neg_r, neg_t = filter_false_negatives(
-                    neg_h, neg_r, neg_t, corrupt_head, known_ids, n_ent, n_rel_total,
-                    max_trials=args.max_filtered_trials
-                )
 
             pos_score = model.score(h, r, t).unsqueeze(1)  # [B, 1]
             neg_score = model.score(
@@ -333,7 +288,6 @@ def main():
                 "margin": args.margin,
                 "adv_temp": args.adv_temp,
                 "entity_norm": use_entity_norm,
-                "filtered_neg": args.filtered_neg,
             }
             bad_eval_count = 0
             print(f"==> new best Recall@{args.recall_k}: {best_recall:.4f}")
@@ -369,7 +323,6 @@ def main():
             "margin": args.margin,
             "adv_temp": args.adv_temp,
             "entity_norm": use_entity_norm,
-            "filtered_neg": args.filtered_neg,
         }
         print(f"==> fallback save with Recall@{args.recall_k}: {recall:.4f}")
 
