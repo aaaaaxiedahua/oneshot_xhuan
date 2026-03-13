@@ -105,6 +105,20 @@ def sample_batch(train_triples, batch_size):
     return h, r, t
 
 
+def sample_corrupted_triples(h, r, t, n_ent, neg_size, device):
+    batch_size = h.shape[0]
+    rand_ent = torch.randint(low=0, high=n_ent, size=(batch_size, neg_size), device=device)
+    corrupt_head = torch.rand((batch_size, neg_size), device=device) < 0.5
+
+    neg_h = h.unsqueeze(1).repeat(1, neg_size)
+    neg_r = r.unsqueeze(1).repeat(1, neg_size)
+    neg_t = t.unsqueeze(1).repeat(1, neg_size)
+
+    neg_h[corrupt_head] = rand_ent[corrupt_head]
+    neg_t[~corrupt_head] = rand_ent[~corrupt_head]
+    return neg_h, neg_r, neg_t
+
+
 def infer_dataset_name(data_path):
     norm = os.path.normpath(data_path)
     name = os.path.basename(norm)
@@ -120,6 +134,8 @@ def main():
     parser.add_argument("--neg_size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight_decay", type=float, default=0.0)
+    parser.add_argument("--margin", type=float, default=1.0)
+    parser.add_argument("--entity_norm", action="store_true")
     parser.add_argument("--steps_per_epoch", type=int, default=1000)
     parser.add_argument("--max_epoch", type=int, default=200)
     parser.add_argument("--eval_every", type=int, default=5)
@@ -156,8 +172,13 @@ def main():
     print(f"==> device: {device}")
     print(f"==> train triples (with inverse): {len(train_pos)}")
     print(f"==> valid queries (with inverse): {len(query_answers)}")
+    print(f"==> training loss: margin ranking (margin={args.margin})")
+    use_entity_norm = (args.score_fn == "transe") or args.entity_norm
 
     model = KGEScorer(n_ent=n_ent, n_rel=n_rel_total, dim=args.emb_dim, score_fn=args.score_fn).to(device)
+    if use_entity_norm:
+        with torch.no_grad():
+            model.entity_emb.weight.data = F.normalize(model.entity_emb.weight.data, p=2, dim=1)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
     best_recall = -1.0
@@ -174,20 +195,24 @@ def main():
             r = r.to(device)
             t = t.to(device)
 
-            neg_t = torch.randint(low=0, high=n_ent, size=(args.batch_size, args.neg_size), device=device)
-            pos_score = model.score(h, r, t)  # [B]
+            neg_h, neg_r, neg_t = sample_corrupted_triples(
+                h=h, r=r, t=t, n_ent=n_ent, neg_size=args.neg_size, device=device
+            )
 
-            h_rep = h.unsqueeze(1).repeat(1, args.neg_size).reshape(-1)
-            r_rep = r.unsqueeze(1).repeat(1, args.neg_size).reshape(-1)
-            neg_score = model.score(h_rep, r_rep, neg_t.reshape(-1)).reshape(args.batch_size, args.neg_size)
+            pos_score = model.score(h, r, t).unsqueeze(1)  # [B, 1]
+            neg_score = model.score(
+                neg_h.reshape(-1), neg_r.reshape(-1), neg_t.reshape(-1)
+            ).reshape(h.shape[0], args.neg_size)  # [B, neg]
 
-            loss_pos = -F.logsigmoid(pos_score).mean()
-            loss_neg = -F.logsigmoid(-neg_score).mean()
-            loss = loss_pos + loss_neg
+            # Margin ranking loss: max(0, margin + s(neg) - s(pos))
+            loss = torch.relu(args.margin + neg_score - pos_score).mean()
 
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+            if use_entity_norm:
+                with torch.no_grad():
+                    model.entity_emb.weight.data = F.normalize(model.entity_emb.weight.data, p=2, dim=1)
             epoch_loss += float(loss.item())
 
         print(f"[Epoch {epoch:03d}] loss={epoch_loss / n_batches:.6f}")
@@ -216,6 +241,8 @@ def main():
                 "best_recall_at_k": best_recall,
                 "recall_k": args.recall_k,
                 "epoch": epoch,
+                "margin": args.margin,
+                "entity_norm": use_entity_norm,
             }
             bad_eval_count = 0
             print(f"==> new best Recall@{args.recall_k}: {best_recall:.4f}")
@@ -245,6 +272,8 @@ def main():
             "best_recall_at_k": recall,
             "recall_k": args.recall_k,
             "epoch": args.max_epoch,
+            "margin": args.margin,
+            "entity_norm": use_entity_norm,
         }
         print(f"==> fallback save with Recall@{args.recall_k}: {recall:.4f}")
 
