@@ -119,6 +119,22 @@ def sample_corrupted_triples(h, r, t, n_ent, neg_size, device):
     return neg_h, neg_r, neg_t
 
 
+def auto_optimizer_and_lr(score_fn, opt_name, lr):
+    if opt_name == "auto":
+        if score_fn == "transe":
+            opt_name = "sgd"
+            if lr is None:
+                lr = 0.05
+        else:
+            opt_name = "adam"
+            if lr is None:
+                lr = 1e-3
+    else:
+        if lr is None:
+            lr = 1e-3
+    return opt_name, float(lr)
+
+
 def infer_dataset_name(data_path):
     norm = os.path.normpath(data_path)
     name = os.path.basename(norm)
@@ -132,9 +148,11 @@ def main():
     parser.add_argument("--emb_dim", type=int, default=128)
     parser.add_argument("--batch_size", type=int, default=1024)
     parser.add_argument("--neg_size", type=int, default=32)
-    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--lr", type=float, default=None)
+    parser.add_argument("--optimizer", type=str, default="auto", choices=["auto", "adam", "adagrad", "sgd"])
     parser.add_argument("--weight_decay", type=float, default=0.0)
     parser.add_argument("--margin", type=float, default=1.0)
+    parser.add_argument("--adv_temp", type=float, default=1.0)
     parser.add_argument("--entity_norm", action="store_true")
     parser.add_argument("--steps_per_epoch", type=int, default=1000)
     parser.add_argument("--max_epoch", type=int, default=200)
@@ -172,14 +190,22 @@ def main():
     print(f"==> device: {device}")
     print(f"==> train triples (with inverse): {len(train_pos)}")
     print(f"==> valid queries (with inverse): {len(query_answers)}")
-    print(f"==> training loss: margin ranking (margin={args.margin})")
+    loss_name = "margin-ranking" if args.score_fn == "transe" else "adversarial-logistic"
+    print(f"==> training loss: {loss_name}")
     use_entity_norm = (args.score_fn == "transe") or args.entity_norm
 
     model = KGEScorer(n_ent=n_ent, n_rel=n_rel_total, dim=args.emb_dim, score_fn=args.score_fn).to(device)
     if use_entity_norm:
         with torch.no_grad():
             model.entity_emb.weight.data = F.normalize(model.entity_emb.weight.data, p=2, dim=1)
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    opt_name, lr = auto_optimizer_and_lr(args.score_fn, args.optimizer, args.lr)
+    if opt_name == "sgd":
+        optimizer = torch.optim.SGD(model.parameters(), lr=lr, weight_decay=args.weight_decay)
+    elif opt_name == "adagrad":
+        optimizer = torch.optim.Adagrad(model.parameters(), lr=lr, weight_decay=args.weight_decay)
+    else:
+        optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=args.weight_decay)
+    print(f"==> optimizer: {opt_name}, lr={lr:g}, entity_norm={use_entity_norm}")
 
     best_recall = -1.0
     best_state = None
@@ -204,8 +230,18 @@ def main():
                 neg_h.reshape(-1), neg_r.reshape(-1), neg_t.reshape(-1)
             ).reshape(h.shape[0], args.neg_size)  # [B, neg]
 
-            # Margin ranking loss: max(0, margin + s(neg) - s(pos))
-            loss = torch.relu(args.margin + neg_score - pos_score).mean()
+            if args.score_fn == "transe":
+                # TransE mainstream: margin ranking with corrupted head/tail negatives.
+                loss = torch.relu(args.margin + neg_score - pos_score).mean()
+            else:
+                # DistMult mainstream: self-adversarial negative sampling + logistic loss.
+                pos_loss = -F.logsigmoid(pos_score).mean()
+                if args.adv_temp > 0:
+                    neg_weight = F.softmax(neg_score * args.adv_temp, dim=1).detach()
+                    neg_loss = -(neg_weight * F.logsigmoid(-neg_score)).sum(dim=1).mean()
+                else:
+                    neg_loss = -F.logsigmoid(-neg_score).mean()
+                loss = 0.5 * (pos_loss + neg_loss)
 
             optimizer.zero_grad()
             loss.backward()
@@ -237,11 +273,14 @@ def main():
                 "entity_emb": model.entity_emb.weight.detach().cpu().clone(),
                 "relation_emb": model.relation_emb.weight.detach().cpu().clone(),
                 "score_fn": args.score_fn,
+                "optimizer": opt_name,
+                "lr": lr,
                 "emb_dim": args.emb_dim,
                 "best_recall_at_k": best_recall,
                 "recall_k": args.recall_k,
                 "epoch": epoch,
                 "margin": args.margin,
+                "adv_temp": args.adv_temp,
                 "entity_norm": use_entity_norm,
             }
             bad_eval_count = 0
@@ -268,11 +307,14 @@ def main():
             "entity_emb": model.entity_emb.weight.detach().cpu().clone(),
             "relation_emb": model.relation_emb.weight.detach().cpu().clone(),
             "score_fn": args.score_fn,
+            "optimizer": opt_name,
+            "lr": lr,
             "emb_dim": args.emb_dim,
             "best_recall_at_k": recall,
             "recall_k": args.recall_k,
             "epoch": args.max_epoch,
             "margin": args.margin,
+            "adv_temp": args.adv_temp,
             "entity_norm": use_entity_norm,
         }
         print(f"==> fallback save with Recall@{args.recall_k}: {recall:.4f}")
