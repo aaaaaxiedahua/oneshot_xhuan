@@ -1,5 +1,7 @@
 import os
 import argparse
+import json
+import ast
 import torch
 import time
 import numpy as np
@@ -77,6 +79,7 @@ parser.add_argument('--useSearchLog', action='store_true')
 parser.add_argument('--search', action='store_true')
 parser.add_argument('--finetune', action='store_true')
 parser.add_argument('--finetune_config', type=str, default='')
+parser.add_argument('--start_config', type=str, default='')  # optional: JSON string or file path for seeded trial config
 parser.add_argument('--not_shuffle_train', action='store_true')
 # ========== R-BiPPR args ==========
 parser.add_argument('--use_bippr', action='store_true')
@@ -109,6 +112,107 @@ parser.add_argument('--qtar_soft_only', action='store_true')
 # parser.add_argument('--rca_mode', type=str, default='shared')       # shared / per_layer
 # parser.add_argument('--compose_max_hop', type=int, default=2)       # max composition hops: 2 or 3
 args = parser.parse_args()
+
+
+def _sample_one_from_space(space):
+    cfg = {}
+    for hp_name, info in space.items():
+        hp_type, hp_range = info[0], info[1]
+        if hp_type == 'uniform':
+            cfg[hp_name] = float(np.random.uniform(hp_range[0], hp_range[1]))
+        else:
+            cfg[hp_name] = np.random.choice(hp_range, 1)[0]
+    return cfg
+
+
+def _load_start_config(raw_value):
+    if raw_value is None or str(raw_value).strip() == '':
+        return None
+
+    raw_value = str(raw_value).strip()
+    data = None
+
+    if os.path.exists(raw_value):
+        if raw_value.endswith('.pkl'):
+            data = pkl.load(open(raw_value, 'rb'))
+        else:
+            text = open(raw_value, 'r', encoding='utf-8').read()
+            try:
+                data = json.loads(text)
+            except Exception:
+                data = ast.literal_eval(text)
+    else:
+        try:
+            data = json.loads(raw_value)
+        except Exception:
+            data = ast.literal_eval(raw_value)
+
+    if isinstance(data, dict):
+        return [data]
+    if isinstance(data, list):
+        if len(data) == 0:
+            return None
+        if not all(isinstance(x, dict) for x in data):
+            raise ValueError('--start_config list must contain dict items.')
+        return data
+    raise ValueError('--start_config must be a dict or list[dict].')
+
+
+def _coerce_choice_value(value, choices):
+    if value in choices:
+        return value
+
+    if isinstance(value, str):
+        for caster in (int, float):
+            try:
+                casted = caster(value)
+                if casted in choices:
+                    return casted
+            except Exception:
+                pass
+
+    if isinstance(value, (int, float)):
+        for c in choices:
+            if isinstance(c, (int, float)) and abs(float(c) - float(value)) < 1e-12:
+                return c
+
+    return None
+
+
+def _build_start_candidates(raw_start_configs, hp_space):
+    if raw_start_configs is None:
+        return None
+
+    start_candidates = []
+    hp_keys = set(hp_space.keys())
+    for idx, user_cfg in enumerate(raw_start_configs):
+        seed_cfg = _sample_one_from_space(hp_space)
+        unknown_keys = [k for k in user_cfg.keys() if k not in hp_keys]
+        if len(unknown_keys) > 0:
+            print(f'==> warning: ignored unknown start_config keys at index {idx}: {unknown_keys}')
+
+        for hp_name, info in hp_space.items():
+            if hp_name not in user_cfg:
+                continue
+
+            hp_type, hp_range = info[0], info[1]
+            user_val = user_cfg[hp_name]
+
+            if hp_type == 'uniform':
+                user_val = float(user_val)
+                lo, hi = float(hp_range[0]), float(hp_range[1])
+                if user_val < lo or user_val > hi:
+                    raise ValueError(f'start_config[{idx}]["{hp_name}"]={user_val} out of range [{lo}, {hi}]')
+                seed_cfg[hp_name] = user_val
+            else:
+                coerced = _coerce_choice_value(user_val, hp_range)
+                if coerced is None:
+                    raise ValueError(f'start_config[{idx}]["{hp_name}"]={user_val} not in choices {hp_range}')
+                seed_cfg[hp_name] = coerced
+
+        start_candidates.append(seed_cfg)
+
+    return start_candidates
 
 if __name__ == '__main__':
     torch.set_num_threads(8)
@@ -298,6 +402,12 @@ if __name__ == '__main__':
     if args.search:
         print('==> HPO search mode (random start)')
         HPO_instance = RF_HPO(kgeModelName='redgnn', obj_function=run_model, dataset_name=args.dataset, HP_info=HPO_search_space, acq='EI')
+        start_candidates = None
+
+        if args.start_config != '':
+            user_start_cfg = _load_start_config(args.start_config)
+            start_candidates = _build_start_candidates(user_start_cfg, HPO_search_space)
+            print(f'==> HPO: loaded {len(start_candidates)} start candidate(s) from --start_config')
 
         if args.useSearchLog and os.path.exists(HPO_save_path):
             config_list, mrr_list = loadSearchLog(HPO_save_path)
@@ -305,7 +415,7 @@ if __name__ == '__main__':
             HPO_instance.pretrain(config_list, mrr_list, dataset_names=dataset_names)
 
         max_trials, sample_num = 1e10, 1e4
-        HPO_instance.runTrials(max_trials, sample_num, explore_trials=1e10, start_candidate=None)
+        HPO_instance.runTrials(max_trials, sample_num, explore_trials=1e10, start_candidate=start_candidates)
         
     elif args.finetune:
         print('==> HPO finetune mode')
@@ -326,5 +436,4 @@ if __name__ == '__main__':
             print(idx, param)
             if idx == -1: break
             run_model(param, finetune_idx=idx)
-
 
