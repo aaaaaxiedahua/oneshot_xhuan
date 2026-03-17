@@ -25,14 +25,6 @@ parser.add_argument('--add_manual_edges', action='store_true')
 parser.add_argument('--remove_1hop_edges', action='store_true')
 parser.add_argument('--only_eval', action='store_true')
 parser.add_argument('--not_shuffle_train', action='store_true')
-# ========== R-BiPPR args ==========
-parser.add_argument('--use_bippr', action='store_true')                  # enable bidirectional ppr collision
-parser.add_argument('--retriever_type', type=str, default='distmult')    # distmult / transe
-parser.add_argument('--retriever_ckpt', type=str, default='')            # retriever checkpoint path
-parser.add_argument('--kge_topk', type=int, default=100)                 # candidate size for reverse ppr
-parser.add_argument('--collision_lambda', type=float, default=1.0)       # reverse ppr fusion strength
-parser.add_argument('--train_include_gt_prob', type=float, default=1.0)  # train-time gt candidate injection prob
-parser.add_argument('--bippr_cache_size', type=int, default=256)         # ppr vector cache size
 # ========== QTAR args ==========
 parser.add_argument('--use_qtar', action='store_true')                   # enable query-target adaptive routing
 parser.add_argument('--qtar_ratio_start', type=float, default=1.0)       # keep ratio at first layer

@@ -1,12 +1,10 @@
 import networkx as nx
 import pickle as pkl
 import time
-import copy
 import numpy as np
 import torch
 import os
 import logging
-import copy
 from tqdm import tqdm
 from scipy.sparse import csr_matrix, coo_matrix
 from collections import defaultdict, OrderedDict
@@ -38,7 +36,7 @@ class pprSampler():
         self.homoTrainGraph = self.triplesToNxGraph(self.homoEdges)
         self.ppr_savePath = os.path.join(self.data_folder, f'ppr_scores/')
         self.ppr_vector_cache = OrderedDict()
-        self.ppr_cache_size = max(16, int(getattr(args, 'bippr_cache_size', 256)))
+        self.ppr_cache_size = 256
         checkPath(self.ppr_savePath)
         print('==> checking ppr scores for each entity...')
         
@@ -80,19 +78,6 @@ class pprSampler():
         # if hasattr(args, 'use_rel_prior') and args.use_rel_prior:
         #     self.mineRelationPatterns(edge_index)
         # # ========== End Module 1 ==========
-
-        # ========== R-BiPPR: Bidirectional PPR collision ==========
-        self.use_bippr = hasattr(args, 'use_bippr') and args.use_bippr
-        self.retriever_type = getattr(args, 'retriever_type', 'distmult').lower()
-        self.kge_topk = max(1, int(getattr(args, 'kge_topk', 100)))
-        self.collision_lambda = float(getattr(args, 'collision_lambda', 1.0))
-        self.train_include_gt_prob = float(getattr(args, 'train_include_gt_prob', 1.0))
-        self.train_include_gt_prob = max(0.0, min(1.0, self.train_include_gt_prob))
-        self.ret_ent_emb = None
-        self.ret_rel_emb = None
-        if self.use_bippr:
-            self._initBipprRetriever()
-        # ========== End R-BiPPR ==========
 
         print('==> finish sampler initilization.')
 
@@ -150,97 +135,6 @@ class pprSampler():
         graph.add_edges_from(edges)
         return graph
 
-    # ========== R-BiPPR helpers ==========
-    def _extractRetrieverWeights(self, state):
-        if state is None:
-            return None, None
-
-        if isinstance(state, dict):
-            direct_ent_keys = ['entity_emb', 'ent_emb']
-            direct_rel_keys = ['relation_emb', 'rel_emb']
-            for k in direct_ent_keys:
-                if k in state and torch.is_tensor(state[k]):
-                    ent = state[k]
-                    break
-            else:
-                ent = None
-            for k in direct_rel_keys:
-                if k in state and torch.is_tensor(state[k]):
-                    rel = state[k]
-                    break
-            else:
-                rel = None
-            if ent is not None and rel is not None:
-                return ent, rel
-
-            if 'model_state_dict' in state and isinstance(state['model_state_dict'], dict):
-                msd = state['model_state_dict']
-                ent_keys = ['entity_emb.weight', 'ent_emb.weight', 'ent_embedding.weight']
-                rel_keys = ['relation_emb.weight', 'rel_emb.weight', 'rel_embedding.weight']
-                ent = None
-                rel = None
-                for k in ent_keys:
-                    if k in msd and torch.is_tensor(msd[k]):
-                        ent = msd[k]
-                        break
-                for k in rel_keys:
-                    if k in msd and torch.is_tensor(msd[k]):
-                        rel = msd[k]
-                        break
-                if ent is not None and rel is not None:
-                    return ent, rel
-        return None, None
-
-    def _initBipprRetriever(self):
-        ckpt_path = getattr(self.args, 'retriever_ckpt', '')
-        if ckpt_path == '' or not os.path.exists(ckpt_path):
-            raise FileNotFoundError('R-BiPPR requires --retriever_ckpt with valid checkpoint path.')
-        print(f'==> loading retriever checkpoint from: {ckpt_path}')
-        state = torch.load(ckpt_path, map_location='cpu')
-        ent_emb, rel_emb = self._extractRetrieverWeights(state)
-        if ent_emb is None or rel_emb is None:
-            raise ValueError('Cannot find entity/relation embeddings in retriever checkpoint.')
-        self.ret_ent_emb = ent_emb.float().cpu()
-        self.ret_rel_emb = rel_emb.float().cpu()
-        if self.ret_ent_emb.shape[0] != self.n_ent:
-            raise ValueError(f'Retriever entity size mismatch: {self.ret_ent_emb.shape[0]} vs {self.n_ent}')
-        print(f'==> retriever loaded. type={self.retriever_type} ent={tuple(self.ret_ent_emb.shape)} rel={tuple(self.ret_rel_emb.shape)}')
-
-    def _normalizeRelIdx(self, rel):
-        rel = int(rel)
-        n_ret_rel = int(self.ret_rel_emb.shape[0])
-        if 0 <= rel < n_ret_rel:
-            return rel
-        if n_ret_rel == self.n_rel:
-            return rel % self.n_rel
-        if n_ret_rel == 2 * self.n_rel:
-            return rel % (2 * self.n_rel)
-        return rel % n_ret_rel
-
-    def _scoreAllEntities(self, ent, rel):
-        rel_idx = self._normalizeRelIdx(rel)
-        h = self.ret_ent_emb[int(ent)]  # [d]
-        r = self.ret_rel_emb[rel_idx]   # [d]
-        if self.retriever_type == 'transe':
-            scores = -torch.norm((h + r).unsqueeze(0) - self.ret_ent_emb, p=1, dim=-1)
-        else:  # default distmult
-            scores = torch.sum(self.ret_ent_emb * (h * r), dim=-1)
-        return scores
-
-    def _getRetrieverCandidates(self, ent, rel, gt_cand=None):
-        scores = self._scoreAllEntities(ent, rel)
-        k = min(self.kge_topk, int(scores.shape[0]))
-        top_vals, top_idx = torch.topk(scores, k, largest=True, sorted=True)
-        if gt_cand is not None:
-            gt_cand = int(gt_cand)
-            if gt_cand not in top_idx.tolist():
-                gt_score = scores[gt_cand]
-                top_idx[-1] = gt_cand
-                top_vals[-1] = gt_score
-        weights = torch.softmax(top_vals, dim=0).cpu().numpy()
-        return top_idx.cpu().numpy().astype(np.int64), weights
-    # ========== End R-BiPPR helpers ==========
-    
     # # ========== Module 1: Relation-Path Conditioned Sampling ==========
     # # Mines frequent 2-hop relation path patterns for each relation
     # # and uses path reachability to condition subgraph extraction.
@@ -344,24 +238,10 @@ class pprSampler():
     #         self.adj_by_rel[h][r].add(t)
     # # ========== End Module 1 ==========
 
-    def sampleSubgraph(self, ent: int, rel: int = -1, cand=None):
+    def sampleSubgraph(self, ent: int, rel: int = -1):
         # sample subgraph to get the edges
         ppr_scores = self.getPPRarray(ent)
         fused_scores = ppr_scores
-
-        # ========== R-BiPPR: forward + reverse ppr collision ==========
-        force_train_cand = None
-        if cand is not None and self.split == 'train' and self.use_bippr:
-            if np.random.rand() < self.train_include_gt_prob:
-                force_train_cand = int(cand)
-
-        if self.use_bippr and rel != -1:
-            cand_ids, cand_weights = self._getRetrieverCandidates(ent, rel, gt_cand=force_train_cand)
-            rev_scores = np.zeros(self.n_ent, dtype=np.float32)
-            for c, w in zip(cand_ids, cand_weights):
-                rev_scores += float(w) * self.getPPRarray(int(c))
-            fused_scores = ppr_scores * (1.0 + self.collision_lambda * rev_scores)
-        # ========== End R-BiPPR ==========
 
         # # ========== Module 1: Fuse path-based prior with PPR scores ==========
         # # When enabled, the node selection combines structural proximity (PPR)
@@ -400,18 +280,12 @@ class pprSampler():
         # # ========== End Module 1 ==========
         # fused_scores = ppr_scores
 
-        # gurantee the candidates are sampled
-        if force_train_cand is not None and self.topk < self.n_ent:
-            tmp_scores = copy.deepcopy(fused_scores)
-            tmp_scores[force_train_cand] = 1e8
-            topk_nodes = sorted(list(set([ent] + np.argsort(tmp_scores)[::-1][:self.topk].tolist())))
+        # topk sampling
+        if self.topk < self.n_ent:
+            topk_nodes = sorted(list(set([ent] + np.argsort(fused_scores)[::-1][:self.topk].tolist())))
         else:
-            # topk sampling
-            if self.topk < self.n_ent:
-                topk_nodes = sorted(list(set([ent] + np.argsort(fused_scores)[::-1][:self.topk].tolist())))
-            else:
-                # no sampling
-                topk_nodes = list(range(self.n_ent))
+            # no sampling
+            topk_nodes = list(range(self.n_ent))
 
         # get candididate edges
         selectd_edges = self.sparseTrainMatrix[topk_nodes, :]	
@@ -456,8 +330,8 @@ class pprSampler():
         
         return topk_nodes, node_index, sampled_edges
 
-    def getOneSubgraph(self, head: int, rel: int = -1, cand=None):
-        topk_nodes, node_index, sampled_edges = self.sampleSubgraph(head, rel, cand)
+    def getOneSubgraph(self, head: int, rel: int = -1):
+        topk_nodes, node_index, sampled_edges = self.sampleSubgraph(head, rel)
         return [head, topk_nodes, node_index, sampled_edges]
         
     def getBatchSubgraph(self, subgraph_list: list):  
