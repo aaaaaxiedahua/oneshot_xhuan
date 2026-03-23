@@ -37,8 +37,23 @@ class pprSampler():
         self.ppr_savePath = os.path.join(self.data_folder, f'ppr_scores/')
         self.ppr_vector_cache = OrderedDict()
         self.ppr_cache_size = 256
+        self.use_lqcd = bool(getattr(args, 'use_lqcd', False))
+        self.lqcd_coarse_ratio = float(getattr(args, 'lqcd_coarse_ratio', 1.5))
+        self.lqcd_fuse_lambda = float(getattr(args, 'lqcd_fuse_lambda', 0.7))
+        self.lqcd_topl = max(1, int(getattr(args, 'lqcd_topl', 2)))
+        self.lqcd_rel_gamma = 0.5
+        self.lqcd_hub_beta = 1.0
+        self.lqcd_self_loop = 1.0
+        self.idd_rel = 2 * self.n_rel
+        self.lqcd_logged = False
         checkPath(self.ppr_savePath)
         print('==> checking ppr scores for each entity...')
+        if self.use_lqcd:
+            print(
+                f'==> LQCD[{self.split}]: enabled '
+                f'(coarse_ratio={self.lqcd_coarse_ratio}, fuse_lambda={self.lqcd_fuse_lambda}, '
+                f'topl={self.lqcd_topl}, gamma={self.lqcd_rel_gamma})'
+            )
         
         for h in tqdm(range(self.n_ent), ncols=50, leave=False):
             ent_ppr_savePath = os.path.join(self.ppr_savePath, f'{int(h)}.pkl')
@@ -134,6 +149,155 @@ class pprSampler():
         graph.add_nodes_from(nodes)        
         graph.add_edges_from(edges)
         return graph
+
+    def _minmax_normalize(self, x):
+        x = np.asarray(x, dtype=np.float32)
+        if x.size == 0:
+            return x
+        x_min = float(np.min(x))
+        x_max = float(np.max(x))
+        if x_max - x_min < 1e-12:
+            return np.zeros_like(x, dtype=np.float32)
+        return (x - x_min) / (x_max - x_min + 1e-12)
+
+    def _row_normalize(self, mat):
+        mat = np.asarray(mat, dtype=np.float32)
+        if mat.size == 0:
+            return mat
+        denom = np.sum(mat, axis=1, keepdims=True)
+        denom = np.clip(denom, 1e-12, None)
+        return mat / denom
+
+    def _extract_induced_edges(self, node_ids):
+        node_ids = np.asarray(node_ids, dtype=np.int64)
+        if node_ids.size == 0:
+            return torch.zeros((0, 3), dtype=torch.long)
+
+        selected_edges = self.sparseTrainMatrix[node_ids, :]
+        _, edge_ids = selected_edges.nonzero()
+        edges = self.edge_index[edge_ids]
+        node_tensor = torch.as_tensor(node_ids, dtype=torch.long)
+        mask = torch.isin(edges[:, 2], node_tensor)
+        return edges[mask, :]
+
+    def _build_lqcd_scores(self, ent, rel, ppr_scores):
+        if rel == -1 or self.topk >= self.n_ent:
+            return ppr_scores
+
+        coarse_k = int(np.ceil(max(1.0, self.lqcd_coarse_ratio) * self.topk))
+        coarse_k = min(self.n_ent, max(self.topk, coarse_k))
+        coarse_rank = np.argsort(ppr_scores)[::-1][:coarse_k].tolist()
+        coarse_nodes = np.array(list(dict.fromkeys([int(ent)] + coarse_rank)), dtype=np.int64)
+
+        coarse_edges = self._extract_induced_edges(coarse_nodes)
+        if coarse_edges.shape[0] == 0:
+            if not self.lqcd_logged:
+                print(f'==> LQCD[{self.split}]: fallback to raw PPR (query_rel={rel}, reason=no_coarse_edges)')
+                self.lqcd_logged = True
+            return ppr_scores
+
+        coarse_edges_np = coarse_edges.numpy()
+        local_edges = coarse_edges_np[coarse_edges_np[:, 1] != self.idd_rel]
+        if local_edges.shape[0] == 0:
+            if not self.lqcd_logged:
+                print(f'==> LQCD[{self.split}]: fallback to raw PPR (query_rel={rel}, reason=no_local_rel_edges)')
+                self.lqcd_logged = True
+            return ppr_scores
+
+        node_pos = {int(node): idx for idx, node in enumerate(coarse_nodes.tolist())}
+        ppr_local = ppr_scores[coarse_nodes]
+        ppr_local_norm = self._minmax_normalize(ppr_local)
+        deg_local = np.zeros(len(coarse_nodes), dtype=np.int32)
+        rel_sets = defaultdict(set)
+        in_edges = defaultdict(list)
+        out_edges = defaultdict(list)
+        rel_vocab = {int(rel)}
+
+        for h, r, t in local_edges:
+            h, r, t = int(h), int(r), int(t)
+            rel_vocab.add(r)
+            h_idx = node_pos[h]
+            t_idx = node_pos[t]
+            deg_local[h_idx] += 1
+            deg_local[t_idx] += 1
+            rel_sets[h].add(r)
+            rel_sets[t].add(r)
+            out_edges[h].append((h, r, t))
+            in_edges[t].append((h, r, t))
+
+        rel_list = sorted(rel_vocab)
+        rel_pos = {r_id: idx for idx, r_id in enumerate(rel_list)}
+        n_local_rel = len(rel_list)
+        cooccur = np.zeros((n_local_rel, n_local_rel), dtype=np.float32)
+        transition = np.zeros((n_local_rel, n_local_rel), dtype=np.float32)
+
+        for node, node_rels in rel_sets.items():
+            if len(node_rels) < 2:
+                continue
+            node_idx = node_pos[node]
+            hub_weight = 1.0 / (np.log(2.0 + float(deg_local[node_idx])) ** self.lqcd_hub_beta)
+            rels = sorted(node_rels)
+            pair_norm = hub_weight / max(1.0, (len(rels) * (len(rels) - 1)) / 2.0)
+            for i in range(len(rels)):
+                for j in range(i + 1, len(rels)):
+                    ri = rel_pos[rels[i]]
+                    rj = rel_pos[rels[j]]
+                    cooccur[ri, rj] += pair_norm
+                    cooccur[rj, ri] += pair_norm
+
+        for mid, incoming in in_edges.items():
+            outgoing = out_edges.get(mid, [])
+            if len(incoming) == 0 or len(outgoing) == 0:
+                continue
+            mid_idx = node_pos[mid]
+            hub_weight = 1.0 / (np.log(2.0 + float(deg_local[mid_idx])) ** self.lqcd_hub_beta)
+            trans_weight = ppr_local_norm[mid_idx] * hub_weight
+            trans_norm = trans_weight / max(1, len(incoming) * len(outgoing))
+            for _, ri, _ in incoming:
+                for _, rj, _ in outgoing:
+                    transition[rel_pos[int(ri)], rel_pos[int(rj)]] += trans_norm
+
+        relation_graph = self._row_normalize(cooccur) + self._row_normalize(transition)
+        relation_graph += self.lqcd_self_loop * np.eye(n_local_rel, dtype=np.float32)
+        relation_graph = self._row_normalize(relation_graph)
+
+        query_idx = rel_pos[int(rel)]
+        query_onehot = np.zeros(n_local_rel, dtype=np.float32)
+        query_onehot[query_idx] = 1.0
+        rel_scores = self.lqcd_rel_gamma * query_onehot + (1.0 - self.lqcd_rel_gamma) * (relation_graph.T @ query_onehot)
+
+        node_supports = defaultdict(list)
+        for h, r, t in local_edges:
+            h, r, t = int(h), int(r), int(t)
+            h_idx = node_pos[h]
+            t_idx = node_pos[t]
+            edge_score = float(rel_scores[rel_pos[r]] * 0.5 * (ppr_local_norm[h_idx] + ppr_local_norm[t_idx]))
+            node_supports[h].append(edge_score)
+            node_supports[t].append(edge_score)
+
+        node_rel_scores = np.zeros(len(coarse_nodes), dtype=np.float32)
+        for node, supports in node_supports.items():
+            top_supports = np.sort(np.asarray(supports, dtype=np.float32))[::-1]
+            keep_k = min(self.lqcd_topl, top_supports.size)
+            node_rel_scores[node_pos[node]] = float(np.mean(top_supports[:keep_k]))
+
+        node_rel_scores = self._minmax_normalize(node_rel_scores)
+        fuse_lambda = float(np.clip(self.lqcd_fuse_lambda, 0.0, 1.0))
+        fused_local = fuse_lambda * ppr_local_norm + (1.0 - fuse_lambda) * node_rel_scores
+
+        if not self.lqcd_logged:
+            rel_score_max = float(np.max(rel_scores)) if rel_scores.size > 0 else 0.0
+            rel_score_mean = float(np.mean(rel_scores)) if rel_scores.size > 0 else 0.0
+            print(
+                f'==> LQCD[{self.split}]: query_rel={rel}, coarse_nodes={len(coarse_nodes)}, '
+                f'local_edges={int(local_edges.shape[0])}, local_rels={n_local_rel}, '
+                f'topl={self.lqcd_topl}, rel_score_max={rel_score_max:.4f}, rel_score_mean={rel_score_mean:.4f}'
+            )
+            self.lqcd_logged = True
+
+        fused_scores = np.full(self.n_ent, -np.inf, dtype=np.float32)
+        fused_scores[coarse_nodes] = fused_local
+        return fused_scores
 
     # # ========== Module 1: Relation-Path Conditioned Sampling ==========
     # # Mines frequent 2-hop relation path patterns for each relation
@@ -279,6 +443,9 @@ class pprSampler():
         #     fused_scores = ppr_scores
         # # ========== End Module 1 ==========
         # fused_scores = ppr_scores
+
+        if self.use_lqcd and rel != -1:
+            fused_scores = self._build_lqcd_scores(ent, rel, ppr_scores)
 
         # topk sampling
         if self.topk < self.n_ent:

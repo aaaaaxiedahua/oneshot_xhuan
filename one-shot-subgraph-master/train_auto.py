@@ -25,15 +25,19 @@ parser.add_argument('--add_manual_edges', action='store_true')
 parser.add_argument('--remove_1hop_edges', action='store_true')
 parser.add_argument('--only_eval', action='store_true')
 parser.add_argument('--not_shuffle_train', action='store_true')
+parser.add_argument('--use_readout_refine', action='store_true')        # enable residual MLP refinement before readout
+# ========== LQCD args ==========
+parser.add_argument('--use_lqcd', action='store_true')                  # enable two-stage LQCD sampler
+parser.add_argument('--lqcd_coarse_ratio', type=float, default=1.5)     # coarse candidate expansion ratio
+parser.add_argument('--lqcd_fuse_lambda', type=float, default=0.7)      # fuse weight between PPR and relation score
+parser.add_argument('--lqcd_topl', type=int, default=2)                 # Top-L incident edges for node projection
 # ========== QTAR args ==========
 parser.add_argument('--use_qtar', action='store_true')                   # enable query-target adaptive routing
 parser.add_argument('--qtar_ratio_start', type=float, default=1.0)       # keep ratio at first layer
 parser.add_argument('--qtar_ratio_end', type=float, default=0.8)         # keep ratio at last layer
 parser.add_argument('--qtar_warmup', type=int, default=5)                # warmup epochs before routing
 parser.add_argument('--qtar_router_hidden', type=int, default=64)        # hidden dim of router mlp
-parser.add_argument('--qtar_budget_lambda', type=float, default=0.01)    # budget regularization weight
 parser.add_argument('--qtar_min_edges', type=int, default=64)            # minimum kept edges per layer
-parser.add_argument('--qtar_soft_only', action='store_true')             # only apply soft routing, no hard pruning
 # # ========== Module 1: Relation-Path Conditioned Sampling args ==========
 # parser.add_argument('--use_rel_prior', action='store_true')         # enable path-based relation prior
 # parser.add_argument('--path_lambda', type=float, default=0.5)       # weight for path prior in fusion

@@ -377,7 +377,7 @@ class QTARRouter(torch.nn.Module):
             return x
         return x / (maxv + 1e-12)
 
-    def forward(self, hidden, edges, q_rel, edge_batch_idxs, evidence, keep_ratio=1.0, soft_only=False):
+    def forward(self, hidden, edges, q_rel, edge_batch_idxs, evidence, keep_ratio=1.0):
         # edges: [n_edges, 3], hidden: [n_nodes, d], evidence: [n_nodes]
         sub, rel, obj = edges[:, 0], edges[:, 1], edges[:, 2]
         hs = hidden[sub]
@@ -390,12 +390,11 @@ class QTARRouter(torch.nn.Module):
         route_scores = torch.clamp(route_scores, min=1e-8)
 
         n_edges = int(edges.shape[0])
-        if soft_only or keep_ratio >= 0.999 or n_edges <= self.min_edges:
+        if keep_ratio >= 0.999 or n_edges <= self.min_edges:
             keep_index = torch.arange(n_edges, device=edges.device)
             kept_edges = edges
             kept_batch = edge_batch_idxs
             kept_weights = route_scores
-            kept_ratio = 1.0
         else:
             target_keep = max(self.min_edges, int(keep_ratio * n_edges))
             target_keep = min(target_keep, n_edges)
@@ -403,7 +402,6 @@ class QTARRouter(torch.nn.Module):
             kept_edges = edges[keep_index]
             kept_batch = edge_batch_idxs[keep_index]
             kept_weights = route_scores[keep_index]
-            kept_ratio = float(target_keep) / float(max(1, n_edges))
 
         # evidence update uses the routed edges
         kept_sub = kept_edges[:, 0]
@@ -411,7 +409,7 @@ class QTARRouter(torch.nn.Module):
         evidence_msg = evidence[kept_sub] * kept_weights
         new_evidence = scatter(evidence_msg, index=kept_obj, dim=0, dim_size=hidden.shape[0], reduce='sum')
         new_evidence = self._normalize_evidence(new_evidence)
-        return kept_edges, kept_batch, kept_weights, new_evidence, kept_ratio
+        return kept_edges, kept_batch, kept_weights, new_evidence
 
 
 class GNNLayer(torch.nn.Module):
@@ -472,18 +470,21 @@ class GNN_auto(torch.nn.Module):
         act = acts[params.act]
         self.current_epoch = 0
         self.latest_aux_loss = torch.tensor(0.0)
+        self.qtar_logged_epochs = set()
 
         # ========== QTAR ==========
         self.use_qtar = hasattr(params, 'use_qtar') and params.use_qtar
         self.qtar_ratio_start = float(getattr(params, 'qtar_ratio_start', 1.0))
         self.qtar_ratio_end = float(getattr(params, 'qtar_ratio_end', 0.8))
         self.qtar_warmup = int(getattr(params, 'qtar_warmup', 5))
-        self.qtar_budget_lambda = float(getattr(params, 'qtar_budget_lambda', 0.01))
-        self.qtar_soft_only = getattr(params, 'qtar_soft_only', False)
         qtar_hidden = int(getattr(params, 'qtar_router_hidden', 64))
         qtar_min_edges = int(getattr(params, 'qtar_min_edges', 64))
         if self.use_qtar:
             self.qtar_router = QTARRouter(self.hidden_dim, self.n_rel, router_hidden=qtar_hidden, min_edges=qtar_min_edges)
+            print(
+                f'==> QTAR: enabled (ratio_start={self.qtar_ratio_start}, ratio_end={self.qtar_ratio_end}, '
+                f'warmup={self.qtar_warmup}, router_hidden={qtar_hidden}, min_edges={qtar_min_edges})'
+            )
         # ========== End QTAR ==========
 
         # # ========== Module 2 ==========
@@ -500,11 +501,25 @@ class GNN_auto(torch.nn.Module):
         self.gate = nn.GRU(self.hidden_dim, self.hidden_dim)
 
         if self.params.initializer == 'relation': self.query_rela_embed = nn.Embedding(2*self.n_rel+1, self.hidden_dim)
+        self.readout_dim = self.hidden_dim * (self.n_layer + 1) if self.params.concatHidden else self.hidden_dim
+        self.use_readout_refine = hasattr(params, 'use_readout_refine') and params.use_readout_refine
+        if self.use_readout_refine:
+            refine_hidden = max(1, self.readout_dim // 2)
+            self.readout_refine = nn.Sequential(
+                nn.Linear(self.readout_dim, refine_hidden),
+                nn.ReLU(),
+                nn.Dropout(params.dropout),
+                nn.Linear(refine_hidden, self.readout_dim),
+            )
+            print(f'==> ReadoutRefine: enabled (readout_dim={self.readout_dim}, hidden={refine_hidden})')
         if self.params.readout == 'linear':
-            if self.params.concatHidden:
-                self.W_final = nn.Linear(self.hidden_dim * (self.n_layer+1), 1, bias=False)
-            else:
-                self.W_final = nn.Linear(self.hidden_dim, 1, bias=False)
+            self.W_final = nn.Linear(self.readout_dim, 1, bias=False)
+        elif self.params.readout == 'pair_mlp':
+            self.pair_score_head = nn.Sequential(
+                nn.Linear(self.readout_dim * 4, self.readout_dim),
+                nn.ReLU(),
+                nn.Linear(self.readout_dim, 1),
+            )
 
         # # ========== Module 2: Create Relation Composer(s) ==========
         # if self.use_rca:
@@ -539,6 +554,10 @@ class GNN_auto(torch.nn.Module):
         h0 = torch.zeros((1, n_node, self.hidden_dim)).cuda()
         hidden = torch.zeros(n_node, self.hidden_dim).cuda()
         self.latest_aux_loss = torch.zeros(1, device=hidden.device).squeeze(0)
+        qtar_log_key = (mode, self.current_epoch)
+        should_log_qtar = self.use_qtar and mode == 'train' and qtar_log_key not in self.qtar_logged_epochs
+        qtar_log_items = []
+        qtar_warmup_skip = False
 
         # # ========== Module 2: Generate virtual edges ==========
         # edge_weights = None
@@ -564,7 +583,6 @@ class GNN_auto(torch.nn.Module):
         if self.params.concatHidden: hidden_list = [hidden]
         evidence = torch.zeros(n_node, device=hidden.device)
         evidence[query_sub_idxs] = 1.0
-        budget_penalty = torch.zeros(1, device=hidden.device).squeeze(0)
 
         # propagation
         for i in range(self.n_layer):
@@ -587,14 +605,16 @@ class GNN_auto(torch.nn.Module):
 
             if self.use_qtar and not (mode == 'train' and self.current_epoch < self.qtar_warmup):
                 keep_ratio = self._layer_keep_ratio(i)
-                curr_edges, curr_batch, curr_edge_weights, evidence, kept_ratio = self.qtar_router(
+                curr_edges, curr_batch, curr_edge_weights, evidence = self.qtar_router(
                     hidden, batch_sampled_edges, q_rel, edge_batch_idxs, evidence,
-                    keep_ratio=keep_ratio, soft_only=self.qtar_soft_only
+                    keep_ratio=keep_ratio
                 )
-                if (not self.qtar_soft_only) and keep_ratio < 0.999:
-                    budget_penalty = budget_penalty + torch.relu(
-                        torch.tensor(kept_ratio - keep_ratio, device=hidden.device)
+                if should_log_qtar:
+                    qtar_log_items.append(
+                        f'L{i}:ratio={keep_ratio:.2f},kept={int(curr_edges.shape[0])}/{int(batch_sampled_edges.shape[0])}'
                     )
+            elif self.use_qtar and mode == 'train' and self.current_epoch < self.qtar_warmup and should_log_qtar:
+                qtar_warmup_skip = True
 
             hidden = self.gnn_layers[i](q_sub, q_rel, curr_batch, hidden, curr_edges, n_node,
                                         shortcut=self.params.shortcut, edge_weights=curr_edge_weights)
@@ -608,16 +628,31 @@ class GNN_auto(torch.nn.Module):
 
             if self.params.concatHidden: hidden_list.append(hidden)
 
+        if should_log_qtar:
+            if qtar_warmup_skip:
+                print(f'==> QTAR[train]: epoch={self.current_epoch}, warmup active, routing skipped')
+            else:
+                print(f'==> QTAR[train]: epoch={self.current_epoch}, ' + ' | '.join(qtar_log_items))
+            self.qtar_logged_epochs.add(qtar_log_key)
+
         # readout
+        if self.params.concatHidden: hidden = torch.cat(hidden_list, dim=-1)
+        if self.use_readout_refine:
+            hidden = hidden + self.readout_refine(hidden)
         if self.params.readout == 'linear':
-            if self.params.concatHidden: hidden = torch.cat(hidden_list, dim=-1)
             scores = self.W_final(hidden).squeeze(-1)
         elif self.params.readout == 'multiply':
-            if self.params.concatHidden: hidden = torch.cat(hidden_list, dim=-1)
             scores = torch.sum(hidden * hidden[query_sub_idxs][batch_idxs], dim=-1)
+        elif self.params.readout == 'pair_mlp':
+            query_hidden = hidden[query_sub_idxs][batch_idxs]
+            pair_feat = torch.cat(
+                [hidden, query_hidden, hidden * query_hidden, torch.abs(hidden - query_hidden)],
+                dim=-1,
+            )
+            scores = self.pair_score_head(pair_feat).squeeze(-1)
+        else:
+            raise ValueError(f'Unknown readout type: {self.params.readout}')
 
         scores_all = torch.zeros((n, self.loader.n_ent)).cuda()
         scores_all[batch_idxs, abs_idxs] = scores
-        if self.use_qtar and mode == 'train':
-            self.latest_aux_loss = self.qtar_budget_lambda * budget_penalty
         return scores_all

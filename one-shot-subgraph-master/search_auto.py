@@ -22,7 +22,7 @@ HPO_search_space = {
         'initializer':           ('choice', ['binary', 'relation']),
         'concatHidden':          ('choice', [True, False]),
         'shortcut':              ('choice', [True, False]),
-        'readout':               ('choice', ['linear', 'multiply']),
+        'readout':               ('choice', ['linear', 'multiply', 'pair_mlp']),
 
         # continuous
         'decay_rate':            ('uniform', (0.8, 1)),
@@ -34,7 +34,12 @@ HPO_search_space = {
 HPO_search_space_QTAR = {
         'qtar_ratio_end':        ('choice', [0.5, 0.6, 0.7, 0.8, 0.9, 1.0]),
         'qtar_router_hidden':    ('choice', [32, 64, 128]),
-        'qtar_budget_lambda':    ('uniform', (0.0, 0.05)),
+    }
+
+HPO_search_space_LQCD = {
+        'lqcd_coarse_ratio':     ('choice', [1.25, 1.5, 2.0]),
+        'lqcd_fuse_lambda':      ('uniform', (0.3, 0.9)),
+        'lqcd_topl':             ('choice', [1, 2, 3]),
     }
 
 # # ========== Module 1: Relation-Path Conditioned Sampling search space ==========
@@ -75,15 +80,19 @@ parser.add_argument('--finetune', action='store_true')
 parser.add_argument('--finetune_config', type=str, default='')
 parser.add_argument('--start_config', type=str, default='')  # optional: JSON string or file path for seeded trial config
 parser.add_argument('--not_shuffle_train', action='store_true')
+parser.add_argument('--use_readout_refine', action='store_true')
+# ========== LQCD args ==========
+parser.add_argument('--use_lqcd', action='store_true')
+parser.add_argument('--lqcd_coarse_ratio', type=float, default=1.5)
+parser.add_argument('--lqcd_fuse_lambda', type=float, default=0.7)
+parser.add_argument('--lqcd_topl', type=int, default=2)
 # ========== QTAR args ==========
 parser.add_argument('--use_qtar', action='store_true')
 parser.add_argument('--qtar_ratio_start', type=float, default=1.0)
 parser.add_argument('--qtar_ratio_end', type=float, default=0.8)
 parser.add_argument('--qtar_warmup', type=int, default=5)
 parser.add_argument('--qtar_router_hidden', type=int, default=64)
-parser.add_argument('--qtar_budget_lambda', type=float, default=0.01)
 parser.add_argument('--qtar_min_edges', type=int, default=64)
-parser.add_argument('--qtar_soft_only', action='store_true')
 # # ========== Module 1: Relation-Path Conditioned Sampling args ==========
 # parser.add_argument('--use_rel_prior', action='store_true')         # enable path-based relation prior
 # parser.add_argument('--path_lambda', type=float, default=0.5)       # weight for path prior in fusion
@@ -236,6 +245,10 @@ if __name__ == '__main__':
         HPO_search_space.update(HPO_search_space_QTAR)
         print('==> HPO: added QTAR search space')
 
+    if args.use_lqcd:
+        HPO_search_space.update(HPO_search_space_LQCD)
+        print('==> HPO: added LQCD search space')
+
     # # conditionally extend search space based on enabled modules
     # if args.use_rel_prior:
     #     HPO_search_space.update(HPO_search_space_M1)
@@ -308,7 +321,16 @@ if __name__ == '__main__':
         if args.use_qtar:
             args.qtar_ratio_end = params['qtar_ratio_end']
             args.qtar_router_hidden = int(params['qtar_router_hidden'])
-            args.qtar_budget_lambda = params['qtar_budget_lambda']
+
+        if args.use_lqcd:
+            args.lqcd_coarse_ratio = params['lqcd_coarse_ratio']
+            args.lqcd_fuse_lambda = params['lqcd_fuse_lambda']
+            args.lqcd_topl = int(params['lqcd_topl'])
+            for sampler in (train_sampler, test_sampler):
+                sampler.lqcd_coarse_ratio = float(args.lqcd_coarse_ratio)
+                sampler.lqcd_fuse_lambda = float(args.lqcd_fuse_lambda)
+                sampler.lqcd_topl = int(args.lqcd_topl)
+                sampler.lqcd_logged = False
 
         # # Module 1: Relation-Path Conditioned Sampling params
         # if args.use_rel_prior:

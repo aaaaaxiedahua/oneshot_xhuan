@@ -197,13 +197,13 @@ python search_auto.py --data_path data/family/ --search --topk 0.5 --use_rca
 # 两个都开（多搜9个参数）
 python search_auto.py --data_path data/family/ --search --topk 0.5 --use_rel_prior --use_rca
 
-# 2) 训练主模型（QTAR soft-only）
-python train_auto.py --data_path data/WN18RR/ --gpu 0 --topk 0.1 --batchsize 16 --epoch 200 --use_qtar --qtar_ratio_start 1.0 --qtar_ratio_end 0.8 --qtar_warmup 5 --qtar_router_hidden 64 --qtar_budget_lambda 0.01 --qtar_min_edges 64 --qtar_soft_only
+# 2) 训练主模型（QTAR 硬裁边）
+python train_auto.py --data_path data/WN18RR/ --gpu 0 --topk 0.1 --batchsize 16 --epoch 200 --use_qtar --qtar_ratio_start 1.0 --qtar_ratio_end 0.8 --qtar_warmup 5 --qtar_router_hidden 64 --qtar_min_edges 64
 
 # 自动调参（推荐，参数显式版）
-python search_auto.py --data_path data/WN18RR/ --search --use_qtar --qtar_soft_only
+python search_auto.py --data_path data/WN18RR/ --search --use_qtar
 
-python search_auto.py --data_path data/WN18RR/ --search --fact_ratio 0.95 --use_qtar --qtar_ratio_start 1.0 --qtar_warmup 5 --qtar_min_edges 64 --qtar_soft_only
+python search_auto.py --data_path data/WN18RR/ --search --fact_ratio 0.95 --use_qtar --qtar_ratio_start 1.0 --qtar_warmup 5 --qtar_min_edges 64
 
 
 ```
