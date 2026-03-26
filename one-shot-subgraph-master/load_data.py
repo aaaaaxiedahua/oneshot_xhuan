@@ -100,8 +100,8 @@ class DataLoader(Dataset):
         
         # NOTE: we can not return sparse tensor here
         # thus, we return its indices and values which are dense tensor.
-        batch_idxs, abs_idxs, query_sub_idxs, edge_batch_idxs, batch_sampled_edges = batch_subgraph
-        return subs, rels, objs, batch_idxs, abs_idxs, query_sub_idxs, edge_batch_idxs, batch_sampled_edges
+        batch_idxs, abs_idxs, query_sub_idxs, edge_batch_idxs, batch_sampled_edges, batch_rbppr_meta = batch_subgraph
+        return subs, rels, objs, batch_idxs, abs_idxs, query_sub_idxs, edge_batch_idxs, batch_sampled_edges, batch_rbppr_meta
 
     def read_triples(self, filename):
         triples = []

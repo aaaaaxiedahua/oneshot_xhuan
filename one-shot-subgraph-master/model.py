@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
-from torch_scatter import scatter, scatter_max
+from torch_scatter import scatter
+import math
 
 
 # # ========== Module 2: Relation Composition Augmentation (RCA) ==========
@@ -357,59 +358,21 @@ from torch_scatter import scatter, scatter_max
 #         return augmented_edges, edge_weights, augmented_batch, virtual_rel_embeds, n_virtual
 # # ========== End Module 2: Relation Composition Augmentation (RCA) ==========
 
+class EdgePruneLayer(torch.nn.Module):
+    def __init__(self, hidden_dim, router_hidden):
+        super(EdgePruneLayer, self).__init__()
+        self.Ws = nn.Linear(hidden_dim, router_hidden, bias=False)
+        self.Wv = nn.Linear(hidden_dim, router_hidden, bias=False)
+        self.Wr = nn.Linear(hidden_dim, router_hidden, bias=False)
+        self.Wq = nn.Linear(hidden_dim, router_hidden)
+        self.w_gate = nn.Linear(router_hidden, 1)
+        self.target_bilinear = nn.Bilinear(hidden_dim, hidden_dim, 1, bias=False)
 
-class QTARRouter(torch.nn.Module):
-    """Query-Target Adaptive Routing (QTAR)."""
-    def __init__(self, hidden_dim, n_rel, router_hidden=64, min_edges=64):
-        super().__init__()
-        self.hidden_dim = hidden_dim
-        self.min_edges = max(1, int(min_edges))
-        self.rel_embed = nn.Embedding(2 * n_rel + 1, hidden_dim)
-        self.router = nn.Sequential(
-            nn.Linear(hidden_dim * 4, router_hidden),
-            nn.ReLU(),
-            nn.Linear(router_hidden, 1),
-        )
-
-    def _normalize_evidence(self, x):
-        maxv = torch.max(x)
-        if maxv.item() <= 1e-12:
-            return x
-        return x / (maxv + 1e-12)
-
-    def forward(self, hidden, edges, q_rel, edge_batch_idxs, evidence, keep_ratio=1.0):
-        # edges: [n_edges, 3], hidden: [n_nodes, d], evidence: [n_nodes]
-        sub, rel, obj = edges[:, 0], edges[:, 1], edges[:, 2]
-        hs = hidden[sub]
-        ho = hidden[obj]
-        hr = self.rel_embed(rel)
-        hq = self.rel_embed(q_rel)[edge_batch_idxs]
-        gate = torch.sigmoid(self.router(torch.cat([hs, ho, hr, hq], dim=-1)).squeeze(-1))
-
-        route_scores = gate * evidence[sub]
-        route_scores = torch.clamp(route_scores, min=1e-8)
-
-        n_edges = int(edges.shape[0])
-        if keep_ratio >= 0.999 or n_edges <= self.min_edges:
-            keep_index = torch.arange(n_edges, device=edges.device)
-            kept_edges = edges
-            kept_batch = edge_batch_idxs
-            kept_weights = route_scores
-        else:
-            target_keep = max(self.min_edges, int(keep_ratio * n_edges))
-            target_keep = min(target_keep, n_edges)
-            keep_index = torch.topk(route_scores, k=target_keep, largest=True, sorted=False).indices
-            kept_edges = edges[keep_index]
-            kept_batch = edge_batch_idxs[keep_index]
-            kept_weights = route_scores[keep_index]
-
-        # evidence update uses the routed edges
-        kept_sub = kept_edges[:, 0]
-        kept_obj = kept_edges[:, 2]
-        evidence_msg = evidence[kept_sub] * kept_weights
-        new_evidence = scatter(evidence_msg, index=kept_obj, dim=0, dim_size=hidden.shape[0], reduce='sum')
-        new_evidence = self._normalize_evidence(new_evidence)
-        return kept_edges, kept_batch, kept_weights, new_evidence
+    def forward(self, hs, hv, hr, hq):
+        gate_hidden = torch.relu(self.Ws(hs) + self.Wv(hv) + self.Wr(hr) + self.Wq(hq))
+        gate = torch.sigmoid(self.w_gate(gate_hidden)).squeeze(-1)
+        target_score = self.target_bilinear(hv, hq).squeeze(-1)
+        return gate, target_score
 
 
 class GNNLayer(torch.nn.Module):
@@ -469,23 +432,8 @@ class GNN_auto(torch.nn.Module):
         acts = {'relu': nn.ReLU(), 'tanh': torch.tanh, 'idd': lambda x:x}
         act = acts[params.act]
         self.current_epoch = 0
-        self.latest_aux_loss = torch.tensor(0.0)
-        self.qtar_logged_epochs = set()
-
-        # ========== QTAR ==========
-        self.use_qtar = hasattr(params, 'use_qtar') and params.use_qtar
-        self.qtar_ratio_start = float(getattr(params, 'qtar_ratio_start', 1.0))
-        self.qtar_ratio_end = float(getattr(params, 'qtar_ratio_end', 0.8))
-        self.qtar_warmup = int(getattr(params, 'qtar_warmup', 5))
-        qtar_hidden = int(getattr(params, 'qtar_router_hidden', 64))
-        qtar_min_edges = int(getattr(params, 'qtar_min_edges', 64))
-        if self.use_qtar:
-            self.qtar_router = QTARRouter(self.hidden_dim, self.n_rel, router_hidden=qtar_hidden, min_edges=qtar_min_edges)
-            print(
-                f'==> QTAR: enabled (ratio_start={self.qtar_ratio_start}, ratio_end={self.qtar_ratio_end}, '
-                f'warmup={self.qtar_warmup}, router_hidden={qtar_hidden}, min_edges={qtar_min_edges})'
-            )
-        # ========== End QTAR ==========
+        self.edgeprune_active_thr = 0.05
+        self.last_edgeprune_stats = None
 
         # # ========== Module 2 ==========
         # self.use_rca = hasattr(params, 'use_rca') and params.use_rca
@@ -503,6 +451,24 @@ class GNN_auto(torch.nn.Module):
         if self.params.initializer == 'relation': self.query_rela_embed = nn.Embedding(2*self.n_rel+1, self.hidden_dim)
         self.readout_dim = self.hidden_dim * (self.n_layer + 1) if self.params.concatHidden else self.hidden_dim
         self.use_readout_refine = hasattr(params, 'use_readout_refine') and params.use_readout_refine
+        self.use_edgeprune = hasattr(params, 'use_edgeprune') and params.use_edgeprune
+        if self.use_edgeprune:
+            self.edgeprune_ratio_start = float(getattr(params, 'edgeprune_ratio_start', 1.0))
+            self.edgeprune_ratio_end = float(getattr(params, 'edgeprune_ratio_end', 0.5))
+            self.edgeprune_evidence_lambda = float(getattr(params, 'edgeprune_evidence_lambda', 0.5))
+            self.edgeprune_teleport = float(getattr(params, 'edgeprune_teleport', 0.1))
+            self.edgeprune_target_alpha = float(getattr(params, 'edgeprune_target_alpha', 0.3))
+            router_hidden = max(32, self.hidden_dim // 2)
+            self.edgeprune_rel_embed = nn.Embedding(2 * self.n_rel + 1, self.hidden_dim)
+            self.edgeprune_layers = nn.ModuleList([
+                EdgePruneLayer(self.hidden_dim, router_hidden) for _ in range(self.n_layer)
+            ])
+            print(
+                '==> EdgePrune: enabled '
+                f'(ratio_start={self.edgeprune_ratio_start}, ratio_end={self.edgeprune_ratio_end}, '
+                f'lambda_e={self.edgeprune_evidence_lambda}, teleport={self.edgeprune_teleport}, '
+                f'target_alpha={self.edgeprune_target_alpha})'
+            )
         if self.use_readout_refine:
             refine_hidden = max(1, self.readout_dim // 2)
             self.readout_refine = nn.Sequential(
@@ -541,23 +507,134 @@ class GNN_auto(torch.nn.Module):
     def set_epoch(self, epoch_idx):
         self.current_epoch = int(epoch_idx)
 
+    def pop_edgeprune_stats(self):
+        stats = self.last_edgeprune_stats
+        self.last_edgeprune_stats = None
+        return stats
+
+    def _normalize_per_query(self, values, query_index, batch_size):
+        if values.numel() == 0:
+            return values
+        max_vals = scatter(values, query_index, dim=0, dim_size=batch_size, reduce='max')
+        return values / (max_vals[query_index] + 1e-12)
+
     def _layer_keep_ratio(self, layer_idx):
         if self.n_layer <= 1:
-            return self.qtar_ratio_end
-        frac = float(layer_idx) / float(self.n_layer - 1)
-        return self.qtar_ratio_start + frac * (self.qtar_ratio_end - self.qtar_ratio_start)
+            return float(self.edgeprune_ratio_end)
+        step = float(layer_idx) / float(self.n_layer - 1)
+        return float(self.edgeprune_ratio_start + step * (self.edgeprune_ratio_end - self.edgeprune_ratio_start))
+
+    def _new_edgeprune_batch_stats(self, batch_size):
+        return {
+            'enabled': 1.0,
+            'query_count': float(batch_size),
+            'total_edges': [0.0 for _ in range(self.n_layer)],
+            'kept_edges': [0.0 for _ in range(self.n_layer)],
+            'gate_sum': [0.0 for _ in range(self.n_layer)],
+            'route_sum': [0.0 for _ in range(self.n_layer)],
+            'active_before': [0.0 for _ in range(self.n_layer)],
+            'active_after': [0.0 for _ in range(self.n_layer)],
+        }
+
+    def _per_query_topk_mask(self, scores, edge_batch_idxs, ratio, batch_size):
+        keep_mask = torch.zeros(scores.shape[0], dtype=torch.bool, device=scores.device)
+        for q_idx in range(batch_size):
+            edge_ids = torch.where(edge_batch_idxs == q_idx)[0]
+            if edge_ids.numel() == 0:
+                continue
+            keep_k = max(1, int(math.ceil(float(ratio) * int(edge_ids.numel()))))
+            keep_k = min(keep_k, int(edge_ids.numel()))
+            if keep_k == int(edge_ids.numel()):
+                keep_mask[edge_ids] = True
+                continue
+            local_topk = torch.topk(scores[edge_ids], keep_k, sorted=False).indices
+            keep_mask[edge_ids[local_topk]] = True
+        return keep_mask
+
+    def _mean_active_ratio(self, evidence, node_batch_idxs, batch_size):
+        node_count = scatter(torch.ones_like(evidence), node_batch_idxs, dim=0, dim_size=batch_size, reduce='sum')
+        active = scatter((evidence > self.edgeprune_active_thr).float(), node_batch_idxs, dim=0, dim_size=batch_size, reduce='sum')
+        return float((active / (node_count + 1e-12)).mean().item())
+
+    def _apply_edgeprune_layer(self, hidden, evidence, evidence0, edges, edge_batch_idxs, node_batch_idxs, query_sub_idxs, q_rel, layer_idx, batch_size):
+        stats = {
+            'total_edges': float(edges.shape[0]),
+            'kept_edges': 0.0,
+            'gate_sum': 0.0,
+            'route_sum': 0.0,
+            'active_before': self._mean_active_ratio(evidence, node_batch_idxs, batch_size),
+            'active_after': 0.0,
+        }
+
+        if edges.shape[0] == 0:
+            stats['active_after'] = stats['active_before']
+            return edges, edge_batch_idxs, None, evidence, stats
+
+        sub = edges[:, 0]
+        rel = edges[:, 1]
+        obj = edges[:, 2]
+        hs = hidden[sub]
+        hv = hidden[obj]
+        hr = self.edgeprune_rel_embed(rel)
+        hq = hidden[query_sub_idxs][edge_batch_idxs]
+
+        gate, target_score = self.edgeprune_layers[layer_idx](hs, hv, hr, hq)
+        dest_pref = torch.sigmoid(target_score)
+        source_evidence = evidence[sub]
+        route_score = gate * ((1.0 - self.edgeprune_target_alpha) * source_evidence + self.edgeprune_target_alpha * dest_pref)
+
+        keep_ratio = self._layer_keep_ratio(layer_idx)
+        keep_mask = self._per_query_topk_mask(route_score, edge_batch_idxs, keep_ratio, batch_size)
+        kept_edges = edges[keep_mask]
+        kept_batch = edge_batch_idxs[keep_mask]
+        kept_scores = route_score[keep_mask]
+
+        propagated = torch.zeros_like(evidence)
+        if kept_edges.shape[0] > 0:
+            propagated = scatter(
+                evidence[kept_edges[:, 0]] * kept_scores,
+                kept_edges[:, 2],
+                dim=0,
+                dim_size=hidden.shape[0],
+                reduce='sum',
+            )
+            propagated = self._normalize_per_query(propagated, node_batch_idxs, batch_size)
+
+        evidence_next = (
+            (1.0 - self.edgeprune_evidence_lambda) * evidence
+            + self.edgeprune_evidence_lambda * propagated
+            + self.edgeprune_teleport * evidence0
+        )
+        evidence_next = self._normalize_per_query(evidence_next, node_batch_idxs, batch_size)
+
+        stats['kept_edges'] = float(kept_edges.shape[0])
+        stats['gate_sum'] = float(gate.sum().item())
+        stats['route_sum'] = float(kept_scores.sum().item()) if kept_scores.numel() > 0 else 0.0
+        stats['active_after'] = self._mean_active_ratio(evidence_next, node_batch_idxs, batch_size)
+        edge_weights = kept_scores if kept_scores.numel() > 0 else None
+        return kept_edges, kept_batch, edge_weights, evidence_next, stats
 
     def forward(self, q_sub, q_rel, subgraph_data, mode='train'):
         n = len(q_sub)
         batch_idxs, abs_idxs, query_sub_idxs, edge_batch_idxs, batch_sampled_edges = subgraph_data
+        device = batch_sampled_edges.device
+        batch_idxs = batch_idxs.to(device)
+        abs_idxs = abs_idxs.to(device)
+        query_sub_idxs = query_sub_idxs.to(device)
         n_node = len(batch_idxs)
-        h0 = torch.zeros((1, n_node, self.hidden_dim)).cuda()
-        hidden = torch.zeros(n_node, self.hidden_dim).cuda()
-        self.latest_aux_loss = torch.zeros(1, device=hidden.device).squeeze(0)
-        qtar_log_key = (mode, self.current_epoch)
-        should_log_qtar = self.use_qtar and mode == 'train' and qtar_log_key not in self.qtar_logged_epochs
-        qtar_log_items = []
-        qtar_warmup_skip = False
+        h0 = torch.zeros((1, n_node, self.hidden_dim), device=device)
+        hidden = torch.zeros(n_node, self.hidden_dim, device=device)
+        routed_edges = batch_sampled_edges
+        routed_batches = edge_batch_idxs
+        if self.use_edgeprune:
+            evidence0 = torch.zeros(n_node, device=device)
+            evidence0[query_sub_idxs] = 1.0
+            evidence = evidence0.clone()
+            edgeprune_stats = self._new_edgeprune_batch_stats(n)
+        else:
+            evidence0 = None
+            evidence = None
+            edgeprune_stats = None
 
         # # ========== Module 2: Generate virtual edges ==========
         # edge_weights = None
@@ -581,8 +658,6 @@ class GNN_auto(torch.nn.Module):
             hidden[query_sub_idxs, :] = self.query_rela_embed(q_rel)
 
         if self.params.concatHidden: hidden_list = [hidden]
-        evidence = torch.zeros(n_node, device=hidden.device)
-        evidence[query_sub_idxs] = 1.0
 
         # propagation
         for i in range(self.n_layer):
@@ -599,22 +674,30 @@ class GNN_auto(torch.nn.Module):
             #     curr_nv = n_virtual
             # # ========== End Module 2 ==========
 
-            curr_edges = batch_sampled_edges
-            curr_batch = edge_batch_idxs
+            curr_edges = routed_edges
+            curr_batch = routed_batches
             curr_edge_weights = None
-
-            if self.use_qtar and not (mode == 'train' and self.current_epoch < self.qtar_warmup):
-                keep_ratio = self._layer_keep_ratio(i)
-                curr_edges, curr_batch, curr_edge_weights, evidence = self.qtar_router(
-                    hidden, batch_sampled_edges, q_rel, edge_batch_idxs, evidence,
-                    keep_ratio=keep_ratio
+            if self.use_edgeprune:
+                curr_edges, curr_batch, curr_edge_weights, evidence, layer_stats = self._apply_edgeprune_layer(
+                    hidden=hidden,
+                    evidence=evidence,
+                    evidence0=evidence0,
+                    edges=curr_edges,
+                    edge_batch_idxs=curr_batch,
+                    node_batch_idxs=batch_idxs,
+                    query_sub_idxs=query_sub_idxs,
+                    q_rel=q_rel,
+                    layer_idx=i,
+                    batch_size=n,
                 )
-                if should_log_qtar:
-                    qtar_log_items.append(
-                        f'L{i}:ratio={keep_ratio:.2f},kept={int(curr_edges.shape[0])}/{int(batch_sampled_edges.shape[0])}'
-                    )
-            elif self.use_qtar and mode == 'train' and self.current_epoch < self.qtar_warmup and should_log_qtar:
-                qtar_warmup_skip = True
+                routed_edges = curr_edges
+                routed_batches = curr_batch
+                edgeprune_stats['total_edges'][i] += layer_stats['total_edges']
+                edgeprune_stats['kept_edges'][i] += layer_stats['kept_edges']
+                edgeprune_stats['gate_sum'][i] += layer_stats['gate_sum']
+                edgeprune_stats['route_sum'][i] += layer_stats['route_sum']
+                edgeprune_stats['active_before'][i] += layer_stats['active_before']
+                edgeprune_stats['active_after'][i] += layer_stats['active_after']
 
             hidden = self.gnn_layers[i](q_sub, q_rel, curr_batch, hidden, curr_edges, n_node,
                                         shortcut=self.params.shortcut, edge_weights=curr_edge_weights)
@@ -627,13 +710,6 @@ class GNN_auto(torch.nn.Module):
             h0 = h0 * (1-act_signal).unsqueeze(-1).unsqueeze(0)
 
             if self.params.concatHidden: hidden_list.append(hidden)
-
-        if should_log_qtar:
-            if qtar_warmup_skip:
-                print(f'==> QTAR[train]: epoch={self.current_epoch}, warmup active, routing skipped')
-            else:
-                print(f'==> QTAR[train]: epoch={self.current_epoch}, ' + ' | '.join(qtar_log_items))
-            self.qtar_logged_epochs.add(qtar_log_key)
 
         # readout
         if self.params.concatHidden: hidden = torch.cat(hidden_list, dim=-1)
@@ -655,4 +731,5 @@ class GNN_auto(torch.nn.Module):
 
         scores_all = torch.zeros((n, self.loader.n_ent)).cuda()
         scores_all[batch_idxs, abs_idxs] = scores
+        self.last_edgeprune_stats = edgeprune_stats
         return scores_all

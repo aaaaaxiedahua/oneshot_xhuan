@@ -26,18 +26,16 @@ parser.add_argument('--remove_1hop_edges', action='store_true')
 parser.add_argument('--only_eval', action='store_true')
 parser.add_argument('--not_shuffle_train', action='store_true')
 parser.add_argument('--use_readout_refine', action='store_true')        # enable residual MLP refinement before readout
-# ========== LQCD args ==========
-parser.add_argument('--use_lqcd', action='store_true')                  # enable two-stage LQCD sampler
-parser.add_argument('--lqcd_coarse_ratio', type=float, default=1.5)     # coarse candidate expansion ratio
-parser.add_argument('--lqcd_fuse_lambda', type=float, default=0.7)      # fuse weight between PPR and relation score
-parser.add_argument('--lqcd_topl', type=int, default=2)                 # Top-L incident edges for node projection
-# ========== QTAR args ==========
-parser.add_argument('--use_qtar', action='store_true')                   # enable query-target adaptive routing
-parser.add_argument('--qtar_ratio_start', type=float, default=1.0)       # keep ratio at first layer
-parser.add_argument('--qtar_ratio_end', type=float, default=0.8)         # keep ratio at last layer
-parser.add_argument('--qtar_warmup', type=int, default=5)                # warmup epochs before routing
-parser.add_argument('--qtar_router_hidden', type=int, default=64)        # hidden dim of router mlp
-parser.add_argument('--qtar_min_edges', type=int, default=64)            # minimum kept edges per layer
+# ========== RBPPR args ==========
+parser.add_argument('--use_rbppr', action='store_true')                 # enable relation-biased personalized PageRank
+parser.add_argument('--rbppr_lambda', type=float, default=0.1)          # fusion weight between entity PPR and relation PPR
+# ========== EdgePrune args ==========
+parser.add_argument('--use_edgeprune', action='store_true')             # enable query-wise cumulative edge pruning
+parser.add_argument('--edgeprune_ratio_start', type=float, default=1.0) # layer-0 keep ratio
+parser.add_argument('--edgeprune_ratio_end', type=float, default=0.5)   # final-layer keep ratio
+parser.add_argument('--edgeprune_evidence_lambda', type=float, default=0.5) # residual update strength for evidence
+parser.add_argument('--edgeprune_teleport', type=float, default=0.1)    # query-head teleport strength
+parser.add_argument('--edgeprune_target_alpha', type=float, default=0.3) # destination preference weight
 # # ========== Module 1: Relation-Path Conditioned Sampling args ==========
 # parser.add_argument('--use_rel_prior', action='store_true')         # enable path-based relation prior
 # parser.add_argument('--path_lambda', type=float, default=0.5)       # weight for path prior in fusion
@@ -149,7 +147,7 @@ if __name__ == '__main__':
             
         # only do evaluation, and then exit
         if args.only_eval:
-            valid_mrr, out_str = model.evaluate(verbose=True, rank_CR=False)
+            valid_mrr, out_str, _ = model.evaluate(verbose=True, rank_CR=False)
             print(out_str)
             exit()
 

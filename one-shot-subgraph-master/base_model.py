@@ -30,8 +30,10 @@ class BaseModel(object):
         self.scheduler = ReduceLROnPlateau(self.optimizer, mode='max', factor=0.5, patience=2, min_lr=args.lr/20, verbose=True)
         self.smooth = 1e-5
         self.t_time = 0
+        self.epoch_train_time = 0
         self.mean_rank_dict = {}
         self.epoch_idx = 0
+        self.best_valid_mrr = 0.0
         
     def saveModelToFiles(self, args, best_metric, deleteLastFile=True):
         if args.val_num == -1:
@@ -54,17 +56,121 @@ class BaseModel(object):
         # re-build optimizter
         self.optimizer = Adam(self.model.parameters(), lr=self.args.lr, weight_decay=self.args.lamb)
 
+    def _new_rbppr_tracker(self):
+        return {
+            'samples': 0,
+            'score_delta_mean': 0.0,
+            'changed_topk_ratio': 0.0,
+            'changed_front_ratio': 0.0,
+            'lead_changed': 0.0,
+            'rel_gain_topk': 0.0,
+        }
+
+    def _new_edgeprune_tracker(self):
+        return {
+            'query_count': 0.0,
+            'total_edges': np.zeros(self.args.n_layer, dtype=np.float64),
+            'kept_edges': np.zeros(self.args.n_layer, dtype=np.float64),
+            'gate_sum': np.zeros(self.args.n_layer, dtype=np.float64),
+            'route_sum': np.zeros(self.args.n_layer, dtype=np.float64),
+            'active_before': np.zeros(self.args.n_layer, dtype=np.float64),
+            'active_after': np.zeros(self.args.n_layer, dtype=np.float64),
+        }
+
+    def _update_rbppr_tracker(self, tracker, batch_rbppr_meta):
+        if batch_rbppr_meta is None:
+            return
+        meta_np = batch_rbppr_meta.detach().cpu().numpy()
+        if meta_np.size == 0:
+            return
+        enabled = meta_np[:, 0] > 0.5
+        if not np.any(enabled):
+            return
+
+        rows = meta_np[enabled]
+        tracker['samples'] += int(rows.shape[0])
+        tracker['score_delta_mean'] += float(np.sum(rows[:, 1]))
+        tracker['changed_topk_ratio'] += float(np.sum(rows[:, 2]))
+        tracker['changed_front_ratio'] += float(np.sum(rows[:, 3]))
+        tracker['lead_changed'] += float(np.sum(rows[:, 4]))
+        tracker['rel_gain_topk'] += float(np.sum(rows[:, 5]))
+
+    def _format_rbppr_tracker(self, phase, tracker):
+        samples = int(tracker['samples'])
+        if samples == 0:
+            return None
+        return (
+            f'==> RBPPR[{phase}][epoch={self.epoch_idx}]: '
+            f'samples={samples} '
+            f'changed@topk={tracker["changed_topk_ratio"] / max(1, samples):.1%} '
+            f'changed@{min(256, self.n_samp_ent)}={tracker["changed_front_ratio"] / max(1, samples):.1%} '
+            f'lead_swap={tracker["lead_changed"] / max(1, samples):.1%} '
+            f'delta={tracker["score_delta_mean"] / max(1, samples):.4f} '
+            f'rel_gain={tracker["rel_gain_topk"] / max(1, samples):.4f}'
+        )
+
+    def _update_edgeprune_tracker(self, tracker, batch_stats):
+        if batch_stats is None or batch_stats.get('enabled', 0.0) < 0.5:
+            return
+        tracker['query_count'] += float(batch_stats['query_count'])
+        for key in ('total_edges', 'kept_edges', 'gate_sum', 'route_sum', 'active_before', 'active_after'):
+            tracker[key] += np.asarray(batch_stats[key], dtype=np.float64)
+
+    def _format_edgeprune_tracker(self, phase, tracker):
+        query_count = float(tracker['query_count'])
+        if query_count <= 0:
+            return None
+        keep_parts = []
+        gate_parts = []
+        route_parts = []
+        active_parts = []
+        for layer_idx in range(self.args.n_layer):
+            total_edges = tracker['total_edges'][layer_idx]
+            kept_edges = tracker['kept_edges'][layer_idx]
+            keep_ratio = kept_edges / max(1.0, total_edges)
+            gate_mean = tracker['gate_sum'][layer_idx] / max(1.0, total_edges)
+            route_mean = tracker['route_sum'][layer_idx] / max(1.0, kept_edges)
+            active_before = tracker['active_before'][layer_idx] / query_count
+            active_after = tracker['active_after'][layer_idx] / query_count
+            keep_parts.append(f'L{layer_idx}:{keep_ratio:.2f}')
+            gate_parts.append(f'L{layer_idx}:{gate_mean:.3f}')
+            route_parts.append(f'L{layer_idx}:{route_mean:.3f}')
+            active_parts.append(f'L{layer_idx}:{active_before:.3f}->{active_after:.3f}')
+
+        return (
+            f'==> EdgePrune[{phase}][epoch={self.epoch_idx}]: '
+            f'keep={" ".join(keep_parts)} | '
+            f'gate={" ".join(gate_parts)} | '
+            f'route={" ".join(route_parts)} | '
+            f'active={" ".join(active_parts)}'
+        )
+
+    def _format_epoch_summary(self, eval_info):
+        current_lr = self.optimizer.param_groups[0]['lr']
+        return (
+            f'==> Epoch {self.epoch_idx:03d}: '
+            f'lr={current_lr:.4e} '
+            f'train_epoch={self.epoch_train_time:.2f}s '
+            f'train_total={self.t_time:.2f}s '
+            f'eval={eval_info["eval_time"]:.2f}s '
+            f'best_valid={self.best_valid_mrr:.4f} '
+            f'valid={eval_info["valid_mrr"]:.4f} '
+            f'test={eval_info["test_mrr"]:.4f}'
+        )
+
     def prepareData(self, batch_data):
-        subs, rels, objs, batch_idxs, abs_idxs, query_sub_idxs, edge_batch_idxs, batch_sampled_edges = batch_data
+        subs, rels, objs, batch_idxs, abs_idxs, query_sub_idxs, edge_batch_idxs, batch_sampled_edges, batch_rbppr_meta = batch_data
         subgraph_data = [batch_idxs, abs_idxs, query_sub_idxs, edge_batch_idxs.cuda(), batch_sampled_edges.cuda()]
         subs = subs.cuda().flatten()
         rels = rels.cuda().flatten()
         objs = objs.cuda()
-        return subs, rels, objs, subgraph_data
+        return subs, rels, objs, subgraph_data, batch_rbppr_meta
         
     def train_batch(self,):        
         epoch_loss = 0
         reach_tails_list = []
+        train_rbppr_tracker = self._new_rbppr_tracker()
+        train_edgeprune_tracker = self._new_edgeprune_tracker()
         t_time = time.time()
         self.model.train()
         if hasattr(self.model, 'set_epoch'):
@@ -72,20 +178,18 @@ class BaseModel(object):
         
         for batch_data in tqdm(self.trainLoader, ncols=50, leave=False):                      
             # prepare data    
-            subs, rels, objs, subgraph_data = self.prepareData(batch_data)
+            subs, rels, objs, subgraph_data, batch_rbppr_meta = self.prepareData(batch_data)
+            self._update_rbppr_tracker(train_rbppr_tracker, batch_rbppr_meta)
             
             # forward
             self.model.zero_grad()
             scores = self.model(subs, rels, subgraph_data)
-            aux_loss = getattr(self.model, 'latest_aux_loss', 0.0)
-            if not torch.is_tensor(aux_loss):
-                aux_loss = torch.tensor(float(aux_loss), device=scores.device)
+            self._update_edgeprune_tracker(train_edgeprune_tracker, self.model.pop_edgeprune_stats())
             
             # loss calculation
             pos_scores = scores[[torch.arange(len(scores)).cuda(), objs.flatten()]]
             max_n = torch.max(scores, 1, keepdim=True)[0]
             loss = torch.sum(- pos_scores + max_n + torch.log(torch.sum(torch.exp(scores - max_n),1)))
-            loss = loss + aux_loss
 
             # loss backward
             loss.backward()
@@ -103,11 +207,26 @@ class BaseModel(object):
             reach_tails_list += reach_tails
             epoch_loss += loss.item()
             
-        self.t_time += time.time() - t_time
+        self.epoch_train_time = time.time() - t_time
+        self.t_time += self.epoch_train_time
         
         # evaluate on val/test set
-        valid_mrr, out_str = self.evaluate()    
+        valid_mrr, out_str, eval_info = self.evaluate()
+        self.best_valid_mrr = max(self.best_valid_mrr, valid_mrr)
         self.scheduler.step(valid_mrr)
+        print(self._format_epoch_summary(eval_info))
+        train_rbppr_log = self._format_rbppr_tracker('train', train_rbppr_tracker)
+        if train_rbppr_log is not None:
+            print(train_rbppr_log)
+        train_edgeprune_log = self._format_edgeprune_tracker('train', train_edgeprune_tracker)
+        if train_edgeprune_log is not None:
+            print(train_edgeprune_log)
+        for phase_log in eval_info['rbppr_logs']:
+            if phase_log is not None:
+                print(phase_log)
+        for phase_log in eval_info['edgeprune_logs']:
+            if phase_log is not None:
+                print(phase_log)
         
         # shuffle train set
         if self.args.not_shuffle_train:
@@ -130,6 +249,10 @@ class BaseModel(object):
         ranking = []
         self.model.eval()
         i_time = time.time()
+        valid_rbppr_tracker = self._new_rbppr_tracker()
+        test_rbppr_tracker = self._new_rbppr_tracker()
+        valid_edgeprune_tracker = self._new_edgeprune_tracker()
+        test_edgeprune_tracker = self._new_edgeprune_tracker()
         
         # eval on val set
         if eval_val:
@@ -137,10 +260,12 @@ class BaseModel(object):
             if mean_rank: mean_rank_list = []
             for batch_data in tqdm(self.valLoader, ncols=50, leave=False):      
                 # prepare data            
-                subs, rels, objs, subgraph_data = self.prepareData(batch_data)
+                subs, rels, objs, subgraph_data, batch_rbppr_meta = self.prepareData(batch_data)
+                self._update_rbppr_tracker(valid_rbppr_tracker, batch_rbppr_meta)
                 
                 # forward
                 scores = self.model(subs, rels, subgraph_data, mode='valid').data.cpu().numpy()
+                self._update_edgeprune_tracker(valid_edgeprune_tracker, self.model.pop_edgeprune_stats())
 
                 # calculate rank
                 subs = subs.cpu().numpy()
@@ -192,10 +317,12 @@ class BaseModel(object):
             if mean_rank: mean_rank_list = []
             for batch_data in tqdm(self.testLoader, ncols=50, leave=False):        
                 # prepare data            
-                subs, rels, objs, subgraph_data = self.prepareData(batch_data)
+                subs, rels, objs, subgraph_data, batch_rbppr_meta = self.prepareData(batch_data)
+                self._update_rbppr_tracker(test_rbppr_tracker, batch_rbppr_meta)
                 
                 # forward
                 scores = self.model(subs, rels, subgraph_data, mode='test').data.cpu().numpy()
+                self._update_edgeprune_tracker(test_edgeprune_tracker, self.model.pop_edgeprune_stats())
 
                 # calculate rank
                 subs = subs.cpu().numpy()
@@ -241,5 +368,19 @@ class BaseModel(object):
             t_mrr, t_h1, t_h10 = -1, -1, -1
             
         i_time = time.time() - i_time
-        out_str = '[VALID] MRR:%.4f H@1:%.4f H@10:%.4f\t [TEST] MRR:%.4f H@1:%.4f H@10:%.4f \t[TIME] train:%.4f inference:%.4f\n'%(v_mrr, v_h1, v_h10, t_mrr, t_h1, t_h10, self.t_time, i_time)
-        return v_mrr, out_str
+        current_lr = self.optimizer.param_groups[0]['lr']
+        out_str = '[VALID] MRR:%.4f H@1:%.4f H@10:%.4f\t [TEST] MRR:%.4f H@1:%.4f H@10:%.4f \t[TIME] train_epoch:%.4f train_total:%.4f inference:%.4f \t[LR] %.4e\n'%(v_mrr, v_h1, v_h10, t_mrr, t_h1, t_h10, self.epoch_train_time, self.t_time, i_time, current_lr)
+        eval_info = {
+            'valid_mrr': v_mrr,
+            'test_mrr': t_mrr,
+            'eval_time': i_time,
+            'rbppr_logs': [
+                self._format_rbppr_tracker('valid', valid_rbppr_tracker),
+                self._format_rbppr_tracker('test', test_rbppr_tracker),
+            ],
+            'edgeprune_logs': [
+                self._format_edgeprune_tracker('valid', valid_edgeprune_tracker),
+                self._format_edgeprune_tracker('test', test_edgeprune_tracker),
+            ],
+        }
+        return v_mrr, out_str, eval_info

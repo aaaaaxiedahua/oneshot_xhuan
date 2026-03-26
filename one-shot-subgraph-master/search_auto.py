@@ -12,12 +12,18 @@ from utils import *
 from base_HPO import RF_HPO
 from PPR_sampler import pprSampler
 
+# 16, 32, 48, 64, 128, 256
+# 2, 4, 8, 16, 32, 64
+# 4, 6, 8, 10
+# 0.5, 0.6, 0.7, 0.8, 0.9, 1.0
+# 32, 64, 128
+# 1.25, 1.5, 2.0
 HPO_search_space = {
         # discrete
         'lr':                    ('choice', [1e-2, 1e-3, 1e-4, 1e-5]),
-        'hidden_dim':            ('choice', [16, 32, 48, 64, 128, 256]),
-        'attn_dim':              ('choice', [2, 4, 8, 16, 32, 64]),
-        'n_layer':               ('choice', [4, 6, 8, 10]),
+        'hidden_dim':            ('choice', [48, 64, 128, 256]),
+        'attn_dim':              ('choice', [8, 16, 32, 64]),
+        'n_layer':               ('choice', [6, 8, 10]),
         'act':                   ('choice', ['relu', 'idd', 'tanh']),
         'initializer':           ('choice', ['binary', 'relation']),
         'concatHidden':          ('choice', [True, False]),
@@ -30,16 +36,16 @@ HPO_search_space = {
         'dropout':               ('uniform', (0, 0.2)),
     }
 
-# ========== QTAR search space ==========
-HPO_search_space_QTAR = {
-        'qtar_ratio_end':        ('choice', [0.5, 0.6, 0.7, 0.8, 0.9, 1.0]),
-        'qtar_router_hidden':    ('choice', [32, 64, 128]),
+HPO_search_space_RBPPR = {
+        'rbppr_lambda':          ('choice', [0.1, 0.05, 0.15, 0.2, 0.25, 0.3]),
     }
 
-HPO_search_space_LQCD = {
-        'lqcd_coarse_ratio':     ('choice', [1.25, 1.5, 2.0]),
-        'lqcd_fuse_lambda':      ('uniform', (0.3, 0.9)),
-        'lqcd_topl':             ('choice', [1, 2, 3]),
+HPO_search_space_EDGEPRUNE = {
+        'edgeprune_ratio_start':     ('choice', [1.0, 0.9]),
+        'edgeprune_ratio_end':       ('choice', [0.8, 0.65, 0.5]),
+        'edgeprune_evidence_lambda': ('uniform', (0.3, 0.8)),
+        'edgeprune_teleport':        ('uniform', (0.0, 0.2)),
+        'edgeprune_target_alpha':    ('uniform', (0.2, 0.6)),
     }
 
 # # ========== Module 1: Relation-Path Conditioned Sampling search space ==========
@@ -81,18 +87,16 @@ parser.add_argument('--finetune_config', type=str, default='')
 parser.add_argument('--start_config', type=str, default='')  # optional: JSON string or file path for seeded trial config
 parser.add_argument('--not_shuffle_train', action='store_true')
 parser.add_argument('--use_readout_refine', action='store_true')
-# ========== LQCD args ==========
-parser.add_argument('--use_lqcd', action='store_true')
-parser.add_argument('--lqcd_coarse_ratio', type=float, default=1.5)
-parser.add_argument('--lqcd_fuse_lambda', type=float, default=0.7)
-parser.add_argument('--lqcd_topl', type=int, default=2)
-# ========== QTAR args ==========
-parser.add_argument('--use_qtar', action='store_true')
-parser.add_argument('--qtar_ratio_start', type=float, default=1.0)
-parser.add_argument('--qtar_ratio_end', type=float, default=0.8)
-parser.add_argument('--qtar_warmup', type=int, default=5)
-parser.add_argument('--qtar_router_hidden', type=int, default=64)
-parser.add_argument('--qtar_min_edges', type=int, default=64)
+# ========== RBPPR args ==========
+parser.add_argument('--use_rbppr', action='store_true')
+parser.add_argument('--rbppr_lambda', type=float, default=0.1)
+# ========== EdgePrune args ==========
+parser.add_argument('--use_edgeprune', action='store_true')
+parser.add_argument('--edgeprune_ratio_start', type=float, default=1.0)
+parser.add_argument('--edgeprune_ratio_end', type=float, default=0.5)
+parser.add_argument('--edgeprune_evidence_lambda', type=float, default=0.5)
+parser.add_argument('--edgeprune_teleport', type=float, default=0.1)
+parser.add_argument('--edgeprune_target_alpha', type=float, default=0.3)
 # # ========== Module 1: Relation-Path Conditioned Sampling args ==========
 # parser.add_argument('--use_rel_prior', action='store_true')         # enable path-based relation prior
 # parser.add_argument('--path_lambda', type=float, default=0.5)       # weight for path prior in fusion
@@ -241,13 +245,12 @@ if __name__ == '__main__':
     
     assert args.search or args.finetune
 
-    if args.use_qtar:
-        HPO_search_space.update(HPO_search_space_QTAR)
-        print('==> HPO: added QTAR search space')
-
-    if args.use_lqcd:
-        HPO_search_space.update(HPO_search_space_LQCD)
-        print('==> HPO: added LQCD search space')
+    if args.use_rbppr:
+        HPO_search_space.update(HPO_search_space_RBPPR)
+        print('==> HPO: added RBPPR search space')
+    if args.use_edgeprune:
+        HPO_search_space.update(HPO_search_space_EDGEPRUNE)
+        print('==> HPO: added EdgePrune search space')
 
     # # conditionally extend search space based on enabled modules
     # if args.use_rel_prior:
@@ -318,19 +321,14 @@ if __name__ == '__main__':
         args.shortcut = params['shortcut']
         args.readout = params['readout']
 
-        if args.use_qtar:
-            args.qtar_ratio_end = params['qtar_ratio_end']
-            args.qtar_router_hidden = int(params['qtar_router_hidden'])
-
-        if args.use_lqcd:
-            args.lqcd_coarse_ratio = params['lqcd_coarse_ratio']
-            args.lqcd_fuse_lambda = params['lqcd_fuse_lambda']
-            args.lqcd_topl = int(params['lqcd_topl'])
-            for sampler in (train_sampler, test_sampler):
-                sampler.lqcd_coarse_ratio = float(args.lqcd_coarse_ratio)
-                sampler.lqcd_fuse_lambda = float(args.lqcd_fuse_lambda)
-                sampler.lqcd_topl = int(args.lqcd_topl)
-                sampler.lqcd_logged = False
+        if args.use_rbppr:
+            args.rbppr_lambda = float(params['rbppr_lambda'])
+        if args.use_edgeprune:
+            args.edgeprune_ratio_start = float(params['edgeprune_ratio_start'])
+            args.edgeprune_ratio_end = float(params['edgeprune_ratio_end'])
+            args.edgeprune_evidence_lambda = float(params['edgeprune_evidence_lambda'])
+            args.edgeprune_teleport = float(params['edgeprune_teleport'])
+            args.edgeprune_target_alpha = float(params['edgeprune_target_alpha'])
 
         # # Module 1: Relation-Path Conditioned Sampling params
         # if args.use_rel_prior:
