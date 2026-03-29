@@ -538,17 +538,32 @@ class GNN_auto(torch.nn.Module):
 
     def _per_query_topk_mask(self, scores, edge_batch_idxs, ratio, batch_size):
         keep_mask = torch.zeros(scores.shape[0], dtype=torch.bool, device=scores.device)
-        for q_idx in range(batch_size):
-            edge_ids = torch.where(edge_batch_idxs == q_idx)[0]
-            if edge_ids.numel() == 0:
+        if scores.numel() == 0:
+            return keep_mask
+
+        # Group edges by query once, then run top-k inside each contiguous segment.
+        sort_perm = torch.argsort(edge_batch_idxs)
+        sorted_batch = edge_batch_idxs[sort_perm]
+        sorted_scores = scores[sort_perm]
+        sorted_keep = torch.zeros_like(sorted_batch, dtype=torch.bool)
+
+        _, counts = torch.unique_consecutive(sorted_batch, return_counts=True)
+        segment_starts = torch.cat([
+            counts.new_zeros(1),
+            counts.cumsum(0)[:-1],
+        ])
+
+        for start, count in zip(segment_starts.tolist(), counts.tolist()):
+            end = start + count
+            keep_k = max(1, int(math.ceil(float(ratio) * int(count))))
+            keep_k = min(keep_k, int(count))
+            if keep_k == int(count):
+                sorted_keep[start:end] = True
                 continue
-            keep_k = max(1, int(math.ceil(float(ratio) * int(edge_ids.numel()))))
-            keep_k = min(keep_k, int(edge_ids.numel()))
-            if keep_k == int(edge_ids.numel()):
-                keep_mask[edge_ids] = True
-                continue
-            local_topk = torch.topk(scores[edge_ids], keep_k, sorted=False).indices
-            keep_mask[edge_ids[local_topk]] = True
+            local_topk = torch.topk(sorted_scores[start:end], keep_k, sorted=False).indices
+            sorted_keep[start + local_topk] = True
+
+        keep_mask[sort_perm] = sorted_keep
         return keep_mask
 
     def _mean_active_ratio(self, evidence, node_batch_idxs, batch_size):
