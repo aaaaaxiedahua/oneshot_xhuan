@@ -26,6 +26,15 @@ parser.add_argument('--remove_1hop_edges', action='store_true')
 parser.add_argument('--only_eval', action='store_true')
 parser.add_argument('--not_shuffle_train', action='store_true')
 parser.add_argument('--use_readout_refine', action='store_true')        # enable residual MLP refinement before readout
+parser.add_argument('--use_relation_refine', action='store_true')       # enable stage-2 relation refinement on coarse subgraphs
+parser.add_argument('--refine_dim', type=int, default=16)
+parser.add_argument('--refine_steps', type=int, default=2)
+parser.add_argument('--refine_eta', type=float, default=0.3)
+parser.add_argument('--refine_keep_ratio', type=float, default=0.7)
+parser.add_argument('--use_query_hub', action='store_true')             # enable query-conditioned virtual hub
+parser.add_argument('--hub_init', type=str, default='query_relation', choices=['query_relation', 'zero'])
+parser.add_argument('--hub_readout', type=str, default='head', choices=['head', 'hub'])
+parser.add_argument('--hub_rel_mode', type=str, default='directed', choices=['directed', 'shared'])
 # # ========== Module 1: Relation-Path Conditioned Sampling args ==========
 # parser.add_argument('--use_rel_prior', action='store_true')         # enable path-based relation prior
 # parser.add_argument('--path_lambda', type=float, default=0.5)       # weight for path prior in fusion
@@ -49,6 +58,9 @@ if __name__ == '__main__':
     torch.manual_seed(args.seed)
     torch.set_num_threads(max(8, args.cpu))
     torch.multiprocessing.set_sharing_strategy('file_system')
+
+    if args.use_query_hub and args.add_manual_edges:
+        raise ValueError('`use_query_hub=True` and `add_manual_edges=True` cannot be enabled at the same time.')
     
     dataset = args.data_path
     dataset = dataset.split('/')

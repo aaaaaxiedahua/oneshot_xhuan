@@ -54,6 +54,69 @@ class BaseModel(object):
         # re-build optimizter
         self.optimizer = Adam(self.model.parameters(), lr=self.args.lr, weight_decay=self.args.lamb)
 
+    def _new_relation_refine_tracker(self):
+        return {
+            'query_count': 0.0,
+            'active_queries': 0.0,
+            'changed_queries': 0.0,
+            'coarse_nodes': 0.0,
+            'refined_nodes': 0.0,
+            'coarse_edges': 0.0,
+            'refined_edges': 0.0,
+        }
+
+    def _new_query_hub_tracker(self):
+        return {
+            'query_count': 0.0,
+            'real_nodes': 0.0,
+            'added_nodes': 0.0,
+            'added_edges': 0.0,
+        }
+
+    def _update_module_trackers(self, relation_refine_tracker, query_hub_tracker, batch_stats):
+        if batch_stats is None:
+            return
+
+        relation_refine_stats = batch_stats.get('relation_refine')
+        if relation_refine_stats is not None and relation_refine_stats.get('enabled', 0.0) > 0.5:
+            for key in relation_refine_tracker.keys():
+                relation_refine_tracker[key] += float(relation_refine_stats.get(key, 0.0))
+
+        query_hub_stats = batch_stats.get('query_hub')
+        if query_hub_stats is not None and query_hub_stats.get('enabled', 0.0) > 0.5:
+            for key in query_hub_tracker.keys():
+                query_hub_tracker[key] += float(query_hub_stats.get(key, 0.0))
+
+    def _format_relation_refine_tracker(self, phase, tracker):
+        query_count = float(tracker['query_count'])
+        if query_count <= 0:
+            return None
+        node_keep = tracker['refined_nodes'] / max(1.0, tracker['coarse_nodes'])
+        edge_keep = tracker['refined_edges'] / max(1.0, tracker['coarse_edges'])
+        return (
+            f'==> RelationRefine[{phase}][epoch={self.epoch_idx}]: '
+            f'queries={int(query_count)} '
+            f'active={tracker["active_queries"] / query_count:.1%} '
+            f'changed={tracker["changed_queries"] / query_count:.1%} '
+            f'nodes={tracker["coarse_nodes"] / query_count:.1f}->{tracker["refined_nodes"] / query_count:.1f} '
+            f'node_keep={node_keep:.1%} '
+            f'edges={tracker["coarse_edges"] / query_count:.1f}->{tracker["refined_edges"] / query_count:.1f} '
+            f'edge_keep={edge_keep:.1%}'
+        )
+
+    def _format_query_hub_tracker(self, phase, tracker):
+        query_count = float(tracker['query_count'])
+        if query_count <= 0:
+            return None
+        return (
+            f'==> QueryHub[{phase}][epoch={self.epoch_idx}]: '
+            f'queries={int(query_count)} '
+            f'real_nodes/q={tracker["real_nodes"] / query_count:.1f} '
+            f'added_nodes/q={tracker["added_nodes"] / query_count:.1f} '
+            f'added_edges/q={tracker["added_edges"] / query_count:.1f} '
+            f'total_nodes/q={(tracker["real_nodes"] + tracker["added_nodes"]) / query_count:.1f}'
+        )
+
     def _format_epoch_summary(self, eval_info):
         current_lr = self.optimizer.param_groups[0]['lr']
         return (
@@ -78,6 +141,8 @@ class BaseModel(object):
     def train_batch(self,):        
         epoch_loss = 0
         reach_tails_list = []
+        train_relation_refine_tracker = self._new_relation_refine_tracker()
+        train_query_hub_tracker = self._new_query_hub_tracker()
         t_time = time.time()
         self.model.train()
         if hasattr(self.model, 'set_epoch'):
@@ -90,6 +155,11 @@ class BaseModel(object):
             # forward
             self.model.zero_grad()
             scores = self.model(subs, rels, subgraph_data)
+            self._update_module_trackers(
+                train_relation_refine_tracker,
+                train_query_hub_tracker,
+                self.model.pop_module_stats(),
+            )
             
             # loss calculation
             pos_scores = scores[[torch.arange(len(scores)).cuda(), objs.flatten()]]
@@ -120,6 +190,18 @@ class BaseModel(object):
         self.best_valid_mrr = max(self.best_valid_mrr, valid_mrr)
         self.scheduler.step(valid_mrr)
         print(self._format_epoch_summary(eval_info))
+        train_relation_refine_log = self._format_relation_refine_tracker('train', train_relation_refine_tracker)
+        if train_relation_refine_log is not None:
+            print(train_relation_refine_log)
+        train_query_hub_log = self._format_query_hub_tracker('train', train_query_hub_tracker)
+        if train_query_hub_log is not None:
+            print(train_query_hub_log)
+        for phase_log in eval_info['relation_refine_logs']:
+            if phase_log is not None:
+                print(phase_log)
+        for phase_log in eval_info['query_hub_logs']:
+            if phase_log is not None:
+                print(phase_log)
         
         # shuffle train set
         if self.args.not_shuffle_train:
@@ -142,6 +224,10 @@ class BaseModel(object):
         ranking = []
         self.model.eval()
         i_time = time.time()
+        valid_relation_refine_tracker = self._new_relation_refine_tracker()
+        test_relation_refine_tracker = self._new_relation_refine_tracker()
+        valid_query_hub_tracker = self._new_query_hub_tracker()
+        test_query_hub_tracker = self._new_query_hub_tracker()
         
         # eval on val set
         if eval_val:
@@ -153,6 +239,11 @@ class BaseModel(object):
                 
                 # forward
                 scores = self.model(subs, rels, subgraph_data, mode='valid').data.cpu().numpy()
+                self._update_module_trackers(
+                    valid_relation_refine_tracker,
+                    valid_query_hub_tracker,
+                    self.model.pop_module_stats(),
+                )
 
                 # calculate rank
                 subs = subs.cpu().numpy()
@@ -208,6 +299,11 @@ class BaseModel(object):
                 
                 # forward
                 scores = self.model(subs, rels, subgraph_data, mode='test').data.cpu().numpy()
+                self._update_module_trackers(
+                    test_relation_refine_tracker,
+                    test_query_hub_tracker,
+                    self.model.pop_module_stats(),
+                )
 
                 # calculate rank
                 subs = subs.cpu().numpy()
@@ -259,5 +355,13 @@ class BaseModel(object):
             'valid_mrr': v_mrr,
             'test_mrr': t_mrr,
             'eval_time': i_time,
+            'relation_refine_logs': [
+                self._format_relation_refine_tracker('valid', valid_relation_refine_tracker),
+                self._format_relation_refine_tracker('test', test_relation_refine_tracker),
+            ],
+            'query_hub_logs': [
+                self._format_query_hub_tracker('valid', valid_query_hub_tracker),
+                self._format_query_hub_tracker('test', test_query_hub_tracker),
+            ],
         }
         return v_mrr, out_str, eval_info

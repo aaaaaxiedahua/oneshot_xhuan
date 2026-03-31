@@ -36,6 +36,19 @@ HPO_search_space = {
         'dropout':               ('uniform', (0, 0.2)),
     }
 
+HPO_search_space_RELATION_REFINE = {
+        'refine_dim':            ('choice', [16, 32]),
+        'refine_steps':          ('choice', [2, 3, 4]),
+        'refine_eta':            ('choice', [0.1, 0.3, 0.5]),
+        'refine_keep_ratio':     ('choice', [0.5, 0.7, 0.8]),
+    }
+
+HPO_search_space_QUERY_HUB = {
+        'hub_init':              ('choice', ['query_relation', 'zero']),
+        'hub_readout':           ('choice', ['head', 'hub']),
+        'hub_rel_mode':          ('choice', ['directed', 'shared']),
+    }
+
 # # ========== Module 1: Relation-Path Conditioned Sampling search space ==========
 # HPO_search_space_M1 = {
 #         'path_lambda':           ('uniform', (0.1, 2.0)),
@@ -75,6 +88,15 @@ parser.add_argument('--finetune_config', type=str, default='')
 parser.add_argument('--start_config', type=str, default='')  # optional: JSON string or file path for seeded trial config
 parser.add_argument('--not_shuffle_train', action='store_true')
 parser.add_argument('--use_readout_refine', action='store_true')
+parser.add_argument('--use_relation_refine', action='store_true')
+parser.add_argument('--refine_dim', type=int, default=16)
+parser.add_argument('--refine_steps', type=int, default=2)
+parser.add_argument('--refine_eta', type=float, default=0.3)
+parser.add_argument('--refine_keep_ratio', type=float, default=0.7)
+parser.add_argument('--use_query_hub', action='store_true')
+parser.add_argument('--hub_init', type=str, default='query_relation', choices=['query_relation', 'zero'])
+parser.add_argument('--hub_readout', type=str, default='head', choices=['head', 'hub'])
+parser.add_argument('--hub_rel_mode', type=str, default='directed', choices=['directed', 'shared'])
 # # ========== Module 1: Relation-Path Conditioned Sampling args ==========
 # parser.add_argument('--use_rel_prior', action='store_true')         # enable path-based relation prior
 # parser.add_argument('--path_lambda', type=float, default=0.5)       # weight for path prior in fusion
@@ -194,6 +216,9 @@ def _build_start_candidates(raw_start_configs, hp_space):
 if __name__ == '__main__':
     torch.set_num_threads(8)
     torch.multiprocessing.set_sharing_strategy('file_system')
+
+    if args.use_query_hub and args.add_manual_edges:
+        raise ValueError('`use_query_hub=True` and `add_manual_edges=True` cannot be enabled at the same time.')
     
     dataset = args.data_path
     dataset = dataset.split('/')
@@ -222,6 +247,13 @@ if __name__ == '__main__':
     args.n_batch = args.n_tbatch = int(args.batchsize)
     
     assert args.search or args.finetune
+
+    if args.use_relation_refine:
+        HPO_search_space.update(HPO_search_space_RELATION_REFINE)
+        print('==> HPO: added RelationRefine search space')
+    if args.use_query_hub:
+        HPO_search_space.update(HPO_search_space_QUERY_HUB)
+        print('==> HPO: added QueryHub search space')
 
     # # conditionally extend search space based on enabled modules
     # if args.use_rel_prior:
@@ -291,6 +323,15 @@ if __name__ == '__main__':
         args.concatHidden = params['concatHidden']
         args.shortcut = params['shortcut']
         args.readout = params['readout']
+        if args.use_relation_refine:
+            args.refine_dim = int(params['refine_dim'])
+            args.refine_steps = int(params['refine_steps'])
+            args.refine_eta = float(params['refine_eta'])
+            args.refine_keep_ratio = float(params['refine_keep_ratio'])
+        if args.use_query_hub:
+            args.hub_init = params['hub_init']
+            args.hub_readout = params['hub_readout']
+            args.hub_rel_mode = params['hub_rel_mode']
 
         # # Module 1: Relation-Path Conditioned Sampling params
         # if args.use_rel_prior:

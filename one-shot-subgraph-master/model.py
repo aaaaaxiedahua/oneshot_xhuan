@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 from torch_scatter import scatter
+import math
 
 
 # # ========== Module 2: Relation Composition Augmentation (RCA) ==========
@@ -368,7 +369,7 @@ class GNNLayer(torch.nn.Module):
         # # ========== Module 2: +n_extra_rel for virtual relation embedding ==========
         # self.rela_embed = nn.Embedding(2*n_rel+1+n_extra_rel, in_dim)
         # # ========== End Module 2 ==========
-        self.rela_embed = nn.Embedding(2*n_rel+1, in_dim)
+        self.rela_embed = nn.Embedding(2*n_rel+1+n_extra_rel, in_dim)
         self.Ws_attn = nn.Linear(in_dim, attn_dim, bias=False)
         self.Wr_attn = nn.Linear(in_dim, attn_dim, bias=False)
         self.Wqr_attn = nn.Linear(in_dim, attn_dim)
@@ -414,6 +415,24 @@ class GNN_auto(torch.nn.Module):
         acts = {'relu': nn.ReLU(), 'tanh': torch.tanh, 'idd': lambda x:x}
         act = acts[params.act]
         self.current_epoch = 0
+        self.last_module_stats = None
+        self.use_relation_refine = bool(getattr(params, 'use_relation_refine', False))
+        self.refine_dim = int(getattr(params, 'refine_dim', 16))
+        self.refine_steps = int(getattr(params, 'refine_steps', 2))
+        self.refine_eta = float(getattr(params, 'refine_eta', 0.3))
+        self.refine_keep_ratio = float(getattr(params, 'refine_keep_ratio', 0.7))
+        self.refine_keep_ratio = min(1.0, max(0.05, self.refine_keep_ratio))
+        self.refine_restart = 0.15
+        self.use_query_hub = bool(getattr(params, 'use_query_hub', False))
+        self.hub_init = getattr(params, 'hub_init', 'query_relation')
+        self.hub_readout = getattr(params, 'hub_readout', 'head')
+        self.hub_rel_mode = getattr(params, 'hub_rel_mode', 'directed')
+        if self.use_query_hub and bool(getattr(params, 'add_manual_edges', False)):
+            raise ValueError('`use_query_hub=True` and `add_manual_edges=True` cannot be enabled at the same time.')
+        self.manual_out_rel = 2 * self.n_rel + 1
+        self.manual_in_rel = 2 * self.n_rel + 2
+        self.n_extra_rel = 2 if (self.use_query_hub or bool(getattr(params, 'add_manual_edges', False))) else 0
+        self.refine_n_extra_rel = 2 if bool(getattr(params, 'add_manual_edges', False)) else 0
 
         # # ========== Module 2 ==========
         # self.use_rca = hasattr(params, 'use_rca') and params.use_rca
@@ -423,14 +442,43 @@ class GNN_auto(torch.nn.Module):
 
         self.gnn_layers = []
         for i in range(self.n_layer):
-            self.gnn_layers.append(GNNLayer(self.hidden_dim, self.hidden_dim, self.attn_dim, self.n_rel, act=act))
+            self.gnn_layers.append(
+                GNNLayer(
+                    self.hidden_dim,
+                    self.hidden_dim,
+                    self.attn_dim,
+                    self.n_rel,
+                    act=act,
+                    n_extra_rel=self.n_extra_rel,
+                )
+            )
         self.gnn_layers = nn.ModuleList(self.gnn_layers)
         self.dropout = nn.Dropout(params.dropout)
         self.gate = nn.GRU(self.hidden_dim, self.hidden_dim)
 
-        if self.params.initializer == 'relation': self.query_rela_embed = nn.Embedding(2*self.n_rel+1, self.hidden_dim)
+        need_query_rela_embed = (self.params.initializer == 'relation') or (
+            self.use_query_hub and self.hub_init == 'query_relation'
+        )
+        if need_query_rela_embed:
+            self.query_rela_embed = nn.Embedding(2*self.n_rel+1, self.hidden_dim)
         self.readout_dim = self.hidden_dim * (self.n_layer + 1) if self.params.concatHidden else self.hidden_dim
         self.use_readout_refine = hasattr(params, 'use_readout_refine') and params.use_readout_refine
+        if self.use_relation_refine:
+            self.refine_rel_embed = nn.Embedding(2 * self.n_rel + 1 + self.refine_n_extra_rel, self.refine_dim)
+            self.refine_query_proj = nn.Linear(self.refine_dim, self.refine_dim, bias=False)
+            self.refine_state_proj = nn.Linear(self.refine_dim, self.refine_dim, bias=False)
+            print(
+                '==> RelationRefine: enabled '
+                f'(dim={self.refine_dim}, steps={self.refine_steps}, eta={self.refine_eta}, '
+                f'keep_ratio={self.refine_keep_ratio})'
+            )
+        if self.use_query_hub and self.hub_init == 'query_relation':
+            self.hub_query_proj = nn.Linear(self.hidden_dim, self.hidden_dim, bias=False)
+        if self.use_query_hub:
+            print(
+                '==> QueryHub: enabled '
+                f'(init={self.hub_init}, readout={self.hub_readout}, rel_mode={self.hub_rel_mode})'
+            )
         if self.use_readout_refine:
             refine_hidden = max(1, self.readout_dim // 2)
             self.readout_refine = nn.Sequential(
@@ -469,6 +517,186 @@ class GNN_auto(torch.nn.Module):
     def set_epoch(self, epoch_idx):
         self.current_epoch = int(epoch_idx)
 
+    def pop_module_stats(self):
+        stats = self.last_module_stats
+        self.last_module_stats = None
+        return stats
+
+    def _refine_local_nodes(self, local_edges, num_nodes, head_local, q_rel_id):
+        keep_mask = torch.ones(num_nodes, dtype=torch.bool, device=q_rel_id.device)
+        if (not self.use_relation_refine) or num_nodes <= 1 or self.refine_steps <= 0:
+            return keep_mask, False
+        if local_edges.shape[0] == 0:
+            return keep_mask, False
+
+        sub = local_edges[:, 0]
+        rel = local_edges[:, 1]
+        obj = local_edges[:, 2]
+        if not torch.any(sub == head_local):
+            return keep_mask, False
+        rel_embeds = self.refine_rel_embed(rel)
+        q_embed = self.refine_rel_embed(q_rel_id.view(1)).squeeze(0)
+        z_state = q_embed
+        p = torch.zeros(num_nodes, device=q_rel_id.device)
+        p[head_local] = 1.0
+        head_vec = torch.zeros_like(p)
+        head_vec[head_local] = 1.0
+
+        for _ in range(self.refine_steps):
+            g = self.refine_query_proj(q_embed) + self.refine_state_proj(z_state)
+            edge_score = torch.matmul(rel_embeds, g)
+            max_score = scatter(edge_score, sub, dim=0, dim_size=num_nodes, reduce='max')
+            exp_score = torch.exp(edge_score - max_score[sub])
+            denom = scatter(exp_score, sub, dim=0, dim_size=num_nodes, reduce='sum')
+            trans = exp_score / (denom[sub] + 1e-12)
+
+            walk_mass = p[sub] * trans
+            propagated = scatter(walk_mass, obj, dim=0, dim_size=num_nodes, reduce='sum')
+            p = self.refine_restart * head_vec + (1.0 - self.refine_restart) * propagated
+            p = p / (p.sum() + 1e-12)
+
+            rel_update = torch.sum(rel_embeds * walk_mass.unsqueeze(-1), dim=0)
+            z_state = (1.0 - self.refine_eta) * z_state + self.refine_eta * rel_update
+
+        keep_k = max(1, int(math.ceil(float(self.refine_keep_ratio) * int(num_nodes))))
+        keep_k = min(num_nodes, keep_k)
+        keep_idx = torch.topk(p, keep_k, sorted=False).indices
+        keep_mask = torch.zeros(num_nodes, dtype=torch.bool, device=q_rel_id.device)
+        keep_mask[keep_idx] = True
+        keep_mask[head_local] = True
+        return keep_mask, True
+
+    def _apply_relation_refine(self, batch_idxs, abs_idxs, query_sub_idxs, edge_batch_idxs, batch_sampled_edges, q_rel):
+        device = batch_sampled_edges.device
+        batch_size = int(q_rel.shape[0])
+        total_nodes = batch_idxs.shape[0]
+        stats = {
+            'enabled': 1.0,
+            'query_count': float(batch_size),
+            'active_queries': 0.0,
+            'changed_queries': 0.0,
+            'coarse_nodes': 0.0,
+            'refined_nodes': 0.0,
+            'coarse_edges': 0.0,
+            'refined_edges': 0.0,
+        }
+
+        refined_batch_idxs = []
+        refined_abs_idxs = []
+        refined_query_sub_idxs = []
+        refined_edge_batch_idxs = []
+        refined_edges = []
+        ent_delta = 0
+
+        for batch_idx in range(batch_size):
+            node_mask = batch_idxs == batch_idx
+            node_global_idxs = torch.nonzero(node_mask, as_tuple=False).flatten()
+            num_nodes = int(node_global_idxs.numel())
+            if num_nodes == 0:
+                continue
+
+            local_index = torch.full((total_nodes,), -1, dtype=torch.long, device=device)
+            local_index[node_global_idxs] = torch.arange(num_nodes, device=device)
+            head_local = int(local_index[query_sub_idxs[batch_idx]].item())
+            local_abs_idxs = abs_idxs[node_global_idxs]
+            stats['coarse_nodes'] += float(num_nodes)
+
+            edge_mask = edge_batch_idxs == batch_idx
+            local_edges = batch_sampled_edges[edge_mask]
+            if local_edges.shape[0] > 0:
+                local_edges = torch.stack([
+                    local_index[local_edges[:, 0]],
+                    local_edges[:, 1],
+                    local_index[local_edges[:, 2]],
+                ], dim=1)
+                valid_edges = (local_edges[:, 0] >= 0) & (local_edges[:, 2] >= 0)
+                local_edges = local_edges[valid_edges]
+            stats['coarse_edges'] += float(local_edges.shape[0])
+
+            keep_mask, refine_applied = self._refine_local_nodes(local_edges, num_nodes, head_local, q_rel[batch_idx])
+            if refine_applied:
+                stats['active_queries'] += 1.0
+            kept_local_idxs = torch.nonzero(keep_mask, as_tuple=False).flatten()
+            kept_local_idxs, _ = torch.sort(kept_local_idxs)
+            stats['refined_nodes'] += float(kept_local_idxs.numel())
+            if kept_local_idxs.numel() < num_nodes:
+                stats['changed_queries'] += 1.0
+
+            compact_index = torch.full((num_nodes,), -1, dtype=torch.long, device=device)
+            compact_index[kept_local_idxs] = torch.arange(kept_local_idxs.numel(), device=device)
+
+            refined_batch_idxs.append(torch.full((kept_local_idxs.numel(),), batch_idx, dtype=torch.long, device=device))
+            refined_abs_idxs.append(local_abs_idxs[kept_local_idxs])
+            refined_query_sub_idxs.append(int(compact_index[head_local].item()) + ent_delta)
+
+            if local_edges.shape[0] > 0:
+                kept_edges_mask = keep_mask[local_edges[:, 0]] & keep_mask[local_edges[:, 2]]
+                kept_edges = local_edges[kept_edges_mask]
+                if kept_edges.shape[0] > 0:
+                    kept_edges = torch.stack([
+                        compact_index[kept_edges[:, 0]] + ent_delta,
+                        kept_edges[:, 1],
+                        compact_index[kept_edges[:, 2]] + ent_delta,
+                    ], dim=1)
+                    refined_edges.append(kept_edges)
+                    refined_edge_batch_idxs.append(
+                        torch.full((kept_edges.shape[0],), batch_idx, dtype=torch.long, device=device)
+                    )
+                    stats['refined_edges'] += float(kept_edges.shape[0])
+
+            ent_delta += int(kept_local_idxs.numel())
+
+        batch_idxs = torch.cat(refined_batch_idxs, dim=0)
+        abs_idxs = torch.cat(refined_abs_idxs, dim=0)
+        query_sub_idxs = torch.LongTensor(refined_query_sub_idxs).to(device)
+        if len(refined_edges) > 0:
+            batch_sampled_edges = torch.cat(refined_edges, dim=0)
+            edge_batch_idxs = torch.cat(refined_edge_batch_idxs, dim=0)
+        else:
+            batch_sampled_edges = torch.zeros((0, 3), dtype=torch.long, device=device)
+            edge_batch_idxs = torch.zeros((0,), dtype=torch.long, device=device)
+
+        return batch_idxs, abs_idxs, query_sub_idxs, edge_batch_idxs, batch_sampled_edges, stats
+
+    def _augment_with_query_hub(self, batch_idxs, batch_sampled_edges, edge_batch_idxs, batch_size):
+        device = batch_sampled_edges.device
+        n_real_nodes = batch_idxs.shape[0]
+        hub_sub_idxs = torch.arange(batch_size, device=device, dtype=torch.long) + n_real_nodes
+        hub_batch_idxs = torch.arange(batch_size, device=device, dtype=torch.long)
+
+        real_node_idxs = torch.arange(n_real_nodes, device=device, dtype=torch.long)
+        node_batch_idxs = torch.cat([batch_idxs, hub_batch_idxs], dim=0)
+        if self.hub_rel_mode == 'shared':
+            hub_out_rel = self.manual_out_rel
+            hub_in_rel = self.manual_out_rel
+        else:
+            hub_out_rel = self.manual_out_rel
+            hub_in_rel = self.manual_in_rel
+
+        add_edges_hub2nodes = torch.stack([
+            hub_sub_idxs[batch_idxs],
+            torch.full((n_real_nodes,), hub_out_rel, dtype=torch.long, device=device),
+            real_node_idxs,
+        ], dim=1)
+        add_edges_nodes2hub = torch.stack([
+            real_node_idxs,
+            torch.full((n_real_nodes,), hub_in_rel, dtype=torch.long, device=device),
+            hub_sub_idxs[batch_idxs],
+        ], dim=1)
+        hub_edges = torch.cat([add_edges_hub2nodes, add_edges_nodes2hub], dim=0)
+        hub_edge_batch_idxs = torch.cat([batch_idxs, batch_idxs], dim=0)
+
+        aug_edges = torch.cat([batch_sampled_edges, hub_edges], dim=0)
+        aug_edge_batch_idxs = torch.cat([edge_batch_idxs, hub_edge_batch_idxs], dim=0)
+        stats = {
+            'enabled': 1.0,
+            'query_count': float(batch_size),
+            'real_nodes': float(n_real_nodes),
+            'added_nodes': float(batch_size),
+            'added_edges': float(hub_edges.shape[0]),
+        }
+        return node_batch_idxs, hub_sub_idxs, aug_edges, aug_edge_batch_idxs, stats
+
     def forward(self, q_sub, q_rel, subgraph_data, mode='train'):
         n = len(q_sub)
         batch_idxs, abs_idxs, query_sub_idxs, edge_batch_idxs, batch_sampled_edges = subgraph_data
@@ -476,7 +704,23 @@ class GNN_auto(torch.nn.Module):
         batch_idxs = batch_idxs.to(device)
         abs_idxs = abs_idxs.to(device)
         query_sub_idxs = query_sub_idxs.to(device)
-        n_node = len(batch_idxs)
+        if self.use_relation_refine:
+            batch_idxs, abs_idxs, query_sub_idxs, edge_batch_idxs, batch_sampled_edges, relation_refine_stats = self._apply_relation_refine(
+                batch_idxs, abs_idxs, query_sub_idxs, edge_batch_idxs, batch_sampled_edges, q_rel
+            )
+        else:
+            relation_refine_stats = None
+        n_real_nodes = len(batch_idxs)
+        if self.use_query_hub:
+            node_batch_idxs, hub_sub_idxs, batch_sampled_edges, edge_batch_idxs, query_hub_stats = self._augment_with_query_hub(
+                batch_idxs, batch_sampled_edges, edge_batch_idxs, n
+            )
+            hub_sub_idxs = hub_sub_idxs.to(device)
+        else:
+            node_batch_idxs = batch_idxs
+            hub_sub_idxs = None
+            query_hub_stats = None
+        n_node = len(node_batch_idxs)
         h0 = torch.zeros((1, n_node, self.hidden_dim), device=device)
         hidden = torch.zeros(n_node, self.hidden_dim, device=device)
 
@@ -500,6 +744,8 @@ class GNN_auto(torch.nn.Module):
             hidden[query_sub_idxs, :] = 1
         elif self.params.initializer == 'relation':
             hidden[query_sub_idxs, :] = self.query_rela_embed(q_rel)
+        if self.use_query_hub and self.hub_init == 'query_relation':
+            hidden[hub_sub_idxs, :] = self.hub_query_proj(self.query_rela_embed(q_rel))
 
         if self.params.concatHidden: hidden_list = [hidden]
 
@@ -534,14 +780,19 @@ class GNN_auto(torch.nn.Module):
         if self.params.concatHidden: hidden = torch.cat(hidden_list, dim=-1)
         if self.use_readout_refine:
             hidden = hidden + self.readout_refine(hidden)
+        real_hidden = hidden[:n_real_nodes]
+        if self.use_query_hub and self.hub_readout == 'hub':
+            anchor_sub_idxs = hub_sub_idxs
+        else:
+            anchor_sub_idxs = query_sub_idxs
         if self.params.readout == 'linear':
-            scores = self.W_final(hidden).squeeze(-1)
+            scores = self.W_final(real_hidden).squeeze(-1)
         elif self.params.readout == 'multiply':
-            scores = torch.sum(hidden * hidden[query_sub_idxs][batch_idxs], dim=-1)
+            scores = torch.sum(real_hidden * hidden[anchor_sub_idxs][batch_idxs], dim=-1)
         elif self.params.readout == 'pair_mlp':
-            query_hidden = hidden[query_sub_idxs][batch_idxs]
+            query_hidden = hidden[anchor_sub_idxs][batch_idxs]
             pair_feat = torch.cat(
-                [hidden, query_hidden, hidden * query_hidden, torch.abs(hidden - query_hidden)],
+                [real_hidden, query_hidden, real_hidden * query_hidden, torch.abs(real_hidden - query_hidden)],
                 dim=-1,
             )
             scores = self.pair_score_head(pair_feat).squeeze(-1)
@@ -550,4 +801,8 @@ class GNN_auto(torch.nn.Module):
 
         scores_all = torch.zeros((n, self.loader.n_ent)).cuda()
         scores_all[batch_idxs, abs_idxs] = scores
+        self.last_module_stats = {
+            'relation_refine': relation_refine_stats,
+            'query_hub': query_hub_stats,
+        }
         return scores_all
