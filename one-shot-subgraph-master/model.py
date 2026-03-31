@@ -420,8 +420,22 @@ class GNN_auto(torch.nn.Module):
         self.refine_dim = int(getattr(params, 'refine_dim', 16))
         self.refine_steps = int(getattr(params, 'refine_steps', 2))
         self.refine_eta = float(getattr(params, 'refine_eta', 0.3))
-        self.refine_keep_ratio = float(getattr(params, 'refine_keep_ratio', 0.7))
-        self.refine_keep_ratio = min(1.0, max(0.05, self.refine_keep_ratio))
+        self.coarse_topk = float(getattr(params, 'topk', 0.1))
+        self.final_topk = float(getattr(params, 'final_topk', -1.0))
+        if self.use_relation_refine:
+            if self.final_topk <= 0:
+                self.final_topk = self.coarse_topk * 0.7
+            if self.coarse_topk <= 0:
+                raise ValueError('`topk` must be positive when `use_relation_refine=True`.')
+            if self.final_topk <= 0:
+                raise ValueError('`final_topk` must be positive when `use_relation_refine=True`.')
+            if self.final_topk - self.coarse_topk > 1e-12:
+                raise ValueError(
+                    f'`final_topk` ({self.final_topk}) cannot be larger than coarse `topk` ({self.coarse_topk}).'
+                )
+            self.final_n_nodes = max(1, int(math.ceil(self.final_topk * self.n_ent)))
+        else:
+            self.final_n_nodes = -1
         self.refine_restart = 0.15
         self.use_query_hub = bool(getattr(params, 'use_query_hub', False))
         self.hub_init = getattr(params, 'hub_init', 'query_relation')
@@ -470,7 +484,8 @@ class GNN_auto(torch.nn.Module):
             print(
                 '==> RelationRefine: enabled '
                 f'(dim={self.refine_dim}, steps={self.refine_steps}, eta={self.refine_eta}, '
-                f'keep_ratio={self.refine_keep_ratio})'
+                f'coarse_topk={self.coarse_topk}, final_topk={self.final_topk}, '
+                f'final_nodes={self.final_n_nodes})'
             )
         if self.use_query_hub and self.hub_init == 'query_relation':
             self.hub_query_proj = nn.Linear(self.hidden_dim, self.hidden_dim, bias=False)
@@ -558,7 +573,7 @@ class GNN_auto(torch.nn.Module):
             rel_update = torch.sum(rel_embeds * walk_mass.unsqueeze(-1), dim=0)
             z_state = (1.0 - self.refine_eta) * z_state + self.refine_eta * rel_update
 
-        keep_k = max(1, int(math.ceil(float(self.refine_keep_ratio) * int(num_nodes))))
+        keep_k = max(1, int(self.final_n_nodes))
         keep_k = min(num_nodes, keep_k)
         keep_idx = torch.topk(p, keep_k, sorted=False).indices
         keep_mask = torch.zeros(num_nodes, dtype=torch.bool, device=q_rel_id.device)

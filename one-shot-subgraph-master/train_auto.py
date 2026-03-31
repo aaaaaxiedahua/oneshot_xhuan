@@ -11,7 +11,7 @@ from PPR_sampler import pprSampler
 parser = argparse.ArgumentParser(description="Parser for the one-shot-subgraph framework")
 parser.add_argument('--data_path', type=str, default='data/WN18RR/')
 parser.add_argument('--seed', type=str, default=1234)
-parser.add_argument('--topk', type=float, default=0.1) # number of sampled nodes (for a subgraph)
+parser.add_argument('--topk', type=float, default=0.1) # coarse sampled-node ratio (for a subgraph)
 parser.add_argument('--topm', type=float, default=-1) # number of sampled edges (for a subgraph)
 parser.add_argument('--gpu', type=int, default=0)
 parser.add_argument('--fact_ratio', type=float, default=0.75)
@@ -30,7 +30,7 @@ parser.add_argument('--use_relation_refine', action='store_true')       # enable
 parser.add_argument('--refine_dim', type=int, default=16)
 parser.add_argument('--refine_steps', type=int, default=2)
 parser.add_argument('--refine_eta', type=float, default=0.3)
-parser.add_argument('--refine_keep_ratio', type=float, default=0.7)
+parser.add_argument('--final_topk', type=float, default=-1.0)           # final node ratio after relation refinement
 parser.add_argument('--use_query_hub', action='store_true')             # enable query-conditioned virtual hub
 parser.add_argument('--hub_init', type=str, default='query_relation', choices=['query_relation', 'zero'])
 parser.add_argument('--hub_readout', type=str, default='head', choices=['head', 'hub'])
@@ -53,6 +53,28 @@ args = parser.parse_args()
 class Options(object):
     pass
 
+
+def resolve_relation_refine_budget(args):
+    if not getattr(args, 'use_relation_refine', False):
+        return
+
+    coarse_topk = float(args.topk)
+    final_topk = float(getattr(args, 'final_topk', -1.0))
+
+    if final_topk <= 0:
+        final_topk = coarse_topk * 0.7
+
+    if coarse_topk <= 0:
+        raise ValueError('`topk` must be positive when `use_relation_refine=True`.')
+    if final_topk <= 0:
+        raise ValueError('`final_topk` must be positive when `use_relation_refine=True`.')
+    if final_topk - coarse_topk > 1e-12:
+        raise ValueError(
+            f'`final_topk` ({final_topk}) cannot be larger than coarse `topk` ({coarse_topk}).'
+        )
+
+    args.final_topk = float(final_topk)
+
 if __name__ == '__main__':
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -61,6 +83,7 @@ if __name__ == '__main__':
 
     if args.use_query_hub and args.add_manual_edges:
         raise ValueError('`use_query_hub=True` and `add_manual_edges=True` cannot be enabled at the same time.')
+    resolve_relation_refine_budget(args)
     
     dataset = args.data_path
     dataset = dataset.split('/')

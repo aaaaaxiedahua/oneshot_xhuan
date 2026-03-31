@@ -34,10 +34,15 @@ class BaseModel(object):
         self.best_valid_mrr = 0.0
         
     def saveModelToFiles(self, args, best_metric, deleteLastFile=True):
+        budget_tag = f'topk_{self.args.topk}'
+        if getattr(self.args, 'use_relation_refine', False):
+            final_topk = float(getattr(self.args, 'final_topk', -1.0))
+            if final_topk > 0:
+                budget_tag = f'ctopk_{self.args.topk}_ftopk_{final_topk}'
         if args.val_num == -1:
-            savePath = f'{self.args.data_path}/saveModel/topk_{self.args.topk}_layer_{self.args.layer}_{best_metric}.pt'
+            savePath = f'{self.args.data_path}/saveModel/{budget_tag}_layer_{self.args.layer}_{best_metric}.pt'
         else:
-            savePath = f'{self.args.data_path}/saveModel/topk_{self.args.topk}_layer_{self.args.layer}_valNum_{self.args.val_num}_{best_metric}.pt'
+            savePath = f'{self.args.data_path}/saveModel/{budget_tag}_layer_{self.args.layer}_valNum_{self.args.val_num}_{best_metric}.pt'
             
         print(f'Save checkpoint to : {savePath}')
         torch.save({

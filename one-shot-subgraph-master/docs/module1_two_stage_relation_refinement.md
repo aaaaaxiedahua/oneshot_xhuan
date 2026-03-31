@@ -298,14 +298,14 @@ T_t(v\mid u) =
 | `refine_dim` | 第二阶段关系向量和状态向量维度 | `16`, `32` | 最核心的新超参数 |
 | `refine_steps` | 第二阶段 refinement 轮数 | `2`, `3`, `4` | 建议先用 `2` 或 `3` |
 | `refine_eta` | 关系状态更新强度 `\eta` | `0.1`, `0.3`, `0.5` | 控制 `z_t` 更新快慢 |
-| `refine_keep_ratio` 或 `refine_topk_nodes` | 第二阶段最终保留节点预算 | ratio: `0.5`, `0.7`, `0.8`; topk: task-dependent | 二选一即可，不建议同时加 |
+| `final_topk` | 第二阶段最终保留节点预算比例 | `0.07`, `0.08`, `0.10` | 语义与原 `topk` 完全一致，二者都表示“占整个实体集的比例” |
 
 ### 6.2 Existing Parameters That Should Not Be Reused
 
 | Parameter | Whether Used in Stage 2 | Reason |
 |---|---|---|
 | `fact_ratio` | No | `fact_ratio` 是训练图切分比例，不是 refinement 轮次预算 |
-| `topk` | Stage 1 only | 用于粗召回节点预算，不等于 Stage 2 最终精化预算 |
+| `topk` | Stage 1 only | 用于粗召回节点预算 |
 | `topm` | Optional | 属于边采样预算，不等于第二阶段关系扩散预算 |
 
 ### 6.3 Recommended Default Configuration
@@ -317,13 +317,13 @@ T_t(v\mid u) =
 | `refine_dim` | `16` |
 | `refine_steps` | `2` |
 | `refine_eta` | `0.3` |
-| `refine_keep_ratio` | `0.7` |
+| `final_topk` | 若想最终仍为 `0.1`，可设 `topk=0.14, final_topk=0.1` |
 
 理由：
 
-- 参数量小
-- 第二阶段不会太重
-- 容易先验证“关系精化是否有效”
+- 参数语义更直观
+- `topk` 继续负责粗召回
+- `final_topk` 直接对应最终送进 GNN 的预算
 
 ---
 

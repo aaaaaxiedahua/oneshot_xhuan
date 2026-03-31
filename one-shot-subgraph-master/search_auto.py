@@ -36,11 +36,18 @@ HPO_search_space = {
         'dropout':               ('uniform', (0, 0.2)),
     }
 
-HPO_search_space_RELATION_REFINE = {
+def build_relation_refine_search_space(coarse_topk):
+    final_topk_choices = []
+    for ratio in [0.5, 0.7, 0.8]:
+        value = round(float(coarse_topk) * ratio, 6)
+        if value > 0:
+            final_topk_choices.append(value)
+    final_topk_choices = sorted(set(final_topk_choices))
+    return {
         'refine_dim':            ('choice', [16, 32]),
         'refine_steps':          ('choice', [2, 3, 4]),
         'refine_eta':            ('choice', [0.1, 0.3, 0.5]),
-        'refine_keep_ratio':     ('choice', [0.5, 0.7, 0.8]),
+        'final_topk':            ('choice', final_topk_choices),
     }
 
 HPO_search_space_QUERY_HUB = {
@@ -69,7 +76,7 @@ HPO_search_space_QUERY_HUB = {
 parser = argparse.ArgumentParser(description="Parser")
 parser.add_argument('--data_path', type=str, default='data/WN18RR/')
 parser.add_argument('--seed', type=str, default=1234)
-parser.add_argument('--topk', type=float, default=0.1) # number of sampled nodes (for a subgraph)
+parser.add_argument('--topk', type=float, default=0.1) # coarse sampled-node ratio (for a subgraph)
 parser.add_argument('--topm', type=float, default=-1) # number of sampled edges (for a subgraph)
 parser.add_argument('--gpu', type=int, default=0)
 parser.add_argument('--fact_ratio', type=float, default=0.75)
@@ -92,7 +99,7 @@ parser.add_argument('--use_relation_refine', action='store_true')
 parser.add_argument('--refine_dim', type=int, default=16)
 parser.add_argument('--refine_steps', type=int, default=2)
 parser.add_argument('--refine_eta', type=float, default=0.3)
-parser.add_argument('--refine_keep_ratio', type=float, default=0.7)
+parser.add_argument('--final_topk', type=float, default=-1.0)
 parser.add_argument('--use_query_hub', action='store_true')
 parser.add_argument('--hub_init', type=str, default='query_relation', choices=['query_relation', 'zero'])
 parser.add_argument('--hub_readout', type=str, default='head', choices=['head', 'hub'])
@@ -111,6 +118,28 @@ parser.add_argument('--hub_rel_mode', type=str, default='directed', choices=['di
 # parser.add_argument('--rca_mode', type=str, default='shared')       # shared / per_layer
 # parser.add_argument('--compose_max_hop', type=int, default=2)       # max composition hops: 2 or 3
 args = parser.parse_args()
+
+
+def resolve_relation_refine_budget(args):
+    if not getattr(args, 'use_relation_refine', False):
+        return
+
+    coarse_topk = float(args.topk)
+    final_topk = float(getattr(args, 'final_topk', -1.0))
+
+    if final_topk <= 0:
+        final_topk = coarse_topk * 0.7
+
+    if coarse_topk <= 0:
+        raise ValueError('`topk` must be positive when `use_relation_refine=True`.')
+    if final_topk <= 0:
+        raise ValueError('`final_topk` must be positive when `use_relation_refine=True`.')
+    if final_topk - coarse_topk > 1e-12:
+        raise ValueError(
+            f'`final_topk` ({final_topk}) cannot be larger than coarse `topk` ({coarse_topk}).'
+        )
+
+    args.final_topk = float(final_topk)
 
 
 def _sample_one_from_space(space):
@@ -185,6 +214,8 @@ def _build_start_candidates(raw_start_configs, hp_space):
     start_candidates = []
     hp_keys = set(hp_space.keys())
     for idx, user_cfg in enumerate(raw_start_configs):
+        user_cfg = dict(user_cfg)
+
         seed_cfg = _sample_one_from_space(hp_space)
         unknown_keys = [k for k in user_cfg.keys() if k not in hp_keys]
         if len(unknown_keys) > 0:
@@ -249,7 +280,8 @@ if __name__ == '__main__':
     assert args.search or args.finetune
 
     if args.use_relation_refine:
-        HPO_search_space.update(HPO_search_space_RELATION_REFINE)
+        resolve_relation_refine_budget(args)
+        HPO_search_space.update(build_relation_refine_search_space(args.topk))
         print('==> HPO: added RelationRefine search space')
     if args.use_query_hub:
         HPO_search_space.update(HPO_search_space_QUERY_HUB)
@@ -327,7 +359,8 @@ if __name__ == '__main__':
             args.refine_dim = int(params['refine_dim'])
             args.refine_steps = int(params['refine_steps'])
             args.refine_eta = float(params['refine_eta'])
-            args.refine_keep_ratio = float(params['refine_keep_ratio'])
+            args.final_topk = float(params['final_topk'])
+            resolve_relation_refine_budget(args)
         if args.use_query_hub:
             args.hub_init = params['hub_init']
             args.hub_readout = params['hub_readout']
