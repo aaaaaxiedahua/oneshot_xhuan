@@ -50,10 +50,9 @@ def build_relation_refine_search_space(coarse_topk):
         'final_topk':            ('choice', final_topk_choices),
     }
 
-HPO_search_space_QUERY_HUB = {
-        'hub_init':              ('choice', ['query_relation', 'zero']),
-        'hub_readout':           ('choice', ['head', 'hub']),
-        'hub_rel_mode':          ('choice', ['directed', 'shared']),
+
+HPO_search_space_DEPTH_ROUTING = {
+        'depth_route_type':      ('choice', ['query', 'query_anchor']),
     }
 
 # # ========== Module 1: Relation-Path Conditioned Sampling search space ==========
@@ -100,10 +99,8 @@ parser.add_argument('--refine_dim', type=int, default=16)
 parser.add_argument('--refine_steps', type=int, default=2)
 parser.add_argument('--refine_eta', type=float, default=0.3)
 parser.add_argument('--final_topk', type=float, default=-1.0)
-parser.add_argument('--use_query_hub', action='store_true')
-parser.add_argument('--hub_init', type=str, default='query_relation', choices=['query_relation', 'zero'])
-parser.add_argument('--hub_readout', type=str, default='head', choices=['head', 'hub'])
-parser.add_argument('--hub_rel_mode', type=str, default='directed', choices=['directed', 'shared'])
+parser.add_argument('--use_depth_routing', action='store_true')
+parser.add_argument('--depth_route_type', type=str, default='query', choices=['query', 'query_anchor'])
 # # ========== Module 1: Relation-Path Conditioned Sampling args ==========
 # parser.add_argument('--use_rel_prior', action='store_true')         # enable path-based relation prior
 # parser.add_argument('--path_lambda', type=float, default=0.5)       # weight for path prior in fusion
@@ -247,9 +244,6 @@ def _build_start_candidates(raw_start_configs, hp_space):
 if __name__ == '__main__':
     torch.set_num_threads(8)
     torch.multiprocessing.set_sharing_strategy('file_system')
-
-    if args.use_query_hub and args.add_manual_edges:
-        raise ValueError('`use_query_hub=True` and `add_manual_edges=True` cannot be enabled at the same time.')
     
     dataset = args.data_path
     dataset = dataset.split('/')
@@ -283,9 +277,9 @@ if __name__ == '__main__':
         resolve_relation_refine_budget(args)
         HPO_search_space.update(build_relation_refine_search_space(args.topk))
         print('==> HPO: added RelationRefine search space')
-    if args.use_query_hub:
-        HPO_search_space.update(HPO_search_space_QUERY_HUB)
-        print('==> HPO: added QueryHub search space')
+    if args.use_depth_routing:
+        HPO_search_space.update(HPO_search_space_DEPTH_ROUTING)
+        print('==> HPO: added DepthRouting search space')
 
     # # conditionally extend search space based on enabled modules
     # if args.use_rel_prior:
@@ -361,10 +355,8 @@ if __name__ == '__main__':
             args.refine_eta = float(params['refine_eta'])
             args.final_topk = float(params['final_topk'])
             resolve_relation_refine_budget(args)
-        if args.use_query_hub:
-            args.hub_init = params['hub_init']
-            args.hub_readout = params['hub_readout']
-            args.hub_rel_mode = params['hub_rel_mode']
+        if args.use_depth_routing:
+            args.depth_route_type = params['depth_route_type']
 
         # # Module 1: Relation-Path Conditioned Sampling params
         # if args.use_rel_prior:

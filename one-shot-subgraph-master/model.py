@@ -422,6 +422,8 @@ class GNN_auto(torch.nn.Module):
         self.refine_eta = float(getattr(params, 'refine_eta', 0.3))
         self.coarse_topk = float(getattr(params, 'topk', 0.1))
         self.final_topk = float(getattr(params, 'final_topk', -1.0))
+        self.use_depth_routing = bool(getattr(params, 'use_depth_routing', False))
+        self.depth_route_type = getattr(params, 'depth_route_type', 'query')
         if self.use_relation_refine:
             if self.final_topk <= 0:
                 self.final_topk = self.coarse_topk * 0.7
@@ -437,15 +439,7 @@ class GNN_auto(torch.nn.Module):
         else:
             self.final_n_nodes = -1
         self.refine_restart = 0.15
-        self.use_query_hub = bool(getattr(params, 'use_query_hub', False))
-        self.hub_init = getattr(params, 'hub_init', 'query_relation')
-        self.hub_readout = getattr(params, 'hub_readout', 'head')
-        self.hub_rel_mode = getattr(params, 'hub_rel_mode', 'directed')
-        if self.use_query_hub and bool(getattr(params, 'add_manual_edges', False)):
-            raise ValueError('`use_query_hub=True` and `add_manual_edges=True` cannot be enabled at the same time.')
-        self.manual_out_rel = 2 * self.n_rel + 1
-        self.manual_in_rel = 2 * self.n_rel + 2
-        self.n_extra_rel = 2 if (self.use_query_hub or bool(getattr(params, 'add_manual_edges', False))) else 0
+        self.n_extra_rel = 2 if bool(getattr(params, 'add_manual_edges', False)) else 0
         self.refine_n_extra_rel = 2 if bool(getattr(params, 'add_manual_edges', False)) else 0
 
         # # ========== Module 2 ==========
@@ -470,12 +464,13 @@ class GNN_auto(torch.nn.Module):
         self.dropout = nn.Dropout(params.dropout)
         self.gate = nn.GRU(self.hidden_dim, self.hidden_dim)
 
-        need_query_rela_embed = (self.params.initializer == 'relation') or (
-            self.use_query_hub and self.hub_init == 'query_relation'
-        )
+        need_query_rela_embed = (self.params.initializer == 'relation') or self.use_depth_routing
         if need_query_rela_embed:
             self.query_rela_embed = nn.Embedding(2*self.n_rel+1, self.hidden_dim)
-        self.readout_dim = self.hidden_dim * (self.n_layer + 1) if self.params.concatHidden else self.hidden_dim
+        self.use_concat_readout = bool(self.params.concatHidden) and (not self.use_depth_routing)
+        self.readout_dim = self.hidden_dim * (self.n_layer + 1) if self.use_concat_readout else self.hidden_dim
+        if self.use_depth_routing and self.params.concatHidden:
+            print('==> DepthRouting: concatHidden is ignored; routing uses per-layer hidden states directly.')
         self.use_readout_refine = hasattr(params, 'use_readout_refine') and params.use_readout_refine
         if self.use_relation_refine:
             self.refine_rel_embed = nn.Embedding(2 * self.n_rel + 1 + self.refine_n_extra_rel, self.refine_dim)
@@ -487,12 +482,18 @@ class GNN_auto(torch.nn.Module):
                 f'coarse_topk={self.coarse_topk}, final_topk={self.final_topk}, '
                 f'final_nodes={self.final_n_nodes})'
             )
-        if self.use_query_hub and self.hub_init == 'query_relation':
-            self.hub_query_proj = nn.Linear(self.hidden_dim, self.hidden_dim, bias=False)
-        if self.use_query_hub:
+        if self.use_depth_routing:
+            if self.depth_route_type == 'query':
+                self.depth_router = nn.Linear(self.hidden_dim, self.n_layer)
+            elif self.depth_route_type == 'query_anchor':
+                self.depth_query_proj = nn.Linear(self.hidden_dim, self.hidden_dim, bias=False)
+                self.depth_anchor_proj = nn.Linear(self.hidden_dim, self.hidden_dim, bias=False)
+                self.depth_router = nn.Linear(self.hidden_dim, 1, bias=False)
+            else:
+                raise ValueError(f'Unknown depth_route_type: {self.depth_route_type}')
             print(
-                '==> QueryHub: enabled '
-                f'(init={self.hub_init}, readout={self.hub_readout}, rel_mode={self.hub_rel_mode})'
+                '==> DepthRouting: enabled '
+                f'(type={self.depth_route_type}, layers={self.n_layer})'
             )
         if self.use_readout_refine:
             refine_hidden = max(1, self.readout_dim // 2)
@@ -673,44 +674,47 @@ class GNN_auto(torch.nn.Module):
 
         return batch_idxs, abs_idxs, query_sub_idxs, edge_batch_idxs, batch_sampled_edges, stats
 
-    def _augment_with_query_hub(self, batch_idxs, batch_sampled_edges, edge_batch_idxs, batch_size):
-        device = batch_sampled_edges.device
-        n_real_nodes = batch_idxs.shape[0]
-        hub_sub_idxs = torch.arange(batch_size, device=device, dtype=torch.long) + n_real_nodes
-        hub_batch_idxs = torch.arange(batch_size, device=device, dtype=torch.long)
+    def _apply_readout_refine(self, hidden):
+        if self.use_readout_refine:
+            return hidden + self.readout_refine(hidden)
+        return hidden
 
-        real_node_idxs = torch.arange(n_real_nodes, device=device, dtype=torch.long)
-        node_batch_idxs = torch.cat([batch_idxs, hub_batch_idxs], dim=0)
-        if self.hub_rel_mode == 'shared':
-            hub_out_rel = self.manual_out_rel
-            hub_in_rel = self.manual_out_rel
+    def _compute_scores(self, real_hidden, anchor_hidden):
+        if self.params.readout == 'linear':
+            return self.W_final(real_hidden).squeeze(-1)
+        if self.params.readout == 'multiply':
+            return torch.sum(real_hidden * anchor_hidden, dim=-1)
+        if self.params.readout == 'pair_mlp':
+            pair_feat = torch.cat(
+                [real_hidden, anchor_hidden, real_hidden * anchor_hidden, torch.abs(real_hidden - anchor_hidden)],
+                dim=-1,
+            )
+            return self.pair_score_head(pair_feat).squeeze(-1)
+        raise ValueError(f'Unknown readout type: {self.params.readout}')
+
+    def _compute_depth_route_weights(self, q_rel, layer_hidden_list, query_sub_idxs):
+        if not self.use_depth_routing:
+            return None, None
+
+        q_embed = self.query_rela_embed(q_rel)
+        if self.depth_route_type == 'query':
+            logits = self.depth_router(q_embed)
         else:
-            hub_out_rel = self.manual_out_rel
-            hub_in_rel = self.manual_in_rel
+            q_proj = self.depth_query_proj(q_embed)
+            layer_logits = []
+            for hidden in layer_hidden_list:
+                anchor_hidden = hidden[query_sub_idxs]
+                fused = torch.tanh(q_proj + self.depth_anchor_proj(anchor_hidden))
+                layer_logits.append(self.depth_router(fused).squeeze(-1))
+            logits = torch.stack(layer_logits, dim=-1)
 
-        add_edges_hub2nodes = torch.stack([
-            hub_sub_idxs[batch_idxs],
-            torch.full((n_real_nodes,), hub_out_rel, dtype=torch.long, device=device),
-            real_node_idxs,
-        ], dim=1)
-        add_edges_nodes2hub = torch.stack([
-            real_node_idxs,
-            torch.full((n_real_nodes,), hub_in_rel, dtype=torch.long, device=device),
-            hub_sub_idxs[batch_idxs],
-        ], dim=1)
-        hub_edges = torch.cat([add_edges_hub2nodes, add_edges_nodes2hub], dim=0)
-        hub_edge_batch_idxs = torch.cat([batch_idxs, batch_idxs], dim=0)
-
-        aug_edges = torch.cat([batch_sampled_edges, hub_edges], dim=0)
-        aug_edge_batch_idxs = torch.cat([edge_batch_idxs, hub_edge_batch_idxs], dim=0)
+        alpha = torch.softmax(logits, dim=-1)
         stats = {
             'enabled': 1.0,
-            'query_count': float(batch_size),
-            'real_nodes': float(n_real_nodes),
-            'added_nodes': float(batch_size),
-            'added_edges': float(hub_edges.shape[0]),
+            'query_count': float(q_rel.shape[0]),
+            'layer_weight_sum': alpha.detach().sum(dim=0).cpu().tolist(),
         }
-        return node_batch_idxs, hub_sub_idxs, aug_edges, aug_edge_batch_idxs, stats
+        return alpha, stats
 
     def forward(self, q_sub, q_rel, subgraph_data, mode='train'):
         n = len(q_sub)
@@ -726,16 +730,7 @@ class GNN_auto(torch.nn.Module):
         else:
             relation_refine_stats = None
         n_real_nodes = len(batch_idxs)
-        if self.use_query_hub:
-            node_batch_idxs, hub_sub_idxs, batch_sampled_edges, edge_batch_idxs, query_hub_stats = self._augment_with_query_hub(
-                batch_idxs, batch_sampled_edges, edge_batch_idxs, n
-            )
-            hub_sub_idxs = hub_sub_idxs.to(device)
-        else:
-            node_batch_idxs = batch_idxs
-            hub_sub_idxs = None
-            query_hub_stats = None
-        n_node = len(node_batch_idxs)
+        n_node = len(batch_idxs)
         h0 = torch.zeros((1, n_node, self.hidden_dim), device=device)
         hidden = torch.zeros(n_node, self.hidden_dim, device=device)
 
@@ -759,10 +754,11 @@ class GNN_auto(torch.nn.Module):
             hidden[query_sub_idxs, :] = 1
         elif self.params.initializer == 'relation':
             hidden[query_sub_idxs, :] = self.query_rela_embed(q_rel)
-        if self.use_query_hub and self.hub_init == 'query_relation':
-            hidden[hub_sub_idxs, :] = self.hub_query_proj(self.query_rela_embed(q_rel))
 
-        if self.params.concatHidden: hidden_list = [hidden]
+        if self.use_concat_readout:
+            hidden_list = [hidden]
+        if self.use_depth_routing:
+            layer_hidden_list = []
 
         # propagation
         for i in range(self.n_layer):
@@ -789,35 +785,34 @@ class GNN_auto(torch.nn.Module):
             hidden = hidden * (1-act_signal).unsqueeze(-1)
             h0 = h0 * (1-act_signal).unsqueeze(-1).unsqueeze(0)
 
-            if self.params.concatHidden: hidden_list.append(hidden)
+            if self.use_concat_readout:
+                hidden_list.append(hidden)
+            if self.use_depth_routing:
+                layer_hidden_list.append(hidden)
 
         # readout
-        if self.params.concatHidden: hidden = torch.cat(hidden_list, dim=-1)
-        if self.use_readout_refine:
-            hidden = hidden + self.readout_refine(hidden)
-        real_hidden = hidden[:n_real_nodes]
-        if self.use_query_hub and self.hub_readout == 'hub':
-            anchor_sub_idxs = hub_sub_idxs
+        if self.use_depth_routing:
+            alpha, depth_routing_stats = self._compute_depth_route_weights(q_rel, layer_hidden_list, query_sub_idxs)
+            scores = torch.zeros(n_real_nodes, device=device)
+            for layer_idx, layer_hidden in enumerate(layer_hidden_list):
+                score_hidden = self._apply_readout_refine(layer_hidden)
+                real_hidden = score_hidden[:n_real_nodes]
+                anchor_hidden = score_hidden[query_sub_idxs][batch_idxs]
+                layer_scores = self._compute_scores(real_hidden, anchor_hidden)
+                scores = scores + alpha[batch_idxs, layer_idx] * layer_scores
         else:
-            anchor_sub_idxs = query_sub_idxs
-        if self.params.readout == 'linear':
-            scores = self.W_final(real_hidden).squeeze(-1)
-        elif self.params.readout == 'multiply':
-            scores = torch.sum(real_hidden * hidden[anchor_sub_idxs][batch_idxs], dim=-1)
-        elif self.params.readout == 'pair_mlp':
-            query_hidden = hidden[anchor_sub_idxs][batch_idxs]
-            pair_feat = torch.cat(
-                [real_hidden, query_hidden, real_hidden * query_hidden, torch.abs(real_hidden - query_hidden)],
-                dim=-1,
-            )
-            scores = self.pair_score_head(pair_feat).squeeze(-1)
-        else:
-            raise ValueError(f'Unknown readout type: {self.params.readout}')
+            if self.use_concat_readout:
+                hidden = torch.cat(hidden_list, dim=-1)
+            hidden = self._apply_readout_refine(hidden)
+            real_hidden = hidden[:n_real_nodes]
+            anchor_hidden = hidden[query_sub_idxs][batch_idxs]
+            scores = self._compute_scores(real_hidden, anchor_hidden)
+            depth_routing_stats = None
 
         scores_all = torch.zeros((n, self.loader.n_ent)).cuda()
         scores_all[batch_idxs, abs_idxs] = scores
         self.last_module_stats = {
             'relation_refine': relation_refine_stats,
-            'query_hub': query_hub_stats,
+            'depth_routing': depth_routing_stats,
         }
         return scores_all

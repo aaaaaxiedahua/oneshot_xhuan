@@ -31,10 +31,8 @@ parser.add_argument('--refine_dim', type=int, default=16)
 parser.add_argument('--refine_steps', type=int, default=2)
 parser.add_argument('--refine_eta', type=float, default=0.3)
 parser.add_argument('--final_topk', type=float, default=-1.0)           # final node ratio after relation refinement
-parser.add_argument('--use_query_hub', action='store_true')             # enable query-conditioned virtual hub
-parser.add_argument('--hub_init', type=str, default='query_relation', choices=['query_relation', 'zero'])
-parser.add_argument('--hub_readout', type=str, default='head', choices=['head', 'hub'])
-parser.add_argument('--hub_rel_mode', type=str, default='directed', choices=['directed', 'shared'])
+parser.add_argument('--use_depth_routing', action='store_true')         # enable query-aware dynamic depth routing
+parser.add_argument('--depth_route_type', type=str, default='query', choices=['query', 'query_anchor'])
 # # ========== Module 1: Relation-Path Conditioned Sampling args ==========
 # parser.add_argument('--use_rel_prior', action='store_true')         # enable path-based relation prior
 # parser.add_argument('--path_lambda', type=float, default=0.5)       # weight for path prior in fusion
@@ -81,8 +79,6 @@ if __name__ == '__main__':
     torch.set_num_threads(max(8, args.cpu))
     torch.multiprocessing.set_sharing_strategy('file_system')
 
-    if args.use_query_hub and args.add_manual_edges:
-        raise ValueError('`use_query_hub=True` and `add_manual_edges=True` cannot be enabled at the same time.')
     resolve_relation_refine_budget(args)
     
     dataset = args.data_path

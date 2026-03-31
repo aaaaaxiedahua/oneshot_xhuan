@@ -70,15 +70,13 @@ class BaseModel(object):
             'refined_edges': 0.0,
         }
 
-    def _new_query_hub_tracker(self):
+    def _new_depth_routing_tracker(self):
         return {
             'query_count': 0.0,
-            'real_nodes': 0.0,
-            'added_nodes': 0.0,
-            'added_edges': 0.0,
+            'layer_weight_sum': np.zeros(self.model.n_layer, dtype=np.float64),
         }
 
-    def _update_module_trackers(self, relation_refine_tracker, query_hub_tracker, batch_stats):
+    def _update_module_trackers(self, relation_refine_tracker, depth_routing_tracker, batch_stats):
         if batch_stats is None:
             return
 
@@ -87,10 +85,12 @@ class BaseModel(object):
             for key in relation_refine_tracker.keys():
                 relation_refine_tracker[key] += float(relation_refine_stats.get(key, 0.0))
 
-        query_hub_stats = batch_stats.get('query_hub')
-        if query_hub_stats is not None and query_hub_stats.get('enabled', 0.0) > 0.5:
-            for key in query_hub_tracker.keys():
-                query_hub_tracker[key] += float(query_hub_stats.get(key, 0.0))
+        depth_routing_stats = batch_stats.get('depth_routing')
+        if depth_routing_stats is not None and depth_routing_stats.get('enabled', 0.0) > 0.5:
+            depth_routing_tracker['query_count'] += float(depth_routing_stats.get('query_count', 0.0))
+            depth_routing_tracker['layer_weight_sum'] += np.array(
+                depth_routing_stats.get('layer_weight_sum', []), dtype=np.float64
+            )
 
     def _format_relation_refine_tracker(self, phase, tracker):
         query_count = float(tracker['query_count'])
@@ -109,17 +109,16 @@ class BaseModel(object):
             f'edge_keep={edge_keep:.1%}'
         )
 
-    def _format_query_hub_tracker(self, phase, tracker):
+    def _format_depth_routing_tracker(self, phase, tracker):
         query_count = float(tracker['query_count'])
         if query_count <= 0:
             return None
+        mean_weights = tracker['layer_weight_sum'] / max(query_count, 1.0)
+        weight_str = ' '.join([f'L{i}:{w:.3f}' for i, w in enumerate(mean_weights, start=1)])
         return (
-            f'==> QueryHub[{phase}][epoch={self.epoch_idx}]: '
+            f'==> DepthRouting[{phase}][epoch={self.epoch_idx}]: '
             f'queries={int(query_count)} '
-            f'real_nodes/q={tracker["real_nodes"] / query_count:.1f} '
-            f'added_nodes/q={tracker["added_nodes"] / query_count:.1f} '
-            f'added_edges/q={tracker["added_edges"] / query_count:.1f} '
-            f'total_nodes/q={(tracker["real_nodes"] + tracker["added_nodes"]) / query_count:.1f}'
+            f'weights={weight_str}'
         )
 
     def _format_epoch_summary(self, eval_info):
@@ -147,7 +146,7 @@ class BaseModel(object):
         epoch_loss = 0
         reach_tails_list = []
         train_relation_refine_tracker = self._new_relation_refine_tracker()
-        train_query_hub_tracker = self._new_query_hub_tracker()
+        train_depth_routing_tracker = self._new_depth_routing_tracker()
         t_time = time.time()
         self.model.train()
         if hasattr(self.model, 'set_epoch'):
@@ -162,7 +161,7 @@ class BaseModel(object):
             scores = self.model(subs, rels, subgraph_data)
             self._update_module_trackers(
                 train_relation_refine_tracker,
-                train_query_hub_tracker,
+                train_depth_routing_tracker,
                 self.model.pop_module_stats(),
             )
             
@@ -198,13 +197,13 @@ class BaseModel(object):
         train_relation_refine_log = self._format_relation_refine_tracker('train', train_relation_refine_tracker)
         if train_relation_refine_log is not None:
             print(train_relation_refine_log)
-        train_query_hub_log = self._format_query_hub_tracker('train', train_query_hub_tracker)
-        if train_query_hub_log is not None:
-            print(train_query_hub_log)
+        train_depth_routing_log = self._format_depth_routing_tracker('train', train_depth_routing_tracker)
+        if train_depth_routing_log is not None:
+            print(train_depth_routing_log)
         for phase_log in eval_info['relation_refine_logs']:
             if phase_log is not None:
                 print(phase_log)
-        for phase_log in eval_info['query_hub_logs']:
+        for phase_log in eval_info['depth_routing_logs']:
             if phase_log is not None:
                 print(phase_log)
         
@@ -231,8 +230,8 @@ class BaseModel(object):
         i_time = time.time()
         valid_relation_refine_tracker = self._new_relation_refine_tracker()
         test_relation_refine_tracker = self._new_relation_refine_tracker()
-        valid_query_hub_tracker = self._new_query_hub_tracker()
-        test_query_hub_tracker = self._new_query_hub_tracker()
+        valid_depth_routing_tracker = self._new_depth_routing_tracker()
+        test_depth_routing_tracker = self._new_depth_routing_tracker()
         
         # eval on val set
         if eval_val:
@@ -246,7 +245,7 @@ class BaseModel(object):
                 scores = self.model(subs, rels, subgraph_data, mode='valid').data.cpu().numpy()
                 self._update_module_trackers(
                     valid_relation_refine_tracker,
-                    valid_query_hub_tracker,
+                    valid_depth_routing_tracker,
                     self.model.pop_module_stats(),
                 )
 
@@ -306,7 +305,7 @@ class BaseModel(object):
                 scores = self.model(subs, rels, subgraph_data, mode='test').data.cpu().numpy()
                 self._update_module_trackers(
                     test_relation_refine_tracker,
-                    test_query_hub_tracker,
+                    test_depth_routing_tracker,
                     self.model.pop_module_stats(),
                 )
 
@@ -364,9 +363,9 @@ class BaseModel(object):
                 self._format_relation_refine_tracker('valid', valid_relation_refine_tracker),
                 self._format_relation_refine_tracker('test', test_relation_refine_tracker),
             ],
-            'query_hub_logs': [
-                self._format_query_hub_tracker('valid', valid_query_hub_tracker),
-                self._format_query_hub_tracker('test', test_query_hub_tracker),
+            'depth_routing_logs': [
+                self._format_depth_routing_tracker('valid', valid_depth_routing_tracker),
+                self._format_depth_routing_tracker('test', test_depth_routing_tracker),
             ],
         }
         return v_mrr, out_str, eval_info
