@@ -36,18 +36,6 @@ HPO_search_space = {
         'dropout':               ('uniform', (0, 0.2)),
     }
 
-HPO_search_space_RBPPR = {
-        'rbppr_lambda':          ('choice', [0.1, 0.05, 0.15, 0.2, 0.25, 0.3]),
-    }
-
-HPO_search_space_EDGEPRUNE = {
-        'edgeprune_ratio_start':     ('choice', [1.0, 0.9]),
-        'edgeprune_ratio_end':       ('choice', [0.8, 0.65, 0.5]),
-        'edgeprune_evidence_lambda': ('uniform', (0.3, 0.8)),
-        'edgeprune_teleport':        ('uniform', (0.0, 0.2)),
-        'edgeprune_target_alpha':    ('uniform', (0.2, 0.6)),
-    }
-
 # # ========== Module 1: Relation-Path Conditioned Sampling search space ==========
 # HPO_search_space_M1 = {
 #         'path_lambda':           ('uniform', (0.1, 2.0)),
@@ -87,16 +75,6 @@ parser.add_argument('--finetune_config', type=str, default='')
 parser.add_argument('--start_config', type=str, default='')  # optional: JSON string or file path for seeded trial config
 parser.add_argument('--not_shuffle_train', action='store_true')
 parser.add_argument('--use_readout_refine', action='store_true')
-# ========== RBPPR args ==========
-parser.add_argument('--use_rbppr', action='store_true')
-parser.add_argument('--rbppr_lambda', type=float, default=0.1)
-# ========== EdgePrune args ==========
-parser.add_argument('--use_edgeprune', action='store_true')
-parser.add_argument('--edgeprune_ratio_start', type=float, default=1.0)
-parser.add_argument('--edgeprune_ratio_end', type=float, default=0.5)
-parser.add_argument('--edgeprune_evidence_lambda', type=float, default=0.5)
-parser.add_argument('--edgeprune_teleport', type=float, default=0.1)
-parser.add_argument('--edgeprune_target_alpha', type=float, default=0.3)
 # # ========== Module 1: Relation-Path Conditioned Sampling args ==========
 # parser.add_argument('--use_rel_prior', action='store_true')         # enable path-based relation prior
 # parser.add_argument('--path_lambda', type=float, default=0.5)       # weight for path prior in fusion
@@ -245,13 +223,6 @@ if __name__ == '__main__':
     
     assert args.search or args.finetune
 
-    if args.use_rbppr:
-        HPO_search_space.update(HPO_search_space_RBPPR)
-        print('==> HPO: added RBPPR search space')
-    if args.use_edgeprune:
-        HPO_search_space.update(HPO_search_space_EDGEPRUNE)
-        print('==> HPO: added EdgePrune search space')
-
     # # conditionally extend search space based on enabled modules
     # if args.use_rel_prior:
     #     HPO_search_space.update(HPO_search_space_M1)
@@ -320,15 +291,6 @@ if __name__ == '__main__':
         args.concatHidden = params['concatHidden']
         args.shortcut = params['shortcut']
         args.readout = params['readout']
-
-        if args.use_rbppr:
-            args.rbppr_lambda = float(params['rbppr_lambda'])
-        if args.use_edgeprune:
-            args.edgeprune_ratio_start = float(params['edgeprune_ratio_start'])
-            args.edgeprune_ratio_end = float(params['edgeprune_ratio_end'])
-            args.edgeprune_evidence_lambda = float(params['edgeprune_evidence_lambda'])
-            args.edgeprune_teleport = float(params['edgeprune_teleport'])
-            args.edgeprune_target_alpha = float(params['edgeprune_target_alpha'])
 
         # # Module 1: Relation-Path Conditioned Sampling params
         # if args.use_rel_prior:

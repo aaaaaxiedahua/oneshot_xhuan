@@ -1,22 +1,11 @@
 import networkx as nx
 import pickle as pkl
-import time
 import numpy as np
 import torch
 import os
-import logging
 from tqdm import tqdm
-from scipy.sparse import csr_matrix, coo_matrix
-from collections import defaultdict, OrderedDict
-
-RBPPR_META_FIELDS = (
-    'enabled',
-    'score_delta_mean',
-    'changed_topk_ratio',
-    'changed_front_ratio',
-    'lead_changed',
-    'rel_gain_topk',
-)
+from scipy.sparse import csr_matrix
+from collections import OrderedDict
 
 def checkPath(path):
     if not os.path.exists(path):
@@ -46,22 +35,8 @@ class pprSampler():
         self.ppr_savePath = os.path.join(self.data_folder, f'ppr_scores/')
         self.ppr_vector_cache = OrderedDict()
         self.ppr_cache_size = 256
-        self.use_rbppr = bool(getattr(args, 'use_rbppr', False))
-        self.rbppr_lambda = float(np.clip(getattr(args, 'rbppr_lambda', 0.1), 0.0, 1.0))
-        self.rbppr_savePath = os.path.join(self.data_folder, 'rbppr_scores/')
-        self.rbppr_vector_cache = OrderedDict()
-        self.rbppr_cache_size = max(32, 2 * self.n_rel)
-        self.rbppr_front_k = min(256, max(1, self.topk))
-        self.idd_rel = 2 * self.n_rel
         checkPath(self.ppr_savePath)
-        if self.use_rbppr:
-            checkPath(self.rbppr_savePath)
         print('==> checking ppr scores for each entity...')
-        if self.use_rbppr:
-            print(
-                f'==> RBPPR[{self.split}]: enabled '
-                f'(lambda={self.rbppr_lambda}, bias=tail_freq)'
-            )
         
         for h in tqdm(range(self.n_ent), ncols=50, leave=False):
             ent_ppr_savePath = os.path.join(self.ppr_savePath, f'{int(h)}.pkl')
@@ -71,15 +46,6 @@ class pprSampler():
                 # with default setting to generate ppr scores
                 h_ppr_scores = self.generatePPRScoresForOneEntity(h)
                 pkl.dump(h_ppr_scores, open(ent_ppr_savePath, 'wb'))
-        if self.use_rbppr:
-            self._build_relation_bias_vectors(edge_index)
-            print('==> checking relation-aware ppr scores for each relation...')
-            for rel_id in tqdm(range(2 * self.n_rel), ncols=50, leave=False):
-                rel_ppr_savePath = os.path.join(self.rbppr_savePath, f'{int(rel_id)}.pkl')
-                if os.path.exists(rel_ppr_savePath):
-                    continue
-                rel_ppr_scores = self.generatePPRScoresForPersonalization(self.relation_bias_dict[rel_id])
-                pkl.dump(rel_ppr_scores, open(rel_ppr_savePath, 'wb'))
         print('finished.')
         
         # build head to edges with sparse matrix
@@ -143,28 +109,6 @@ class pprSampler():
             self.ppr_vector_cache.popitem(last=False)
         return arr
 
-    def getRelationPPRscores(self, rel):
-        rel_ppr_savePath = os.path.join(self.rbppr_savePath, f'{int(rel)}.pkl')
-        scores = pkl.load(open(rel_ppr_savePath, 'rb'))
-        return scores
-
-    def getRelationPPRarray(self, rel):
-        rel = int(rel)
-        if rel in self.rbppr_vector_cache:
-            arr = self.rbppr_vector_cache.pop(rel)
-            self.rbppr_vector_cache[rel] = arr
-            return arr
-
-        scores = self.getRelationPPRscores(rel)
-        if isinstance(scores, dict):
-            arr = np.array([scores[i] for i in range(self.n_ent)], dtype=np.float32)
-        else:
-            arr = np.array(scores, dtype=np.float32)
-        self.rbppr_vector_cache[rel] = arr
-        if len(self.rbppr_vector_cache) > self.rbppr_cache_size:
-            self.rbppr_vector_cache.popitem(last=False)
-        return arr
-        
     def generatePPRScoresForOneEntity(self, h, method='nx'):
         return self.generatePPRScoresForPersonalization({int(h): 1.0}, method=method)
 
@@ -189,72 +133,6 @@ class pprSampler():
             scores = scores.cpu().reshape(-1).numpy()
         return scores
 
-    def _build_relation_bias_vectors(self, edge_index):
-        rel_tail_counts = np.zeros((2 * self.n_rel, self.n_ent), dtype=np.float32)
-        for h, r, t in edge_index:
-            r = int(r)
-            if r == self.idd_rel:
-                continue
-            rel_tail_counts[r, int(t)] += 1.0
-
-        self.relation_bias_dict = {}
-        for rel_id in range(2 * self.n_rel):
-            counts = rel_tail_counts[rel_id]
-            nz = np.flatnonzero(counts > 0)
-            if nz.size == 0:
-                self.relation_bias_dict[rel_id] = {0: 1.0}
-                continue
-            total = float(counts[nz].sum())
-            self.relation_bias_dict[rel_id] = {
-                int(node_id): float(counts[node_id] / total) for node_id in nz.tolist()
-            }
-
-    def _build_rbppr_scores(self, ent, rel, ent_ppr_scores):
-        meta = self._empty_rbppr_meta()
-        if (not self.use_rbppr) or rel == -1:
-            return ent_ppr_scores, meta
-
-        meta['enabled'] = 1.0
-        rel_ppr_scores = self.getRelationPPRarray(rel)
-        fused_scores = ((1.0 - self.rbppr_lambda) * ent_ppr_scores + self.rbppr_lambda * rel_ppr_scores).astype(np.float32)
-
-        base_norm = self._minmax_normalize(ent_ppr_scores)
-        rel_norm = self._minmax_normalize(rel_ppr_scores)
-        fused_norm = self._minmax_normalize(fused_scores)
-
-        raw_rank_nodes = [int(node) for node in np.argsort(ent_ppr_scores)[::-1].tolist() if int(node) != int(ent)]
-        fused_rank_nodes = [int(node) for node in np.argsort(fused_scores)[::-1].tolist() if int(node) != int(ent)]
-
-        raw_topk_nodes = sorted(list(set([int(ent)] + raw_rank_nodes[:self.topk])))
-        fused_topk_nodes = sorted(list(set([int(ent)] + fused_rank_nodes[:self.topk])))
-        raw_front_nodes = sorted(list(set([int(ent)] + raw_rank_nodes[:self.rbppr_front_k])))
-        fused_front_nodes = sorted(list(set([int(ent)] + fused_rank_nodes[:self.rbppr_front_k])))
-        raw_lead = raw_rank_nodes[0] if len(raw_rank_nodes) > 0 else int(ent)
-        fused_lead = fused_rank_nodes[0] if len(fused_rank_nodes) > 0 else int(ent)
-
-        score_nodes = sorted(list(set(raw_front_nodes).union(set(fused_front_nodes))))
-        if len(score_nodes) > 0:
-            meta['score_delta_mean'] = float(np.mean(np.abs(fused_norm[score_nodes] - base_norm[score_nodes])))
-
-        raw_topk_set = set(raw_topk_nodes)
-        fused_topk_set = set(fused_topk_nodes)
-        raw_front_set = set(raw_front_nodes)
-        fused_front_set = set(fused_front_nodes)
-        meta['changed_topk_ratio'] = float(
-            len(raw_topk_set.symmetric_difference(fused_topk_set)) / max(1, len(raw_topk_set))
-        )
-        meta['changed_front_ratio'] = float(
-            len(raw_front_set.symmetric_difference(fused_front_set)) / max(1, len(raw_front_set))
-        )
-        meta['lead_changed'] = float(raw_lead != fused_lead)
-
-        fused_top_nodes_wo_head = [node for node in fused_topk_nodes if int(node) != int(ent)]
-        if len(fused_top_nodes_wo_head) > 0:
-            idx = np.asarray(fused_top_nodes_wo_head, dtype=np.int64)
-            meta['rel_gain_topk'] = float(np.mean(rel_norm[idx] - base_norm[idx]))
-
-        return fused_scores, meta
-    
     def triplesToNxGraph(self, edges):
         ''' edges is the list of [(h,t)] '''
         graph = nx.Graph()
@@ -262,37 +140,6 @@ class pprSampler():
         graph.add_nodes_from(nodes)        
         graph.add_edges_from(edges)
         return graph
-
-    def _minmax_normalize(self, x):
-        x = np.asarray(x, dtype=np.float32)
-        if x.size == 0:
-            return x
-        x_min = float(np.min(x))
-        x_max = float(np.max(x))
-        if x_max - x_min < 1e-12:
-            return np.zeros_like(x, dtype=np.float32)
-        return (x - x_min) / (x_max - x_min + 1e-12)
-
-    def _row_normalize(self, mat):
-        mat = np.asarray(mat, dtype=np.float32)
-        if mat.size == 0:
-            return mat
-        denom = np.sum(mat, axis=1, keepdims=True)
-        denom = np.clip(denom, 1e-12, None)
-        return mat / denom
-
-    def _empty_rbppr_meta(self):
-        return {
-            'enabled': 0.0,
-            'score_delta_mean': 0.0,
-            'changed_topk_ratio': 0.0,
-            'changed_front_ratio': 0.0,
-            'lead_changed': 0.0,
-            'rel_gain_topk': 0.0,
-        }
-
-    def _finalize_rbppr_meta(self, meta):
-        return torch.tensor([meta[key] for key in RBPPR_META_FIELDS], dtype=torch.float32)
 
     # # ========== Module 1: Relation-Path Conditioned Sampling ==========
     # # Mines frequent 2-hop relation path patterns for each relation
@@ -399,9 +246,7 @@ class pprSampler():
 
     def sampleSubgraph(self, ent: int, rel: int = -1):
         # sample subgraph to get the edges
-        base_ppr_scores = self.getPPRarray(ent)
-        ppr_scores, rbppr_meta = self._build_rbppr_scores(ent, rel, base_ppr_scores)
-        fused_scores = ppr_scores
+        fused_scores = self.getPPRarray(ent)
 
         # # ========== Module 1: Fuse path-based prior with PPR scores ==========
         # # When enabled, the node selection combines structural proximity (PPR)
@@ -491,12 +336,11 @@ class pprSampler():
             topk_nodes,
             node_index,
             sampled_edges,
-            self._finalize_rbppr_meta(rbppr_meta),
         )
 
     def getOneSubgraph(self, head: int, rel: int = -1):
-        topk_nodes, node_index, sampled_edges, rbppr_meta = self.sampleSubgraph(head, rel)
-        return [head, topk_nodes, node_index, sampled_edges, rbppr_meta]
+        topk_nodes, node_index, sampled_edges = self.sampleSubgraph(head, rel)
+        return [head, topk_nodes, node_index, sampled_edges]
         
     def getBatchSubgraph(self, subgraph_list: list):  
         batchsize = len(subgraph_list)
@@ -505,10 +349,9 @@ class pprSampler():
         batch_idxs, abs_idxs = [], []
         query_sub_idxs = []
         edge_batch_idxs = []
-        batch_rbppr_meta = []
 
         for batch_idx in range(batchsize):       
-            sub, topk_nodes, node_index, sampled_edges, rbppr_meta = subgraph_list[batch_idx]
+            sub, topk_nodes, node_index, sampled_edges = subgraph_list[batch_idx]
             num_nodes = len(topk_nodes)
             ent_delta = sum(ent_delta_values)
 
@@ -521,7 +364,6 @@ class pprSampler():
             batch_idxs += [batch_idx] * num_nodes
             abs_idxs += topk_nodes.tolist()
             query_sub_idxs.append(int(node_index[sub]) + ent_delta)
-            batch_rbppr_meta.append(rbppr_meta)
         
         # [n_batch_ent]
         batch_idxs = torch.LongTensor(batch_idxs)
@@ -533,6 +375,5 @@ class pprSampler():
         edge_batch_idxs = torch.LongTensor(edge_batch_idxs)
         # [n_batch]
         query_sub_idxs = torch.LongTensor(query_sub_idxs)
-        batch_rbppr_meta = torch.stack(batch_rbppr_meta, dim=0)
         
-        return batch_idxs, abs_idxs, query_sub_idxs, edge_batch_idxs, batch_sampled_edges, batch_rbppr_meta
+        return batch_idxs, abs_idxs, query_sub_idxs, edge_batch_idxs, batch_sampled_edges

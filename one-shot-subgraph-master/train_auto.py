@@ -26,16 +26,6 @@ parser.add_argument('--remove_1hop_edges', action='store_true')
 parser.add_argument('--only_eval', action='store_true')
 parser.add_argument('--not_shuffle_train', action='store_true')
 parser.add_argument('--use_readout_refine', action='store_true')        # enable residual MLP refinement before readout
-# ========== RBPPR args ==========
-parser.add_argument('--use_rbppr', action='store_true')                 # enable relation-biased personalized PageRank
-parser.add_argument('--rbppr_lambda', type=float, default=0.1)          # fusion weight between entity PPR and relation PPR
-# ========== EdgePrune args ==========
-parser.add_argument('--use_edgeprune', action='store_true')             # enable query-wise cumulative edge pruning
-parser.add_argument('--edgeprune_ratio_start', type=float, default=1.0) # layer-0 keep ratio
-parser.add_argument('--edgeprune_ratio_end', type=float, default=0.5)   # final-layer keep ratio
-parser.add_argument('--edgeprune_evidence_lambda', type=float, default=0.5) # residual update strength for evidence
-parser.add_argument('--edgeprune_teleport', type=float, default=0.1)    # query-head teleport strength
-parser.add_argument('--edgeprune_target_alpha', type=float, default=0.3) # destination preference weight
 # # ========== Module 1: Relation-Path Conditioned Sampling args ==========
 # parser.add_argument('--use_rel_prior', action='store_true')         # enable path-based relation prior
 # parser.add_argument('--path_lambda', type=float, default=0.5)       # weight for path prior in fusion
