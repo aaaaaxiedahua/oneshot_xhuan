@@ -99,16 +99,16 @@ class BaseModel(object):
             'refined_edges': 0.0,
         }
 
-    def _new_path_memory_tracker(self):
+    def _new_progressive_query_tracker(self):
         return {
             'query_count': 0.0,
-            'real_node_count': 0.0,
-            'active_node_count': 0.0,
+            'layer_count': 0.0,
+            'context_norm_sum': 0.0,
+            'delta_norm_sum': 0.0,
             'state_norm_sum': 0.0,
-            'abs_score_sum': 0.0,
         }
 
-    def _update_module_trackers(self, relation_refine_tracker, path_memory_tracker, batch_stats):
+    def _update_module_trackers(self, relation_refine_tracker, progressive_query_tracker, batch_stats):
         if batch_stats is None:
             return
 
@@ -117,10 +117,10 @@ class BaseModel(object):
             for key in relation_refine_tracker.keys():
                 relation_refine_tracker[key] += float(relation_refine_stats.get(key, 0.0))
 
-        path_memory_stats = batch_stats.get('path_memory')
-        if path_memory_stats is not None and path_memory_stats.get('enabled', 0.0) > 0.5:
-            for key in path_memory_tracker.keys():
-                path_memory_tracker[key] += float(path_memory_stats.get(key, 0.0))
+        progressive_query_stats = batch_stats.get('progressive_query')
+        if progressive_query_stats is not None and progressive_query_stats.get('enabled', 0.0) > 0.5:
+            for key in progressive_query_tracker.keys():
+                progressive_query_tracker[key] += float(progressive_query_stats.get(key, 0.0))
 
     def _format_relation_refine_tracker(self, phase, tracker):
         query_count = float(tracker['query_count'])
@@ -139,21 +139,17 @@ class BaseModel(object):
             f'edge_keep={edge_keep:.1%}'
         )
 
-    def _format_path_memory_tracker(self, phase, tracker):
+    def _format_progressive_query_tracker(self, phase, tracker):
         query_count = float(tracker['query_count'])
-        real_node_count = float(tracker['real_node_count'])
-        if query_count <= 0 or real_node_count <= 0:
+        layer_count = float(tracker['layer_count'])
+        if query_count <= 0 or layer_count <= 0:
             return None
-        active_ratio = tracker['active_node_count'] / max(real_node_count, 1.0)
-        mean_norm = tracker['state_norm_sum'] / max(real_node_count, 1.0)
-        mean_abs_score = tracker['abs_score_sum'] / max(real_node_count, 1.0)
         return (
-            f'==> PathMemory[{phase}][epoch={self.epoch_idx}]: '
+            f'==> ProgressiveQuery[{phase}][epoch={self.epoch_idx}]: '
             f'queries={int(query_count)} '
-            f'active_nodes={active_ratio:.1%} '
-            f'state_norm={mean_norm:.4f} '
-            f'abs_score={mean_abs_score:.4f} '
-            f'lambda={float(getattr(self.args, "path_lambda", 0.0)):.3f}'
+            f'avg_ctx_norm={tracker["context_norm_sum"] / layer_count:.4f} '
+            f'avg_delta_norm={tracker["delta_norm_sum"] / layer_count:.4f} '
+            f'avg_state_norm={tracker["state_norm_sum"] / layer_count:.4f}'
         )
 
     def _format_epoch_summary(self, eval_info):
@@ -181,7 +177,7 @@ class BaseModel(object):
         epoch_loss = 0
         reach_tails_list = []
         train_relation_refine_tracker = self._new_relation_refine_tracker()
-        train_path_memory_tracker = self._new_path_memory_tracker()
+        train_progressive_query_tracker = self._new_progressive_query_tracker()
         t_time = time.time()
         self.model.train()
         if hasattr(self.model, 'set_epoch'):
@@ -196,7 +192,7 @@ class BaseModel(object):
             scores = self.model(subs, rels, subgraph_data)
             self._update_module_trackers(
                 train_relation_refine_tracker,
-                train_path_memory_tracker,
+                train_progressive_query_tracker,
                 self.model.pop_module_stats(),
             )
             
@@ -232,13 +228,13 @@ class BaseModel(object):
         train_relation_refine_log = self._format_relation_refine_tracker('train', train_relation_refine_tracker)
         if train_relation_refine_log is not None:
             print(train_relation_refine_log)
-        train_path_memory_log = self._format_path_memory_tracker('train', train_path_memory_tracker)
-        if train_path_memory_log is not None:
-            print(train_path_memory_log)
+        train_progressive_query_log = self._format_progressive_query_tracker('train', train_progressive_query_tracker)
+        if train_progressive_query_log is not None:
+            print(train_progressive_query_log)
         for phase_log in eval_info['relation_refine_logs']:
             if phase_log is not None:
                 print(phase_log)
-        for phase_log in eval_info['path_memory_logs']:
+        for phase_log in eval_info['progressive_query_logs']:
             if phase_log is not None:
                 print(phase_log)
         
@@ -265,8 +261,8 @@ class BaseModel(object):
         i_time = time.time()
         valid_relation_refine_tracker = self._new_relation_refine_tracker()
         test_relation_refine_tracker = self._new_relation_refine_tracker()
-        valid_path_memory_tracker = self._new_path_memory_tracker()
-        test_path_memory_tracker = self._new_path_memory_tracker()
+        valid_progressive_query_tracker = self._new_progressive_query_tracker()
+        test_progressive_query_tracker = self._new_progressive_query_tracker()
         
         # eval on val set
         if eval_val:
@@ -280,7 +276,7 @@ class BaseModel(object):
                 scores = self.model(subs, rels, subgraph_data, mode='valid').data.cpu().numpy()
                 self._update_module_trackers(
                     valid_relation_refine_tracker,
-                    valid_path_memory_tracker,
+                    valid_progressive_query_tracker,
                     self.model.pop_module_stats(),
                 )
 
@@ -340,7 +336,7 @@ class BaseModel(object):
                 scores = self.model(subs, rels, subgraph_data, mode='test').data.cpu().numpy()
                 self._update_module_trackers(
                     test_relation_refine_tracker,
-                    test_path_memory_tracker,
+                    test_progressive_query_tracker,
                     self.model.pop_module_stats(),
                 )
 
@@ -398,9 +394,9 @@ class BaseModel(object):
                 self._format_relation_refine_tracker('valid', valid_relation_refine_tracker),
                 self._format_relation_refine_tracker('test', test_relation_refine_tracker),
             ],
-            'path_memory_logs': [
-                self._format_path_memory_tracker('valid', valid_path_memory_tracker),
-                self._format_path_memory_tracker('test', test_path_memory_tracker),
+            'progressive_query_logs': [
+                self._format_progressive_query_tracker('valid', valid_progressive_query_tracker),
+                self._format_progressive_query_tracker('test', test_progressive_query_tracker),
             ],
         }
         return v_mrr, out_str, eval_info

@@ -380,13 +380,16 @@ class GNNLayer(torch.nn.Module):
     def _compute_alpha(self, hs, hr, h_qr):
         return torch.sigmoid(self.w_alpha(nn.ReLU()(self.Ws_attn(hs) + self.Wr_attn(hr) + self.Wqr_attn(h_qr))))
 
-    def forward(self, q_sub, q_rel, r_idx, hidden, edges, n_node, shortcut=False, edge_weights=None, return_alpha=False):
+    def forward(self, q_sub, q_rel, r_idx, hidden, edges, n_node, shortcut=False, edge_weights=None, return_alpha=False, q_embed=None):
         sub = edges[:,0]
         rel = edges[:,1]
         obj = edges[:,2]
         hs = hidden[sub]
         hr = self.rela_embed(rel)
-        h_qr = self.rela_embed(q_rel)[r_idx]
+        if q_embed is None:
+            h_qr = self.rela_embed(q_rel)[r_idx]
+        else:
+            h_qr = q_embed[r_idx]
 
         # # ========== Module 2: Override virtual edge embeddings (compose_aware) ==========
         # if virtual_rel_embeds is not None and n_virtual > 0:
@@ -438,7 +441,7 @@ class GNN_auto(torch.nn.Module):
         self.current_epoch = 0
         self.last_module_stats = None
         self.use_relation_refine = bool(getattr(params, 'use_relation_refine', False))
-        self.use_path_memory = bool(getattr(params, 'use_path_memory', False))
+        self.use_progressive_query = bool(getattr(params, 'use_progressive_query', False))
         self.use_input_refine = bool(getattr(params, 'use_input_refine', False))
         self.use_layer_refine = bool(getattr(params, 'use_layer_refine', False))
         self.refine_dim = int(getattr(params, 'refine_dim', 16))
@@ -446,8 +449,7 @@ class GNN_auto(torch.nn.Module):
         self.refine_eta = float(getattr(params, 'refine_eta', 0.3))
         self.coarse_topk = float(getattr(params, 'topk', 0.1))
         self.final_topk = float(getattr(params, 'final_topk', -1.0))
-        self.path_dim = int(getattr(params, 'path_dim', 64))
-        self.path_lambda = float(getattr(params, 'path_lambda', 0.1))
+        self.query_update_hidden = int(getattr(params, 'query_update_hidden', 64))
         self.ffn_hidden_dim = int(getattr(params, 'ffn_hidden_dim', 64))
         self.ffn_dropout = float(getattr(params, 'ffn_dropout', -1.0))
         if self.ffn_dropout < 0:
@@ -492,7 +494,7 @@ class GNN_auto(torch.nn.Module):
         self.dropout = nn.Dropout(params.dropout)
         self.gate = nn.GRU(self.hidden_dim, self.hidden_dim)
 
-        need_query_rela_embed = (self.params.initializer == 'relation') or self.use_path_memory or self.use_input_refine
+        need_query_rela_embed = (self.params.initializer == 'relation') or self.use_input_refine or self.use_progressive_query
         if need_query_rela_embed:
             self.query_rela_embed = nn.Embedding(2*self.n_rel+1, self.hidden_dim)
         self.readout_dim = self.hidden_dim * (self.n_layer + 1) if self.params.concatHidden else self.hidden_dim
@@ -507,14 +509,16 @@ class GNN_auto(torch.nn.Module):
                 f'coarse_topk={self.coarse_topk}, final_topk={self.final_topk}, '
                 f'final_nodes={self.final_n_nodes})'
             )
-        if self.use_path_memory:
-            self.path_rel_embed = nn.Embedding(2 * self.n_rel + 1 + self.n_extra_rel, self.path_dim)
-            self.path_init_proj = nn.Linear(self.hidden_dim, self.path_dim)
-            self.path_query_proj = nn.Linear(self.hidden_dim, self.path_dim, bias=False)
-            self.path_cell = nn.GRUCell(self.path_dim, self.path_dim)
+        if self.use_progressive_query:
+            self.query_updater = nn.Sequential(
+                nn.Linear(self.hidden_dim * 2, self.query_update_hidden),
+                nn.ReLU(),
+                nn.Linear(self.query_update_hidden, self.hidden_dim),
+            )
+            self.query_norm = nn.LayerNorm(self.hidden_dim)
             print(
-                '==> PathMemory: enabled '
-                f'(dim={self.path_dim}, lambda={self.path_lambda})'
+                '==> ProgressiveQuery: enabled '
+                f'(hidden={self.query_update_hidden})'
             )
         if self.use_input_refine:
             self.input_refine = ResidualFFN(self.hidden_dim, self.ffn_hidden_dim, self.ffn_dropout)
@@ -714,6 +718,35 @@ class GNN_auto(torch.nn.Module):
             return hidden + self.readout_refine(hidden)
         return hidden
 
+    def _update_query_state(self, layer_idx, query_state, edge_batch_idxs, batch_sampled_edges, edge_alpha, batch_size):
+        if (not self.use_progressive_query) or edge_alpha is None:
+            return query_state, None
+
+        rel_embeds = self.gnn_layers[layer_idx].rela_embed(batch_sampled_edges[:, 1])
+        weighted_context = scatter(
+            rel_embeds * edge_alpha.unsqueeze(-1),
+            index=edge_batch_idxs,
+            dim=0,
+            dim_size=batch_size,
+            reduce='sum',
+        )
+        alpha_denom = scatter(
+            edge_alpha,
+            index=edge_batch_idxs,
+            dim=0,
+            dim_size=batch_size,
+            reduce='sum',
+        ).unsqueeze(-1).clamp_min(1e-12)
+        rel_context = weighted_context / alpha_denom
+        query_delta = self.query_updater(torch.cat([query_state, rel_context], dim=-1))
+        query_state = self.query_norm(query_state + query_delta)
+        layer_stats = {
+            'context_norm_sum': float(rel_context.norm(dim=-1).sum().item()),
+            'delta_norm_sum': float(query_delta.norm(dim=-1).sum().item()),
+            'state_norm_sum': float(query_state.norm(dim=-1).sum().item()),
+        }
+        return query_state, layer_stats
+
     def _compute_scores(self, real_hidden, anchor_hidden):
         if self.params.readout == 'linear':
             return self.W_final(real_hidden).squeeze(-1)
@@ -747,9 +780,15 @@ class GNN_auto(torch.nn.Module):
         q_embed = self.query_rela_embed(q_rel) if hasattr(self, 'query_rela_embed') else None
         if self.use_input_refine and q_embed is not None:
             q_embed = self.input_refine(q_embed)
-        if self.use_path_memory:
-            path_hidden = torch.zeros(n_node, self.path_dim, device=device)
-            path_hidden[query_sub_idxs, :] = self.path_init_proj(q_embed)
+        q_state = q_embed if self.use_progressive_query else None
+        progressive_query_stats = {
+            'enabled': 1.0,
+            'query_count': float(n),
+            'layer_count': 0.0,
+            'context_norm_sum': 0.0,
+            'delta_norm_sum': 0.0,
+            'state_norm_sum': 0.0,
+        } if self.use_progressive_query else None
 
         # # ========== Module 2: Generate virtual edges ==========
         # edge_weights = None
@@ -789,16 +828,17 @@ class GNN_auto(torch.nn.Module):
             #     curr_nv = n_virtual
             # # ========== End Module 2 ==========
 
-            if self.use_path_memory:
+            if self.use_progressive_query:
                 hidden, edge_alpha = self.gnn_layers[i](
                     q_sub, q_rel, edge_batch_idxs, hidden, batch_sampled_edges, n_node,
-                    shortcut=self.params.shortcut, edge_weights=None, return_alpha=True
+                    shortcut=self.params.shortcut, edge_weights=None, return_alpha=True, q_embed=q_state
                 )
             else:
                 hidden = self.gnn_layers[i](
                     q_sub, q_rel, edge_batch_idxs, hidden, batch_sampled_edges, n_node,
                     shortcut=self.params.shortcut, edge_weights=None
                 )
+                edge_alpha = None
 
             act_signal = (hidden.sum(-1) == 0).detach().int()
             hidden = self.dropout(hidden)
@@ -810,18 +850,18 @@ class GNN_auto(torch.nn.Module):
             hidden = hidden * (1-act_signal).unsqueeze(-1)
             h0 = h0 * (1-act_signal).unsqueeze(-1).unsqueeze(0)
 
-            if self.use_path_memory:
-                rel_inputs = self.path_rel_embed(batch_sampled_edges[:, 1])
-                prev_path = path_hidden[batch_sampled_edges[:, 0]]
-                path_messages = self.path_cell(rel_inputs, prev_path)
-                path_messages = path_messages * edge_alpha.unsqueeze(-1)
-                path_hidden = scatter(
-                    path_messages,
-                    index=batch_sampled_edges[:, 2],
-                    dim=0,
-                    dim_size=n_node,
-                    reduce='sum',
+            if self.use_progressive_query:
+                q_state, layer_stats = self._update_query_state(
+                    i,
+                    q_state,
+                    edge_batch_idxs,
+                    batch_sampled_edges,
+                    edge_alpha,
+                    n,
                 )
+                progressive_query_stats['layer_count'] += float(n)
+                for key, value in layer_stats.items():
+                    progressive_query_stats[key] += float(value)
 
             if self.params.concatHidden: hidden_list.append(hidden)
 
@@ -831,27 +871,11 @@ class GNN_auto(torch.nn.Module):
         real_hidden = hidden[:n_real_nodes]
         anchor_hidden = hidden[query_sub_idxs][batch_idxs]
         scores = self._compute_scores(real_hidden, anchor_hidden)
-        if self.use_path_memory:
-            path_real_hidden = path_hidden[:n_real_nodes]
-            path_query = self.path_query_proj(q_embed)[batch_idxs]
-            path_scores = torch.sum(path_real_hidden * path_query, dim=-1)
-            scores = scores + self.path_lambda * path_scores
-            active_mask = (torch.abs(path_real_hidden).sum(dim=-1) > 0).float()
-            path_memory_stats = {
-                'enabled': 1.0,
-                'query_count': float(n),
-                'real_node_count': float(n_real_nodes),
-                'active_node_count': float(active_mask.sum().item()),
-                'state_norm_sum': float(path_real_hidden.norm(dim=-1).sum().item()),
-                'abs_score_sum': float(path_scores.abs().sum().item()),
-            }
-        else:
-            path_memory_stats = None
 
         scores_all = torch.zeros((n, self.loader.n_ent)).cuda()
         scores_all[batch_idxs, abs_idxs] = scores
         self.last_module_stats = {
             'relation_refine': relation_refine_stats,
-            'path_memory': path_memory_stats,
+            'progressive_query': progressive_query_stats,
         }
         return scores_all

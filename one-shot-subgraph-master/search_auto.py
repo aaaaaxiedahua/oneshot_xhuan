@@ -42,9 +42,8 @@ HPO_search_space_RELATION_REFINE = {
         'refine_eta':            ('choice', [0.1, 0.3, 0.5]),
     }
 
-HPO_search_space_PATH_MEMORY = {
-        'path_dim':              ('choice', [32, 64, 128]),
-        'path_lambda':           ('choice', [0.05, 0.1, 0.2, 0.3]),
+HPO_search_space_PROGRESSIVE_QUERY = {
+        'query_update_hidden':   ('choice', [32, 64, 128]),
     }
 
 def build_ffn_search_space(use_input_refine, use_layer_refine):
@@ -62,7 +61,6 @@ def build_ffn_search_space(use_input_refine, use_layer_refine):
 
 # # ========== Module 1: Relation-Path Conditioned Sampling search space ==========
 # HPO_search_space_M1 = {
-#         'path_lambda':           ('uniform', (0.1, 2.0)),
 #         'rel_path_topk':         ('choice', [5, 10, 20, 50]),
 #         'fusion_mode':           ('choice', ['add', 'multiply']),
 #     }
@@ -104,9 +102,8 @@ parser.add_argument('--refine_dim', type=int, default=16)
 parser.add_argument('--refine_steps', type=int, default=2)
 parser.add_argument('--refine_eta', type=float, default=0.3)
 parser.add_argument('--final_topk', type=float, default=-1.0)
-parser.add_argument('--use_path_memory', action='store_true')
-parser.add_argument('--path_dim', type=int, default=64)
-parser.add_argument('--path_lambda', type=float, default=0.1)
+parser.add_argument('--use_progressive_query', action='store_true')
+parser.add_argument('--query_update_hidden', type=int, default=64)
 parser.add_argument('--use_input_refine', action='store_true')
 parser.add_argument('--use_layer_refine', action='store_true')
 parser.add_argument('--ffn_hidden_dim', type=int, default=64)
@@ -117,7 +114,6 @@ parser.add_argument('--layer_lr', type=float, default=-1.0)
 parser.add_argument('--layer_weight_decay', type=float, default=-1.0)
 # # ========== Module 1: Relation-Path Conditioned Sampling args ==========
 # parser.add_argument('--use_rel_prior', action='store_true')         # enable path-based relation prior
-# parser.add_argument('--path_lambda', type=float, default=0.5)       # weight for path prior in fusion
 # parser.add_argument('--rel_path_topk', type=int, default=10)        # top-K relation path patterns per relation
 # parser.add_argument('--fusion_mode', type=str, default='add')       # fusion: add / multiply
 # # ========== Module 2: Relation Composition Augmentation args ==========
@@ -291,9 +287,9 @@ if __name__ == '__main__':
         resolve_relation_refine_budget(args)
         HPO_search_space.update(HPO_search_space_RELATION_REFINE)
         print('==> HPO: added RelationRefine search space')
-    if args.use_path_memory:
-        HPO_search_space.update(HPO_search_space_PATH_MEMORY)
-        print('==> HPO: added PathMemory search space')
+    if args.use_progressive_query:
+        HPO_search_space.update(HPO_search_space_PROGRESSIVE_QUERY)
+        print('==> HPO: added ProgressiveQuery search space')
     if args.use_input_refine or args.use_layer_refine:
         HPO_search_space.update(build_ffn_search_space(args.use_input_refine, args.use_layer_refine))
         print('==> HPO: added FCRefine search space')
@@ -371,9 +367,8 @@ if __name__ == '__main__':
             args.refine_steps = int(params['refine_steps'])
             args.refine_eta = float(params['refine_eta'])
             resolve_relation_refine_budget(args)
-        if args.use_path_memory:
-            args.path_dim = int(params['path_dim'])
-            args.path_lambda = float(params['path_lambda'])
+        if args.use_progressive_query:
+            args.query_update_hidden = int(params['query_update_hidden'])
         if args.use_input_refine or args.use_layer_refine:
             args.ffn_hidden_dim = int(params['ffn_hidden_dim'])
             args.ffn_dropout = float(params['ffn_dropout'])
@@ -386,7 +381,6 @@ if __name__ == '__main__':
 
         # # Module 1: Relation-Path Conditioned Sampling params
         # if args.use_rel_prior:
-        #     args.path_lambda = params['path_lambda']
         #     args.rel_path_topk = int(params['rel_path_topk'])
         #     args.fusion_mode = params['fusion_mode']
         #
