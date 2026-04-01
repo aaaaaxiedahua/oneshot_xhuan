@@ -31,8 +31,17 @@ parser.add_argument('--refine_dim', type=int, default=16)
 parser.add_argument('--refine_steps', type=int, default=2)
 parser.add_argument('--refine_eta', type=float, default=0.3)
 parser.add_argument('--final_topk', type=float, default=-1.0)           # final node ratio after relation refinement
-parser.add_argument('--use_depth_routing', action='store_true')         # enable query-aware dynamic depth routing
-parser.add_argument('--depth_route_type', type=str, default='query', choices=['query', 'query_anchor'])
+parser.add_argument('--use_path_memory', action='store_true')           # enable relation-sequence memory branch
+parser.add_argument('--path_dim', type=int, default=64)                 # hidden size of path memory states
+parser.add_argument('--path_lambda', type=float, default=0.1)           # fusion weight for path-memory scores
+parser.add_argument('--use_input_refine', action='store_true')          # residual FFN on query initialization
+parser.add_argument('--use_layer_refine', action='store_true')          # residual FFN after each GRU update
+parser.add_argument('--ffn_hidden_dim', type=int, default=64)           # shared hidden size for input/layer FFNs
+parser.add_argument('--ffn_dropout', type=float, default=-1.0)          # dropout inside input/layer FFNs (-1 => use global dropout)
+parser.add_argument('--input_lr', type=float, default=-1.0)             # optimizer lr for input FFN (-1 => use global lr)
+parser.add_argument('--input_weight_decay', type=float, default=-1.0)   # optimizer wd for input FFN (-1 => use global wd)
+parser.add_argument('--layer_lr', type=float, default=-1.0)             # optimizer lr for layer FFNs (-1 => use global lr)
+parser.add_argument('--layer_weight_decay', type=float, default=-1.0)   # optimizer wd for layer FFNs (-1 => use global wd)
 # # ========== Module 1: Relation-Path Conditioned Sampling args ==========
 # parser.add_argument('--use_rel_prior', action='store_true')         # enable path-based relation prior
 # parser.add_argument('--path_lambda', type=float, default=0.5)       # weight for path prior in fusion

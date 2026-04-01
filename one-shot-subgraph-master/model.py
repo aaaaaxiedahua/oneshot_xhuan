@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch_scatter import scatter
 import math
 
@@ -376,7 +377,10 @@ class GNNLayer(torch.nn.Module):
         self.w_alpha  = nn.Linear(attn_dim, 1)
         self.W_h = nn.Linear(in_dim, out_dim, bias=False)
 
-    def forward(self, q_sub, q_rel, r_idx, hidden, edges, n_node, shortcut=False, edge_weights=None):
+    def _compute_alpha(self, hs, hr, h_qr):
+        return torch.sigmoid(self.w_alpha(nn.ReLU()(self.Ws_attn(hs) + self.Wr_attn(hr) + self.Wqr_attn(h_qr))))
+
+    def forward(self, q_sub, q_rel, r_idx, hidden, edges, n_node, shortcut=False, edge_weights=None, return_alpha=False):
         sub = edges[:,0]
         rel = edges[:,1]
         obj = edges[:,2]
@@ -391,7 +395,7 @@ class GNNLayer(torch.nn.Module):
 
         # message aggregation
         message = hs * hr
-        alpha = torch.sigmoid(self.w_alpha(nn.ReLU()(self.Ws_attn(hs) + self.Wr_attn(hr) + self.Wqr_attn(h_qr))))
+        alpha = self._compute_alpha(hs, hr, h_qr)
         message = alpha * message
 
         if edge_weights is not None:
@@ -400,7 +404,24 @@ class GNNLayer(torch.nn.Module):
         message_agg = scatter(message, index=obj, dim=0, dim_size=n_node, reduce='sum')
         hidden_new = self.act(self.W_h(message_agg))
         if shortcut: hidden_new = hidden_new + hidden
+        if return_alpha:
+            return hidden_new, alpha.squeeze(-1)
         return hidden_new
+
+class ResidualFFN(nn.Module):
+    def __init__(self, in_dim, hidden_dim, dropout):
+        super().__init__()
+        self.lin1 = nn.Linear(in_dim, hidden_dim)
+        self.lin2 = nn.Linear(hidden_dim, in_dim)
+        self.dropout = float(dropout)
+
+    def forward(self, x):
+        out = F.dropout(x, p=self.dropout, training=self.training)
+        out = self.lin1(out)
+        out = F.relu(out)
+        out = F.dropout(out, p=self.dropout, training=self.training)
+        out = self.lin2(out)
+        return x + out
 
 class GNN_auto(torch.nn.Module):
     def __init__(self, params, loader):
@@ -417,13 +438,20 @@ class GNN_auto(torch.nn.Module):
         self.current_epoch = 0
         self.last_module_stats = None
         self.use_relation_refine = bool(getattr(params, 'use_relation_refine', False))
+        self.use_path_memory = bool(getattr(params, 'use_path_memory', False))
+        self.use_input_refine = bool(getattr(params, 'use_input_refine', False))
+        self.use_layer_refine = bool(getattr(params, 'use_layer_refine', False))
         self.refine_dim = int(getattr(params, 'refine_dim', 16))
         self.refine_steps = int(getattr(params, 'refine_steps', 2))
         self.refine_eta = float(getattr(params, 'refine_eta', 0.3))
         self.coarse_topk = float(getattr(params, 'topk', 0.1))
         self.final_topk = float(getattr(params, 'final_topk', -1.0))
-        self.use_depth_routing = bool(getattr(params, 'use_depth_routing', False))
-        self.depth_route_type = getattr(params, 'depth_route_type', 'query')
+        self.path_dim = int(getattr(params, 'path_dim', 64))
+        self.path_lambda = float(getattr(params, 'path_lambda', 0.1))
+        self.ffn_hidden_dim = int(getattr(params, 'ffn_hidden_dim', 64))
+        self.ffn_dropout = float(getattr(params, 'ffn_dropout', -1.0))
+        if self.ffn_dropout < 0:
+            self.ffn_dropout = float(params.dropout)
         if self.use_relation_refine:
             if self.final_topk <= 0:
                 self.final_topk = self.coarse_topk * 0.7
@@ -464,13 +492,10 @@ class GNN_auto(torch.nn.Module):
         self.dropout = nn.Dropout(params.dropout)
         self.gate = nn.GRU(self.hidden_dim, self.hidden_dim)
 
-        need_query_rela_embed = (self.params.initializer == 'relation') or self.use_depth_routing
+        need_query_rela_embed = (self.params.initializer == 'relation') or self.use_path_memory or self.use_input_refine
         if need_query_rela_embed:
             self.query_rela_embed = nn.Embedding(2*self.n_rel+1, self.hidden_dim)
-        self.use_concat_readout = bool(self.params.concatHidden) and (not self.use_depth_routing)
-        self.readout_dim = self.hidden_dim * (self.n_layer + 1) if self.use_concat_readout else self.hidden_dim
-        if self.use_depth_routing and self.params.concatHidden:
-            print('==> DepthRouting: concatHidden is ignored; routing uses per-layer hidden states directly.')
+        self.readout_dim = self.hidden_dim * (self.n_layer + 1) if self.params.concatHidden else self.hidden_dim
         self.use_readout_refine = hasattr(params, 'use_readout_refine') and params.use_readout_refine
         if self.use_relation_refine:
             self.refine_rel_embed = nn.Embedding(2 * self.n_rel + 1 + self.refine_n_extra_rel, self.refine_dim)
@@ -482,18 +507,28 @@ class GNN_auto(torch.nn.Module):
                 f'coarse_topk={self.coarse_topk}, final_topk={self.final_topk}, '
                 f'final_nodes={self.final_n_nodes})'
             )
-        if self.use_depth_routing:
-            if self.depth_route_type == 'query':
-                self.depth_router = nn.Linear(self.hidden_dim, self.n_layer)
-            elif self.depth_route_type == 'query_anchor':
-                self.depth_query_proj = nn.Linear(self.hidden_dim, self.hidden_dim, bias=False)
-                self.depth_anchor_proj = nn.Linear(self.hidden_dim, self.hidden_dim, bias=False)
-                self.depth_router = nn.Linear(self.hidden_dim, 1, bias=False)
-            else:
-                raise ValueError(f'Unknown depth_route_type: {self.depth_route_type}')
+        if self.use_path_memory:
+            self.path_rel_embed = nn.Embedding(2 * self.n_rel + 1 + self.n_extra_rel, self.path_dim)
+            self.path_init_proj = nn.Linear(self.hidden_dim, self.path_dim)
+            self.path_query_proj = nn.Linear(self.hidden_dim, self.path_dim, bias=False)
+            self.path_cell = nn.GRUCell(self.path_dim, self.path_dim)
             print(
-                '==> DepthRouting: enabled '
-                f'(type={self.depth_route_type}, layers={self.n_layer})'
+                '==> PathMemory: enabled '
+                f'(dim={self.path_dim}, lambda={self.path_lambda})'
+            )
+        if self.use_input_refine:
+            self.input_refine = ResidualFFN(self.hidden_dim, self.ffn_hidden_dim, self.ffn_dropout)
+            print(
+                '==> InputRefine: enabled '
+                f'(hidden={self.ffn_hidden_dim}, dropout={self.ffn_dropout})'
+            )
+        if self.use_layer_refine:
+            self.layer_refine = nn.ModuleList([
+                ResidualFFN(self.hidden_dim, self.ffn_hidden_dim, self.ffn_dropout) for _ in range(self.n_layer)
+            ])
+            print(
+                '==> LayerRefine: enabled '
+                f'(hidden={self.ffn_hidden_dim}, dropout={self.ffn_dropout}, layers={self.n_layer})'
             )
         if self.use_readout_refine:
             refine_hidden = max(1, self.readout_dim // 2)
@@ -692,30 +727,6 @@ class GNN_auto(torch.nn.Module):
             return self.pair_score_head(pair_feat).squeeze(-1)
         raise ValueError(f'Unknown readout type: {self.params.readout}')
 
-    def _compute_depth_route_weights(self, q_rel, layer_hidden_list, query_sub_idxs):
-        if not self.use_depth_routing:
-            return None, None
-
-        q_embed = self.query_rela_embed(q_rel)
-        if self.depth_route_type == 'query':
-            logits = self.depth_router(q_embed)
-        else:
-            q_proj = self.depth_query_proj(q_embed)
-            layer_logits = []
-            for hidden in layer_hidden_list:
-                anchor_hidden = hidden[query_sub_idxs]
-                fused = torch.tanh(q_proj + self.depth_anchor_proj(anchor_hidden))
-                layer_logits.append(self.depth_router(fused).squeeze(-1))
-            logits = torch.stack(layer_logits, dim=-1)
-
-        alpha = torch.softmax(logits, dim=-1)
-        stats = {
-            'enabled': 1.0,
-            'query_count': float(q_rel.shape[0]),
-            'layer_weight_sum': alpha.detach().sum(dim=0).cpu().tolist(),
-        }
-        return alpha, stats
-
     def forward(self, q_sub, q_rel, subgraph_data, mode='train'):
         n = len(q_sub)
         batch_idxs, abs_idxs, query_sub_idxs, edge_batch_idxs, batch_sampled_edges = subgraph_data
@@ -733,6 +744,12 @@ class GNN_auto(torch.nn.Module):
         n_node = len(batch_idxs)
         h0 = torch.zeros((1, n_node, self.hidden_dim), device=device)
         hidden = torch.zeros(n_node, self.hidden_dim, device=device)
+        q_embed = self.query_rela_embed(q_rel) if hasattr(self, 'query_rela_embed') else None
+        if self.use_input_refine and q_embed is not None:
+            q_embed = self.input_refine(q_embed)
+        if self.use_path_memory:
+            path_hidden = torch.zeros(n_node, self.path_dim, device=device)
+            path_hidden[query_sub_idxs, :] = self.path_init_proj(q_embed)
 
         # # ========== Module 2: Generate virtual edges ==========
         # edge_weights = None
@@ -753,12 +770,9 @@ class GNN_auto(torch.nn.Module):
         if self.params.initializer == 'binary':
             hidden[query_sub_idxs, :] = 1
         elif self.params.initializer == 'relation':
-            hidden[query_sub_idxs, :] = self.query_rela_embed(q_rel)
+            hidden[query_sub_idxs, :] = q_embed
 
-        if self.use_concat_readout:
-            hidden_list = [hidden]
-        if self.use_depth_routing:
-            layer_hidden_list = []
+        if self.params.concatHidden: hidden_list = [hidden]
 
         # propagation
         for i in range(self.n_layer):
@@ -775,44 +789,69 @@ class GNN_auto(torch.nn.Module):
             #     curr_nv = n_virtual
             # # ========== End Module 2 ==========
 
-            hidden = self.gnn_layers[i](q_sub, q_rel, edge_batch_idxs, hidden, batch_sampled_edges, n_node,
-                                        shortcut=self.params.shortcut, edge_weights=None)
+            if self.use_path_memory:
+                hidden, edge_alpha = self.gnn_layers[i](
+                    q_sub, q_rel, edge_batch_idxs, hidden, batch_sampled_edges, n_node,
+                    shortcut=self.params.shortcut, edge_weights=None, return_alpha=True
+                )
+            else:
+                hidden = self.gnn_layers[i](
+                    q_sub, q_rel, edge_batch_idxs, hidden, batch_sampled_edges, n_node,
+                    shortcut=self.params.shortcut, edge_weights=None
+                )
 
             act_signal = (hidden.sum(-1) == 0).detach().int()
             hidden = self.dropout(hidden)
             hidden, h0 = self.gate(hidden.unsqueeze(0), h0)
             hidden = hidden.squeeze(0)
+            if self.use_layer_refine:
+                hidden = self.layer_refine[i](hidden)
+                h0 = hidden.unsqueeze(0)
             hidden = hidden * (1-act_signal).unsqueeze(-1)
             h0 = h0 * (1-act_signal).unsqueeze(-1).unsqueeze(0)
 
-            if self.use_concat_readout:
-                hidden_list.append(hidden)
-            if self.use_depth_routing:
-                layer_hidden_list.append(hidden)
+            if self.use_path_memory:
+                rel_inputs = self.path_rel_embed(batch_sampled_edges[:, 1])
+                prev_path = path_hidden[batch_sampled_edges[:, 0]]
+                path_messages = self.path_cell(rel_inputs, prev_path)
+                path_messages = path_messages * edge_alpha.unsqueeze(-1)
+                path_hidden = scatter(
+                    path_messages,
+                    index=batch_sampled_edges[:, 2],
+                    dim=0,
+                    dim_size=n_node,
+                    reduce='sum',
+                )
+
+            if self.params.concatHidden: hidden_list.append(hidden)
 
         # readout
-        if self.use_depth_routing:
-            alpha, depth_routing_stats = self._compute_depth_route_weights(q_rel, layer_hidden_list, query_sub_idxs)
-            scores = torch.zeros(n_real_nodes, device=device)
-            for layer_idx, layer_hidden in enumerate(layer_hidden_list):
-                score_hidden = self._apply_readout_refine(layer_hidden)
-                real_hidden = score_hidden[:n_real_nodes]
-                anchor_hidden = score_hidden[query_sub_idxs][batch_idxs]
-                layer_scores = self._compute_scores(real_hidden, anchor_hidden)
-                scores = scores + alpha[batch_idxs, layer_idx] * layer_scores
+        if self.params.concatHidden: hidden = torch.cat(hidden_list, dim=-1)
+        hidden = self._apply_readout_refine(hidden)
+        real_hidden = hidden[:n_real_nodes]
+        anchor_hidden = hidden[query_sub_idxs][batch_idxs]
+        scores = self._compute_scores(real_hidden, anchor_hidden)
+        if self.use_path_memory:
+            path_real_hidden = path_hidden[:n_real_nodes]
+            path_query = self.path_query_proj(q_embed)[batch_idxs]
+            path_scores = torch.sum(path_real_hidden * path_query, dim=-1)
+            scores = scores + self.path_lambda * path_scores
+            active_mask = (torch.abs(path_real_hidden).sum(dim=-1) > 0).float()
+            path_memory_stats = {
+                'enabled': 1.0,
+                'query_count': float(n),
+                'real_node_count': float(n_real_nodes),
+                'active_node_count': float(active_mask.sum().item()),
+                'state_norm_sum': float(path_real_hidden.norm(dim=-1).sum().item()),
+                'abs_score_sum': float(path_scores.abs().sum().item()),
+            }
         else:
-            if self.use_concat_readout:
-                hidden = torch.cat(hidden_list, dim=-1)
-            hidden = self._apply_readout_refine(hidden)
-            real_hidden = hidden[:n_real_nodes]
-            anchor_hidden = hidden[query_sub_idxs][batch_idxs]
-            scores = self._compute_scores(real_hidden, anchor_hidden)
-            depth_routing_stats = None
+            path_memory_stats = None
 
         scores_all = torch.zeros((n, self.loader.n_ent)).cuda()
         scores_all[batch_idxs, abs_idxs] = scores
         self.last_module_stats = {
             'relation_refine': relation_refine_stats,
-            'depth_routing': depth_routing_stats,
+            'path_memory': path_memory_stats,
         }
         return scores_all

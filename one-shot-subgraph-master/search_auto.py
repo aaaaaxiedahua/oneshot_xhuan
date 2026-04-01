@@ -36,24 +36,29 @@ HPO_search_space = {
         'dropout':               ('uniform', (0, 0.2)),
     }
 
-def build_relation_refine_search_space(coarse_topk):
-    final_topk_choices = []
-    for ratio in [0.5, 0.7, 0.8]:
-        value = round(float(coarse_topk) * ratio, 6)
-        if value > 0:
-            final_topk_choices.append(value)
-    final_topk_choices = sorted(set(final_topk_choices))
-    return {
+HPO_search_space_RELATION_REFINE = {
         'refine_dim':            ('choice', [16, 32]),
         'refine_steps':          ('choice', [2, 3, 4]),
         'refine_eta':            ('choice', [0.1, 0.3, 0.5]),
-        'final_topk':            ('choice', final_topk_choices),
     }
 
-
-HPO_search_space_DEPTH_ROUTING = {
-        'depth_route_type':      ('choice', ['query', 'query_anchor']),
+HPO_search_space_PATH_MEMORY = {
+        'path_dim':              ('choice', [32, 64, 128]),
+        'path_lambda':           ('choice', [0.05, 0.1, 0.2, 0.3]),
     }
+
+def build_ffn_search_space(use_input_refine, use_layer_refine):
+    space = {
+        'ffn_hidden_dim':        ('choice', [32, 64, 128]),
+        'ffn_dropout':           ('choice', [0.0, 0.1, 0.2, 0.3]),
+    }
+    if use_input_refine:
+        space['input_lr'] = ('choice', [1e-4, 3e-4, 1e-3])
+        space['input_weight_decay'] = ('choice', [0.0, 1e-5, 1e-4])
+    if use_layer_refine:
+        space['layer_lr'] = ('choice', [1e-4, 3e-4, 1e-3])
+        space['layer_weight_decay'] = ('choice', [0.0, 1e-5, 1e-4])
+    return space
 
 # # ========== Module 1: Relation-Path Conditioned Sampling search space ==========
 # HPO_search_space_M1 = {
@@ -99,8 +104,17 @@ parser.add_argument('--refine_dim', type=int, default=16)
 parser.add_argument('--refine_steps', type=int, default=2)
 parser.add_argument('--refine_eta', type=float, default=0.3)
 parser.add_argument('--final_topk', type=float, default=-1.0)
-parser.add_argument('--use_depth_routing', action='store_true')
-parser.add_argument('--depth_route_type', type=str, default='query', choices=['query', 'query_anchor'])
+parser.add_argument('--use_path_memory', action='store_true')
+parser.add_argument('--path_dim', type=int, default=64)
+parser.add_argument('--path_lambda', type=float, default=0.1)
+parser.add_argument('--use_input_refine', action='store_true')
+parser.add_argument('--use_layer_refine', action='store_true')
+parser.add_argument('--ffn_hidden_dim', type=int, default=64)
+parser.add_argument('--ffn_dropout', type=float, default=-1.0)
+parser.add_argument('--input_lr', type=float, default=-1.0)
+parser.add_argument('--input_weight_decay', type=float, default=-1.0)
+parser.add_argument('--layer_lr', type=float, default=-1.0)
+parser.add_argument('--layer_weight_decay', type=float, default=-1.0)
 # # ========== Module 1: Relation-Path Conditioned Sampling args ==========
 # parser.add_argument('--use_rel_prior', action='store_true')         # enable path-based relation prior
 # parser.add_argument('--path_lambda', type=float, default=0.5)       # weight for path prior in fusion
@@ -275,11 +289,14 @@ if __name__ == '__main__':
 
     if args.use_relation_refine:
         resolve_relation_refine_budget(args)
-        HPO_search_space.update(build_relation_refine_search_space(args.topk))
+        HPO_search_space.update(HPO_search_space_RELATION_REFINE)
         print('==> HPO: added RelationRefine search space')
-    if args.use_depth_routing:
-        HPO_search_space.update(HPO_search_space_DEPTH_ROUTING)
-        print('==> HPO: added DepthRouting search space')
+    if args.use_path_memory:
+        HPO_search_space.update(HPO_search_space_PATH_MEMORY)
+        print('==> HPO: added PathMemory search space')
+    if args.use_input_refine or args.use_layer_refine:
+        HPO_search_space.update(build_ffn_search_space(args.use_input_refine, args.use_layer_refine))
+        print('==> HPO: added FCRefine search space')
 
     # # conditionally extend search space based on enabled modules
     # if args.use_rel_prior:
@@ -353,10 +370,19 @@ if __name__ == '__main__':
             args.refine_dim = int(params['refine_dim'])
             args.refine_steps = int(params['refine_steps'])
             args.refine_eta = float(params['refine_eta'])
-            args.final_topk = float(params['final_topk'])
             resolve_relation_refine_budget(args)
-        if args.use_depth_routing:
-            args.depth_route_type = params['depth_route_type']
+        if args.use_path_memory:
+            args.path_dim = int(params['path_dim'])
+            args.path_lambda = float(params['path_lambda'])
+        if args.use_input_refine or args.use_layer_refine:
+            args.ffn_hidden_dim = int(params['ffn_hidden_dim'])
+            args.ffn_dropout = float(params['ffn_dropout'])
+        if args.use_input_refine:
+            args.input_lr = float(params['input_lr'])
+            args.input_weight_decay = float(params['input_weight_decay'])
+        if args.use_layer_refine:
+            args.layer_lr = float(params['layer_lr'])
+            args.layer_weight_decay = float(params['layer_weight_decay'])
 
         # # Module 1: Relation-Path Conditioned Sampling params
         # if args.use_rel_prior:

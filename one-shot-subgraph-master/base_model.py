@@ -24,14 +24,41 @@ class BaseModel(object):
         self.trainLoader = DataLoader(loader, batch_size=args.n_batch, num_workers=args.cpu, collate_fn=loader.collate_fn, shuffle=False, prefetch_factor=args.cpu, pin_memory=True)
         self.valLoader = DataLoader(val_loader, batch_size=args.n_tbatch, num_workers=args.cpu, collate_fn=val_loader.collate_fn, shuffle=False, prefetch_factor=args.cpu, pin_memory=True)
         self.testLoader = DataLoader(test_loader, batch_size=args.n_tbatch, num_workers=args.cpu, collate_fn=test_loader.collate_fn, shuffle=False, prefetch_factor=args.cpu, pin_memory=True)
-        self.optimizer = Adam(self.model.parameters(), lr=args.lr, weight_decay=args.lamb)
-        self.scheduler = ReduceLROnPlateau(self.optimizer, mode='max', factor=0.5, patience=2, min_lr=args.lr/20, verbose=True)
+        self.optimizer = self._build_optimizer()
+        min_group_lr = min(group['lr'] for group in self.optimizer.param_groups)
+        self.scheduler = ReduceLROnPlateau(self.optimizer, mode='max', factor=0.5, patience=2, min_lr=min_group_lr/20, verbose=True)
         self.smooth = 1e-5
         self.t_time = 0
         self.epoch_train_time = 0
         self.mean_rank_dict = {}
         self.epoch_idx = 0
         self.best_valid_mrr = 0.0
+
+    def _build_optimizer(self):
+        default_lr = float(self.args.lr)
+        default_wd = float(self.args.lamb)
+        param_groups = []
+        special_param_ids = set()
+
+        if getattr(self.args, 'use_input_refine', False) and hasattr(self.model, 'input_refine'):
+            input_params = [p for p in self.model.input_refine.parameters() if p.requires_grad]
+            if input_params:
+                input_lr = float(self.args.input_lr) if float(getattr(self.args, 'input_lr', -1.0)) > 0 else default_lr
+                input_wd = float(self.args.input_weight_decay) if float(getattr(self.args, 'input_weight_decay', -1.0)) >= 0 else default_wd
+                param_groups.append({'params': input_params, 'lr': input_lr, 'weight_decay': input_wd})
+                special_param_ids.update(id(p) for p in input_params)
+
+        if getattr(self.args, 'use_layer_refine', False) and hasattr(self.model, 'layer_refine'):
+            layer_params = [p for p in self.model.layer_refine.parameters() if p.requires_grad]
+            if layer_params:
+                layer_lr = float(self.args.layer_lr) if float(getattr(self.args, 'layer_lr', -1.0)) > 0 else default_lr
+                layer_wd = float(self.args.layer_weight_decay) if float(getattr(self.args, 'layer_weight_decay', -1.0)) >= 0 else default_wd
+                param_groups.append({'params': layer_params, 'lr': layer_lr, 'weight_decay': layer_wd})
+                special_param_ids.update(id(p) for p in layer_params)
+
+        default_params = [p for p in self.model.parameters() if p.requires_grad and id(p) not in special_param_ids]
+        param_groups.insert(0, {'params': default_params, 'lr': default_lr, 'weight_decay': default_wd})
+        return Adam(param_groups)
         
     def saveModelToFiles(self, args, best_metric, deleteLastFile=True):
         budget_tag = f'topk_{self.args.topk}'
@@ -57,7 +84,9 @@ class BaseModel(object):
         checkpoint = torch.load(filePath, map_location=torch.device(f'cuda:{self.args.gpu}'))
         self.model.load_state_dict(checkpoint['model_state_dict'])
         # re-build optimizter
-        self.optimizer = Adam(self.model.parameters(), lr=self.args.lr, weight_decay=self.args.lamb)
+        self.optimizer = self._build_optimizer()
+        min_group_lr = min(group['lr'] for group in self.optimizer.param_groups)
+        self.scheduler = ReduceLROnPlateau(self.optimizer, mode='max', factor=0.5, patience=2, min_lr=min_group_lr/20, verbose=True)
 
     def _new_relation_refine_tracker(self):
         return {
@@ -70,13 +99,16 @@ class BaseModel(object):
             'refined_edges': 0.0,
         }
 
-    def _new_depth_routing_tracker(self):
+    def _new_path_memory_tracker(self):
         return {
             'query_count': 0.0,
-            'layer_weight_sum': np.zeros(self.model.n_layer, dtype=np.float64),
+            'real_node_count': 0.0,
+            'active_node_count': 0.0,
+            'state_norm_sum': 0.0,
+            'abs_score_sum': 0.0,
         }
 
-    def _update_module_trackers(self, relation_refine_tracker, depth_routing_tracker, batch_stats):
+    def _update_module_trackers(self, relation_refine_tracker, path_memory_tracker, batch_stats):
         if batch_stats is None:
             return
 
@@ -85,12 +117,10 @@ class BaseModel(object):
             for key in relation_refine_tracker.keys():
                 relation_refine_tracker[key] += float(relation_refine_stats.get(key, 0.0))
 
-        depth_routing_stats = batch_stats.get('depth_routing')
-        if depth_routing_stats is not None and depth_routing_stats.get('enabled', 0.0) > 0.5:
-            depth_routing_tracker['query_count'] += float(depth_routing_stats.get('query_count', 0.0))
-            depth_routing_tracker['layer_weight_sum'] += np.array(
-                depth_routing_stats.get('layer_weight_sum', []), dtype=np.float64
-            )
+        path_memory_stats = batch_stats.get('path_memory')
+        if path_memory_stats is not None and path_memory_stats.get('enabled', 0.0) > 0.5:
+            for key in path_memory_tracker.keys():
+                path_memory_tracker[key] += float(path_memory_stats.get(key, 0.0))
 
     def _format_relation_refine_tracker(self, phase, tracker):
         query_count = float(tracker['query_count'])
@@ -109,16 +139,21 @@ class BaseModel(object):
             f'edge_keep={edge_keep:.1%}'
         )
 
-    def _format_depth_routing_tracker(self, phase, tracker):
+    def _format_path_memory_tracker(self, phase, tracker):
         query_count = float(tracker['query_count'])
-        if query_count <= 0:
+        real_node_count = float(tracker['real_node_count'])
+        if query_count <= 0 or real_node_count <= 0:
             return None
-        mean_weights = tracker['layer_weight_sum'] / max(query_count, 1.0)
-        weight_str = ' '.join([f'L{i}:{w:.3f}' for i, w in enumerate(mean_weights, start=1)])
+        active_ratio = tracker['active_node_count'] / max(real_node_count, 1.0)
+        mean_norm = tracker['state_norm_sum'] / max(real_node_count, 1.0)
+        mean_abs_score = tracker['abs_score_sum'] / max(real_node_count, 1.0)
         return (
-            f'==> DepthRouting[{phase}][epoch={self.epoch_idx}]: '
+            f'==> PathMemory[{phase}][epoch={self.epoch_idx}]: '
             f'queries={int(query_count)} '
-            f'weights={weight_str}'
+            f'active_nodes={active_ratio:.1%} '
+            f'state_norm={mean_norm:.4f} '
+            f'abs_score={mean_abs_score:.4f} '
+            f'lambda={float(getattr(self.args, "path_lambda", 0.0)):.3f}'
         )
 
     def _format_epoch_summary(self, eval_info):
@@ -146,7 +181,7 @@ class BaseModel(object):
         epoch_loss = 0
         reach_tails_list = []
         train_relation_refine_tracker = self._new_relation_refine_tracker()
-        train_depth_routing_tracker = self._new_depth_routing_tracker()
+        train_path_memory_tracker = self._new_path_memory_tracker()
         t_time = time.time()
         self.model.train()
         if hasattr(self.model, 'set_epoch'):
@@ -161,7 +196,7 @@ class BaseModel(object):
             scores = self.model(subs, rels, subgraph_data)
             self._update_module_trackers(
                 train_relation_refine_tracker,
-                train_depth_routing_tracker,
+                train_path_memory_tracker,
                 self.model.pop_module_stats(),
             )
             
@@ -197,13 +232,13 @@ class BaseModel(object):
         train_relation_refine_log = self._format_relation_refine_tracker('train', train_relation_refine_tracker)
         if train_relation_refine_log is not None:
             print(train_relation_refine_log)
-        train_depth_routing_log = self._format_depth_routing_tracker('train', train_depth_routing_tracker)
-        if train_depth_routing_log is not None:
-            print(train_depth_routing_log)
+        train_path_memory_log = self._format_path_memory_tracker('train', train_path_memory_tracker)
+        if train_path_memory_log is not None:
+            print(train_path_memory_log)
         for phase_log in eval_info['relation_refine_logs']:
             if phase_log is not None:
                 print(phase_log)
-        for phase_log in eval_info['depth_routing_logs']:
+        for phase_log in eval_info['path_memory_logs']:
             if phase_log is not None:
                 print(phase_log)
         
@@ -230,8 +265,8 @@ class BaseModel(object):
         i_time = time.time()
         valid_relation_refine_tracker = self._new_relation_refine_tracker()
         test_relation_refine_tracker = self._new_relation_refine_tracker()
-        valid_depth_routing_tracker = self._new_depth_routing_tracker()
-        test_depth_routing_tracker = self._new_depth_routing_tracker()
+        valid_path_memory_tracker = self._new_path_memory_tracker()
+        test_path_memory_tracker = self._new_path_memory_tracker()
         
         # eval on val set
         if eval_val:
@@ -245,7 +280,7 @@ class BaseModel(object):
                 scores = self.model(subs, rels, subgraph_data, mode='valid').data.cpu().numpy()
                 self._update_module_trackers(
                     valid_relation_refine_tracker,
-                    valid_depth_routing_tracker,
+                    valid_path_memory_tracker,
                     self.model.pop_module_stats(),
                 )
 
@@ -305,7 +340,7 @@ class BaseModel(object):
                 scores = self.model(subs, rels, subgraph_data, mode='test').data.cpu().numpy()
                 self._update_module_trackers(
                     test_relation_refine_tracker,
-                    test_depth_routing_tracker,
+                    test_path_memory_tracker,
                     self.model.pop_module_stats(),
                 )
 
@@ -363,9 +398,9 @@ class BaseModel(object):
                 self._format_relation_refine_tracker('valid', valid_relation_refine_tracker),
                 self._format_relation_refine_tracker('test', test_relation_refine_tracker),
             ],
-            'depth_routing_logs': [
-                self._format_depth_routing_tracker('valid', valid_depth_routing_tracker),
-                self._format_depth_routing_tracker('test', test_depth_routing_tracker),
+            'path_memory_logs': [
+                self._format_path_memory_tracker('valid', valid_path_memory_tracker),
+                self._format_path_memory_tracker('test', test_path_memory_tracker),
             ],
         }
         return v_mrr, out_str, eval_info
