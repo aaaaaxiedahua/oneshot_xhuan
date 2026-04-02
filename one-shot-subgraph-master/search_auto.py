@@ -37,26 +37,26 @@ HPO_search_space = {
     }
 
 HPO_search_space_RELATION_REFINE = {
-        'refine_dim':            ('choice', [16, 32]),
-        'refine_steps':          ('choice', [2, 3, 4]),
-        'refine_eta':            ('choice', [0.1, 0.3, 0.5]),
+        'refine_dim':            ('choice', [16, 32, 48, 64, 128]),
+        'refine_steps':          ('choice', [2, 3, 4, 5, 6]),
+        'refine_eta':            ('uniform', (0.05, 0.7)),
     }
 
 HPO_search_space_PROGRESSIVE_QUERY = {
-        'query_update_hidden':   ('choice', [32, 64, 128]),
+        'query_update_hidden':   ('choice', [32, 64, 128, 256]),
     }
 
 def build_ffn_search_space(use_input_refine, use_layer_refine):
     space = {
-        'ffn_hidden_dim':        ('choice', [32, 64, 128]),
-        'ffn_dropout':           ('choice', [0.0, 0.1, 0.2, 0.3]),
+        'ffn_hidden_dim':        ('choice', [32, 64, 128, 256]),
+        'ffn_dropout':           ('uniform', (0.0, 0.4)),
     }
     if use_input_refine:
-        space['input_lr'] = ('choice', [1e-4, 3e-4, 1e-3])
-        space['input_weight_decay'] = ('choice', [0.0, 1e-5, 1e-4])
+        space['input_lr'] = ('choice', [5e-5, 1e-4, 5e-4, 1e-3, 5e-3])
+        space['input_weight_decay'] = ('uniform', (0.0, 5e-4))
     if use_layer_refine:
-        space['layer_lr'] = ('choice', [1e-4, 3e-4, 1e-3])
-        space['layer_weight_decay'] = ('choice', [0.0, 1e-5, 1e-4])
+        space['layer_lr'] = ('choice', [5e-5, 1e-4, 5e-4, 1e-3, 5e-3])
+        space['layer_weight_decay'] = ('uniform', (0.0, 5e-4))
     return space
 
 # # ========== Module 1: Relation-Path Conditioned Sampling search space ==========
