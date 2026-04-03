@@ -95,6 +95,12 @@ parser.add_argument('--search', action='store_true')
 parser.add_argument('--finetune', action='store_true')
 parser.add_argument('--finetune_config', type=str, default='')
 parser.add_argument('--start_config', type=str, default='')  # optional: JSON string or file path for seeded trial config
+parser.add_argument('--hpo_backend', type=str, default='legacy', choices=['legacy', 'optuna'])
+parser.add_argument('--optuna_trials', type=int, default=50)
+parser.add_argument('--optuna_timeout', type=float, default=-1.0)
+parser.add_argument('--optuna_startup_trials', type=int, default=10)
+parser.add_argument('--optuna_min_resource', type=int, default=1)
+parser.add_argument('--optuna_reduction_factor', type=int, default=3)
 parser.add_argument('--not_shuffle_train', action='store_true')
 parser.add_argument('--use_readout_refine', action='store_true')
 parser.add_argument('--use_relation_refine', action='store_true')
@@ -214,7 +220,7 @@ def _coerce_choice_value(value, choices):
     return None
 
 
-def _build_start_candidates(raw_start_configs, hp_space):
+def _normalize_start_configs(raw_start_configs, hp_space, fill_missing=True):
     if raw_start_configs is None:
         return None
 
@@ -223,7 +229,7 @@ def _build_start_candidates(raw_start_configs, hp_space):
     for idx, user_cfg in enumerate(raw_start_configs):
         user_cfg = dict(user_cfg)
 
-        seed_cfg = _sample_one_from_space(hp_space)
+        seed_cfg = _sample_one_from_space(hp_space) if fill_missing else {}
         unknown_keys = [k for k in user_cfg.keys() if k not in hp_keys]
         if len(unknown_keys) > 0:
             print(f'==> warning: ignored unknown start_config keys at index {idx}: {unknown_keys}')
@@ -348,7 +354,7 @@ if __name__ == '__main__':
         print(f'==> load {len(config_list)} trials from file: {file}')
         return config_list, mrr_list
     
-    def run_model(params, save_path=HPO_save_path, finetune_idx=-1):       
+    def run_model(params, save_path=HPO_save_path, finetune_idx=-1, reporter=None, save_result=True, early_stop_patience=3):       
         print(params)
         args.lr = params['lr']
         args.decay_rate = params['decay_rate']
@@ -421,21 +427,24 @@ if __name__ == '__main__':
                 model.saveModelToFiles(args, BestMetricStr, deleteLastFile=False)
             else:
                 bearing += 1
+
+            if reporter is not None:
+                reporter.report_and_prune(epoch, v_mrr)
                 
             # early stop (3 as the threshould to boost searching)
-            if bearing >= 3: 
+            if early_stop_patience is not None and bearing >= int(early_stop_patience): 
                 print(f'early stopping at {epoch+1} epoch.')
                 break
         
         # save to local file
-        if args.search:
+        if save_result and args.search:
             if not os.path.exists(save_path):
                 HPO_records = {}
             else:
                 HPO_records = pkl.load(open(save_path, 'rb'))
             HPO_records[str(args)] = (best_mrr, best_test_mrr, params, args)
             pkl.dump(HPO_records, open(save_path, 'wb'))
-        elif args.finetune:
+        elif save_result and args.finetune:
             assert finetune_idx != -1
             data = pkl.load(open(args.finetune_config, 'rb'))
             data[finetune_idx]['status'] = 'done'
@@ -447,24 +456,76 @@ if __name__ == '__main__':
 
     # standard HPO pipeline (no best_configs start, random exploration for new model)
     if args.search:
-        print('==> HPO search mode (random start)')
-        HPO_instance = RF_HPO(kgeModelName='redgnn', obj_function=run_model, dataset_name=args.dataset, HP_info=HPO_search_space, acq='EI')
-        start_candidates = None
+        user_start_cfg = _load_start_config(args.start_config) if args.start_config != '' else None
 
-        if args.start_config != '':
-            user_start_cfg = _load_start_config(args.start_config)
-            start_candidates = _build_start_candidates(user_start_cfg, HPO_search_space)
-            print(f'==> HPO: loaded {len(start_candidates)} start candidate(s) from --start_config')
+        if args.hpo_backend == 'legacy':
+            print('==> HPO search mode (legacy backend)')
+            HPO_instance = RF_HPO(kgeModelName='redgnn', obj_function=run_model, dataset_name=args.dataset, HP_info=HPO_search_space, acq='EI')
+            start_candidates = None
 
-        if args.useSearchLog and os.path.exists(HPO_save_path):
-            config_list, mrr_list = loadSearchLog(HPO_save_path)
-            dataset_names = [args.dataset for i in range(len(config_list))]
-            HPO_instance.pretrain(config_list, mrr_list, dataset_names=dataset_names)
+            if user_start_cfg is not None:
+                start_candidates = _normalize_start_configs(user_start_cfg, HPO_search_space, fill_missing=True)
+                print(f'==> HPO: loaded {len(start_candidates)} start candidate(s) from --start_config')
 
-        max_trials, sample_num = 1e10, 1e4
-        HPO_instance.runTrials(max_trials, sample_num, explore_trials=1e10, start_candidate=start_candidates)
+            if args.useSearchLog and os.path.exists(HPO_save_path):
+                config_list, mrr_list = loadSearchLog(HPO_save_path)
+                dataset_names = [args.dataset for i in range(len(config_list))]
+                HPO_instance.pretrain(config_list, mrr_list, dataset_names=dataset_names)
+
+            max_trials, sample_num = 1e10, 1e4
+            HPO_instance.runTrials(max_trials, sample_num, explore_trials=1e10, start_candidate=start_candidates)
+
+        elif args.hpo_backend == 'optuna':
+            from optuna_hpo import OptunaTPEHyperbandHPO
+
+            print('==> HPO search mode (optuna backend)')
+            print('==> sampler=TPE, pruner=Hyperband')
+            print(f'==> optuna trials will be saved to legacy search log: {HPO_save_path}')
+
+            if args.useSearchLog:
+                print('==> warning: --useSearchLog is only supported by the legacy HPO backend. Ignoring it for optuna.')
+
+            start_configs = None
+            if user_start_cfg is not None:
+                start_configs = _normalize_start_configs(user_start_cfg, HPO_search_space, fill_missing=False)
+                print(f'==> HPO: loaded {len(start_configs)} start candidate(s) from --start_config')
+
+            timeout = None if args.optuna_timeout <= 0 else float(args.optuna_timeout)
+            study_name = f'redgnn-{dataset}-optuna'
+
+            HPO_instance = OptunaTPEHyperbandHPO(
+                search_space=HPO_search_space,
+                study_name=study_name,
+                direction='maximize',
+                seed=int(args.seed),
+                n_startup_trials=args.optuna_startup_trials,
+                min_resource=args.optuna_min_resource,
+                max_resource=int(args.epoch),
+                reduction_factor=args.optuna_reduction_factor,
+            )
+
+            def optuna_objective(trial, params, reporter):
+                return run_model(
+                    params,
+                    reporter=reporter,
+                    save_result=True,
+                    early_stop_patience=None,
+                )
+
+            HPO_instance.optimize(
+                optuna_objective,
+                n_trials=args.optuna_trials,
+                timeout=timeout,
+                start_configs=start_configs,
+                catch=(RuntimeError,),
+            )
+
+            print(f'==> optuna best MRR={HPO_instance.best_value}')
+            print(HPO_instance.best_config)
         
     elif args.finetune:
+        if args.hpo_backend != 'legacy':
+            raise ValueError('--finetune currently only supports --hpo_backend legacy.')
         print('==> HPO finetune mode')
         np.random.seed(args.seed)
         torch.manual_seed(args.seed)
