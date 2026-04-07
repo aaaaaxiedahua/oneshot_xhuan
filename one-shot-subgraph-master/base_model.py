@@ -40,14 +40,6 @@ class BaseModel(object):
         param_groups = []
         special_param_ids = set()
 
-        if getattr(self.args, 'use_input_refine', False) and hasattr(self.model, 'input_refine'):
-            input_params = [p for p in self.model.input_refine.parameters() if p.requires_grad]
-            if input_params:
-                input_lr = float(self.args.input_lr) if float(getattr(self.args, 'input_lr', -1.0)) > 0 else default_lr
-                input_wd = float(self.args.input_weight_decay) if float(getattr(self.args, 'input_weight_decay', -1.0)) >= 0 else default_wd
-                param_groups.append({'params': input_params, 'lr': input_lr, 'weight_decay': input_wd})
-                special_param_ids.update(id(p) for p in input_params)
-
         if getattr(self.args, 'use_layer_refine', False) and hasattr(self.model, 'layer_refine'):
             layer_params = [p for p in self.model.layer_refine.parameters() if p.requires_grad]
             if layer_params:
@@ -55,6 +47,27 @@ class BaseModel(object):
                 layer_wd = float(self.args.layer_weight_decay) if float(getattr(self.args, 'layer_weight_decay', -1.0)) >= 0 else default_wd
                 param_groups.append({'params': layer_params, 'lr': layer_lr, 'weight_decay': layer_wd})
                 special_param_ids.update(id(p) for p in layer_params)
+
+        if getattr(self.args, 'use_readout_refine', False) and hasattr(self.model, 'readout_refine'):
+            readout_params = [p for p in self.model.readout_refine.parameters() if p.requires_grad]
+            if readout_params:
+                readout_lr = float(self.args.readout_lr) if float(getattr(self.args, 'readout_lr', -1.0)) > 0 else default_lr
+                readout_wd = float(self.args.readout_weight_decay) if float(getattr(self.args, 'readout_weight_decay', -1.0)) >= 0 else default_wd
+                param_groups.append({'params': readout_params, 'lr': readout_lr, 'weight_decay': readout_wd})
+                special_param_ids.update(id(p) for p in readout_params)
+
+        if getattr(self.args, 'use_progressive_query', False) and hasattr(self.model, 'query_updater'):
+            query_modules = [self.model.query_updater]
+            if hasattr(self.model, 'query_norm'):
+                query_modules.append(self.model.query_norm)
+            query_params = []
+            for module in query_modules:
+                query_params.extend([p for p in module.parameters() if p.requires_grad])
+            if query_params:
+                query_lr = float(self.args.query_lr) if float(getattr(self.args, 'query_lr', -1.0)) > 0 else default_lr
+                query_wd = float(self.args.query_weight_decay) if float(getattr(self.args, 'query_weight_decay', -1.0)) >= 0 else default_wd
+                param_groups.append({'params': query_params, 'lr': query_lr, 'weight_decay': query_wd})
+                special_param_ids.update(id(p) for p in query_params)
 
         default_params = [p for p in self.model.parameters() if p.requires_grad and id(p) not in special_param_ids]
         param_groups.insert(0, {'params': default_params, 'lr': default_lr, 'weight_decay': default_wd})

@@ -37,26 +37,34 @@ HPO_search_space = {
     }
 
 HPO_search_space_RELATION_REFINE = {
-        'refine_dim':            ('choice', [16, 32, 48, 64, 128]),
+        'refine_dim':            ('choice', [16, 32, 48, 64, 128， 256]),
         'refine_steps':          ('choice', [2, 3, 4, 5, 6]),
         'refine_eta':            ('uniform', (0.05, 0.7)),
     }
 
 HPO_search_space_PROGRESSIVE_QUERY = {
         'query_update_hidden':   ('choice', [32, 64, 128, 256]),
+        'query_lr':              ('choice', [5e-5, 1e-4, 5e-4, 1e-3]),
+        'query_weight_decay':    ('uniform', (0.0, 5e-4)),
     }
 
-def build_ffn_search_space(use_input_refine, use_layer_refine):
-    space = {
-        'ffn_hidden_dim':        ('choice', [32, 64, 128, 256]),
-        'ffn_dropout':           ('uniform', (0.0, 0.4)),
-    }
-    if use_input_refine:
-        space['input_lr'] = ('choice', [5e-5, 1e-4, 5e-4, 1e-3, 5e-3])
-        space['input_weight_decay'] = ('uniform', (0.0, 5e-4))
+def build_layer_refine_search_space(use_layer_refine):
+    space = {}
     if use_layer_refine:
+        space['layer_hidden_dim'] = ('choice', [32, 64, 128, 256])
+        space['layer_dropout'] = ('uniform', (0.0, 0.4))
         space['layer_lr'] = ('choice', [5e-5, 1e-4, 5e-4, 1e-3, 5e-3])
         space['layer_weight_decay'] = ('uniform', (0.0, 5e-4))
+    return space
+
+
+def build_readout_refine_search_space(use_readout_refine):
+    space = {}
+    if use_readout_refine:
+        space['readout_hidden_dim'] = ('choice', [64, 128, 256])
+        space['readout_dropout'] = ('uniform', (0.0, 0.3))
+        space['readout_lr'] = ('choice', [5e-5, 1e-4, 5e-4, 1e-3])
+        space['readout_weight_decay'] = ('uniform', (0.0, 5e-4))
     return space
 
 # # ========== Module 1: Relation-Path Conditioned Sampling search space ==========
@@ -110,14 +118,17 @@ parser.add_argument('--refine_eta', type=float, default=0.3)
 parser.add_argument('--final_topk', type=float, default=-1.0)
 parser.add_argument('--use_progressive_query', action='store_true')
 parser.add_argument('--query_update_hidden', type=int, default=64)
-parser.add_argument('--use_input_refine', action='store_true')
+parser.add_argument('--query_lr', type=float, default=-1.0)
+parser.add_argument('--query_weight_decay', type=float, default=-1.0)
 parser.add_argument('--use_layer_refine', action='store_true')
-parser.add_argument('--ffn_hidden_dim', type=int, default=64)
-parser.add_argument('--ffn_dropout', type=float, default=-1.0)
-parser.add_argument('--input_lr', type=float, default=-1.0)
-parser.add_argument('--input_weight_decay', type=float, default=-1.0)
+parser.add_argument('--layer_hidden_dim', type=int, default=-1)
+parser.add_argument('--layer_dropout', type=float, default=-1.0)
 parser.add_argument('--layer_lr', type=float, default=-1.0)
 parser.add_argument('--layer_weight_decay', type=float, default=-1.0)
+parser.add_argument('--readout_hidden_dim', type=int, default=-1)
+parser.add_argument('--readout_dropout', type=float, default=-1.0)
+parser.add_argument('--readout_lr', type=float, default=-1.0)
+parser.add_argument('--readout_weight_decay', type=float, default=-1.0)
 # # ========== Module 1: Relation-Path Conditioned Sampling args ==========
 # parser.add_argument('--use_rel_prior', action='store_true')         # enable path-based relation prior
 # parser.add_argument('--rel_path_topk', type=int, default=10)        # top-K relation path patterns per relation
@@ -220,6 +231,26 @@ def _coerce_choice_value(value, choices):
     return None
 
 
+def _populate_refine_defaults(raw_cfg):
+    cfg = dict(raw_cfg)
+    if 'ffn_hidden_dim' in cfg and 'layer_hidden_dim' not in cfg:
+        cfg['layer_hidden_dim'] = cfg['ffn_hidden_dim']
+    if 'ffn_dropout' in cfg and 'layer_dropout' not in cfg:
+        cfg['layer_dropout'] = cfg['ffn_dropout']
+    if 'lr' in cfg:
+        cfg.setdefault('query_lr', cfg['lr'])
+        cfg.setdefault('readout_lr', cfg['lr'])
+    if 'lamb' in cfg:
+        cfg.setdefault('query_weight_decay', cfg['lamb'])
+        cfg.setdefault('readout_weight_decay', cfg['lamb'])
+    if 'dropout' in cfg:
+        cfg.setdefault('readout_dropout', cfg['dropout'])
+    if 'hidden_dim' in cfg and 'readout_hidden_dim' not in cfg:
+        hidden_dim = int(cfg['hidden_dim'])
+        cfg['readout_hidden_dim'] = max(64, min(256, hidden_dim // 2))
+    return cfg
+
+
 def _normalize_start_configs(raw_start_configs, hp_space, fill_missing=True):
     if raw_start_configs is None:
         return None
@@ -227,7 +258,7 @@ def _normalize_start_configs(raw_start_configs, hp_space, fill_missing=True):
     start_candidates = []
     hp_keys = set(hp_space.keys())
     for idx, user_cfg in enumerate(raw_start_configs):
-        user_cfg = dict(user_cfg)
+        user_cfg = _populate_refine_defaults(user_cfg)
 
         seed_cfg = _sample_one_from_space(hp_space) if fill_missing else {}
         unknown_keys = [k for k in user_cfg.keys() if k not in hp_keys]
@@ -288,7 +319,6 @@ if __name__ == '__main__':
     args.n_batch = args.n_tbatch = int(args.batchsize)
     
     assert args.search or args.finetune
-
     if args.use_relation_refine:
         resolve_relation_refine_budget(args)
         HPO_search_space.update(HPO_search_space_RELATION_REFINE)
@@ -296,9 +326,12 @@ if __name__ == '__main__':
     if args.use_progressive_query:
         HPO_search_space.update(HPO_search_space_PROGRESSIVE_QUERY)
         print('==> HPO: added ProgressiveQuery search space')
-    if args.use_input_refine or args.use_layer_refine:
-        HPO_search_space.update(build_ffn_search_space(args.use_input_refine, args.use_layer_refine))
-        print('==> HPO: added FCRefine search space')
+    if args.use_layer_refine:
+        HPO_search_space.update(build_layer_refine_search_space(args.use_layer_refine))
+        print('==> HPO: added LayerRefine search space')
+    if args.use_readout_refine:
+        HPO_search_space.update(build_readout_refine_search_space(args.use_readout_refine))
+        print('==> HPO: added ReadoutRefine search space')
 
     # # conditionally extend search space based on enabled modules
     # if args.use_rel_prior:
@@ -348,7 +381,7 @@ if __name__ == '__main__':
         config_list, mrr_list = [], []
         for HP_key, HP_values in data.items():
             (best_mrr, best_test_mrr, params, opts) = HP_values
-            config_list.append(params)
+            config_list.append(_populate_refine_defaults(params))
             mrr_list.append(best_mrr)
 
         print(f'==> load {len(config_list)} trials from file: {file}')
@@ -375,15 +408,18 @@ if __name__ == '__main__':
             resolve_relation_refine_budget(args)
         if args.use_progressive_query:
             args.query_update_hidden = int(params['query_update_hidden'])
-        if args.use_input_refine or args.use_layer_refine:
-            args.ffn_hidden_dim = int(params['ffn_hidden_dim'])
-            args.ffn_dropout = float(params['ffn_dropout'])
-        if args.use_input_refine:
-            args.input_lr = float(params['input_lr'])
-            args.input_weight_decay = float(params['input_weight_decay'])
+            args.query_lr = float(params['query_lr'])
+            args.query_weight_decay = float(params['query_weight_decay'])
         if args.use_layer_refine:
+            args.layer_hidden_dim = int(params['layer_hidden_dim'])
+            args.layer_dropout = float(params['layer_dropout'])
             args.layer_lr = float(params['layer_lr'])
             args.layer_weight_decay = float(params['layer_weight_decay'])
+        if args.use_readout_refine:
+            args.readout_hidden_dim = int(params['readout_hidden_dim'])
+            args.readout_dropout = float(params['readout_dropout'])
+            args.readout_lr = float(params['readout_lr'])
+            args.readout_weight_decay = float(params['readout_weight_decay'])
 
         # # Module 1: Relation-Path Conditioned Sampling params
         # if args.use_rel_prior:

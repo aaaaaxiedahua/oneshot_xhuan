@@ -426,6 +426,75 @@ class ResidualFFN(nn.Module):
         out = self.lin2(out)
         return x + out
 
+
+class QueryConditionedLayerRefine(nn.Module):
+    def __init__(self, in_dim, hidden_dim, dropout):
+        super().__init__()
+        gate_hidden_dim = max(1, hidden_dim // 2)
+        self.hidden_norm = nn.LayerNorm(in_dim)
+        self.query_norm = nn.LayerNorm(in_dim)
+        self.delta_net = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, in_dim),
+        )
+        self.gate_net = nn.Sequential(
+            nn.Linear(in_dim * 2, gate_hidden_dim),
+            nn.ReLU(),
+            nn.Linear(gate_hidden_dim, in_dim),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, hidden, query_hidden):
+        base_hidden = self.hidden_norm(hidden)
+        if query_hidden is None:
+            base_query = base_hidden
+        else:
+            base_query = self.query_norm(query_hidden)
+        gate = self.gate_net(torch.cat([base_hidden, base_query], dim=-1))
+        delta = self.delta_net(base_hidden)
+        return hidden + gate * delta
+
+
+class PairFusionReadout(nn.Module):
+    def __init__(self, hidden_dim, pair_hidden_dim, dropout):
+        super().__init__()
+        gate_hidden_dim = max(1, pair_hidden_dim // 2)
+        pair_dim = hidden_dim * 4
+        self.pair_norm = nn.LayerNorm(pair_dim)
+        self.delta_net = nn.Sequential(
+            nn.Linear(pair_dim, pair_hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(pair_hidden_dim, hidden_dim * 2),
+        )
+        self.gate_net = nn.Sequential(
+            nn.Linear(pair_dim, gate_hidden_dim),
+            nn.ReLU(),
+            nn.Linear(gate_hidden_dim, hidden_dim * 2),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, real_hidden, anchor_hidden):
+        pair_feat = torch.cat(
+            [
+                real_hidden,
+                anchor_hidden,
+                real_hidden * anchor_hidden,
+                torch.abs(real_hidden - anchor_hidden),
+            ],
+            dim=-1,
+        )
+        pair_feat = self.pair_norm(pair_feat)
+        delta = self.delta_net(pair_feat)
+        gate = self.gate_net(pair_feat)
+        delta_real, delta_anchor = delta.chunk(2, dim=-1)
+        gate_real, gate_anchor = gate.chunk(2, dim=-1)
+        refined_real = real_hidden + gate_real * delta_real
+        refined_anchor = anchor_hidden + gate_anchor * delta_anchor
+        return refined_real, refined_anchor
+
 class GNN_auto(torch.nn.Module):
     def __init__(self, params, loader):
         super(GNN_auto, self).__init__()
@@ -442,7 +511,6 @@ class GNN_auto(torch.nn.Module):
         self.last_module_stats = None
         self.use_relation_refine = bool(getattr(params, 'use_relation_refine', False))
         self.use_progressive_query = bool(getattr(params, 'use_progressive_query', False))
-        self.use_input_refine = bool(getattr(params, 'use_input_refine', False))
         self.use_layer_refine = bool(getattr(params, 'use_layer_refine', False))
         self.refine_dim = int(getattr(params, 'refine_dim', 16))
         self.refine_steps = int(getattr(params, 'refine_steps', 2))
@@ -450,10 +518,12 @@ class GNN_auto(torch.nn.Module):
         self.coarse_topk = float(getattr(params, 'topk', 0.1))
         self.final_topk = float(getattr(params, 'final_topk', -1.0))
         self.query_update_hidden = int(getattr(params, 'query_update_hidden', 64))
-        self.ffn_hidden_dim = int(getattr(params, 'ffn_hidden_dim', 64))
-        self.ffn_dropout = float(getattr(params, 'ffn_dropout', -1.0))
-        if self.ffn_dropout < 0:
-            self.ffn_dropout = float(params.dropout)
+        self.layer_hidden_dim = int(getattr(params, 'layer_hidden_dim', 64))
+        if self.layer_hidden_dim <= 0:
+            self.layer_hidden_dim = 64
+        self.layer_dropout = float(getattr(params, 'layer_dropout', -1.0))
+        if self.layer_dropout < 0:
+            self.layer_dropout = float(params.dropout)
         if self.use_relation_refine:
             if self.final_topk <= 0:
                 self.final_topk = self.coarse_topk * 0.7
@@ -494,7 +564,7 @@ class GNN_auto(torch.nn.Module):
         self.dropout = nn.Dropout(params.dropout)
         self.gate = nn.GRU(self.hidden_dim, self.hidden_dim)
 
-        need_query_rela_embed = (self.params.initializer == 'relation') or self.use_input_refine or self.use_progressive_query
+        need_query_rela_embed = (self.params.initializer == 'relation') or self.use_layer_refine or self.use_progressive_query
         if need_query_rela_embed:
             self.query_rela_embed = nn.Embedding(2*self.n_rel+1, self.hidden_dim)
         self.readout_dim = self.hidden_dim * (self.n_layer + 1) if self.params.concatHidden else self.hidden_dim
@@ -520,29 +590,26 @@ class GNN_auto(torch.nn.Module):
                 '==> ProgressiveQuery: enabled '
                 f'(hidden={self.query_update_hidden})'
             )
-        if self.use_input_refine:
-            self.input_refine = ResidualFFN(self.hidden_dim, self.ffn_hidden_dim, self.ffn_dropout)
-            print(
-                '==> InputRefine: enabled '
-                f'(hidden={self.ffn_hidden_dim}, dropout={self.ffn_dropout})'
-            )
         if self.use_layer_refine:
             self.layer_refine = nn.ModuleList([
-                ResidualFFN(self.hidden_dim, self.ffn_hidden_dim, self.ffn_dropout) for _ in range(self.n_layer)
+                QueryConditionedLayerRefine(self.hidden_dim, self.layer_hidden_dim, self.layer_dropout) for _ in range(self.n_layer)
             ])
             print(
                 '==> LayerRefine: enabled '
-                f'(hidden={self.ffn_hidden_dim}, dropout={self.ffn_dropout}, layers={self.n_layer})'
+                f'(hidden={self.layer_hidden_dim}, dropout={self.layer_dropout}, layers={self.n_layer})'
             )
         if self.use_readout_refine:
-            refine_hidden = max(1, self.readout_dim // 2)
-            self.readout_refine = nn.Sequential(
-                nn.Linear(self.readout_dim, refine_hidden),
-                nn.ReLU(),
-                nn.Dropout(params.dropout),
-                nn.Linear(refine_hidden, self.readout_dim),
+            self.readout_hidden_dim = int(getattr(params, 'readout_hidden_dim', -1))
+            if self.readout_hidden_dim <= 0:
+                self.readout_hidden_dim = max(64, self.readout_dim // 2)
+            self.readout_dropout = float(getattr(params, 'readout_dropout', -1.0))
+            if self.readout_dropout < 0:
+                self.readout_dropout = float(params.dropout)
+            self.readout_refine = PairFusionReadout(self.readout_dim, self.readout_hidden_dim, self.readout_dropout)
+            print(
+                '==> ReadoutRefine: enabled '
+                f'(readout_dim={self.readout_dim}, hidden={self.readout_hidden_dim}, dropout={self.readout_dropout})'
             )
-            print(f'==> ReadoutRefine: enabled (readout_dim={self.readout_dim}, hidden={refine_hidden})')
         if self.params.readout == 'linear':
             self.W_final = nn.Linear(self.readout_dim, 1, bias=False)
         elif self.params.readout == 'pair_mlp':
@@ -713,10 +780,10 @@ class GNN_auto(torch.nn.Module):
 
         return batch_idxs, abs_idxs, query_sub_idxs, edge_batch_idxs, batch_sampled_edges, stats
 
-    def _apply_readout_refine(self, hidden):
+    def _apply_readout_refine(self, real_hidden, anchor_hidden):
         if self.use_readout_refine:
-            return hidden + self.readout_refine(hidden)
-        return hidden
+            return self.readout_refine(real_hidden, anchor_hidden)
+        return real_hidden, anchor_hidden
 
     def _update_query_state(self, layer_idx, query_state, edge_batch_idxs, batch_sampled_edges, edge_alpha, batch_size):
         if (not self.use_progressive_query) or edge_alpha is None:
@@ -778,8 +845,6 @@ class GNN_auto(torch.nn.Module):
         h0 = torch.zeros((1, n_node, self.hidden_dim), device=device)
         hidden = torch.zeros(n_node, self.hidden_dim, device=device)
         q_embed = self.query_rela_embed(q_rel) if hasattr(self, 'query_rela_embed') else None
-        if self.use_input_refine and q_embed is not None:
-            q_embed = self.input_refine(q_embed)
         q_state = q_embed if self.use_progressive_query else None
         progressive_query_stats = {
             'enabled': 1.0,
@@ -845,7 +910,9 @@ class GNN_auto(torch.nn.Module):
             hidden, h0 = self.gate(hidden.unsqueeze(0), h0)
             hidden = hidden.squeeze(0)
             if self.use_layer_refine:
-                hidden = self.layer_refine[i](hidden)
+                query_condition = q_state if q_state is not None else q_embed
+                node_query_condition = query_condition[batch_idxs] if query_condition is not None else None
+                hidden = self.layer_refine[i](hidden, node_query_condition)
                 h0 = hidden.unsqueeze(0)
             hidden = hidden * (1-act_signal).unsqueeze(-1)
             h0 = h0 * (1-act_signal).unsqueeze(-1).unsqueeze(0)
@@ -867,9 +934,9 @@ class GNN_auto(torch.nn.Module):
 
         # readout
         if self.params.concatHidden: hidden = torch.cat(hidden_list, dim=-1)
-        hidden = self._apply_readout_refine(hidden)
         real_hidden = hidden[:n_real_nodes]
         anchor_hidden = hidden[query_sub_idxs][batch_idxs]
+        real_hidden, anchor_hidden = self._apply_readout_refine(real_hidden, anchor_hidden)
         scores = self._compute_scores(real_hidden, anchor_hidden)
 
         scores_all = torch.zeros((n, self.loader.n_ent)).cuda()
