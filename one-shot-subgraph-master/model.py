@@ -378,12 +378,12 @@ class GNNLayer(torch.nn.Module):
     def _compute_alpha(self, hs, hr, h_qr):
         return torch.sigmoid(self.w_alpha(nn.ReLU()(self.Ws_attn(hs) + self.Wr_attn(hr) + self.Wqr_attn(h_qr))))
 
-    def forward(self, q_sub, q_rel, r_idx, hidden, edges, n_node, shortcut=False, edge_weights=None, return_alpha=False, q_embed=None):
+    def forward(self, q_sub, q_rel, r_idx, hidden, edges, n_node, shortcut=False, edge_weights=None, return_alpha=False, q_embed=None, rel_embed=None):
         sub = edges[:,0]
         rel = edges[:,1]
         obj = edges[:,2]
         hs = hidden[sub]
-        hr = self.rela_embed(rel)
+        hr = self.rela_embed(rel) if rel_embed is None else rel_embed
         if q_embed is None:
             h_qr = self.rela_embed(q_rel)[r_idx]
         else:
@@ -487,25 +487,24 @@ class GNN_auto(torch.nn.Module):
             self.path_init_proj = nn.Linear(self.hidden_dim, self.path_hidden_dim, bias=False)
             self.path_norm = nn.LayerNorm(self.path_hidden_dim)
         if self.use_alp:
-            self.alp_gate = nn.Sequential(
-                nn.Linear(self.hidden_dim * 3 + self.path_hidden_dim, self.alp_hidden_dim),
-                nn.ReLU(),
-                nn.Dropout(self.alp_dropout),
-                nn.Linear(self.alp_hidden_dim, 1),
-                nn.Sigmoid(),
-            )
+            self.alp_node_score = nn.Linear(self.hidden_dim, 1, bias=False)
+            self.alp_path_score = nn.Linear(self.path_hidden_dim, 1, bias=False)
+            self.alp_rel_proj = nn.Linear(self.hidden_dim, self.alp_hidden_dim, bias=False)
+            self.alp_query_proj = nn.Linear(self.hidden_dim, self.alp_hidden_dim, bias=False)
+            self.alp_gate_dropout = nn.Dropout(self.alp_dropout)
             print(
                 '==> ALP: enabled '
                 f'(alp_hidden_dim={self.alp_hidden_dim}, path_hidden_dim={self.path_hidden_dim}, '
                 f'dropout={self.alp_dropout})'
             )
         if self.use_qpcr:
-            self.path_message_mlp = nn.Sequential(
-                nn.Linear(self.path_hidden_dim + self.hidden_dim * 2, self.path_mlp_hidden),
+            self.path_node_update = nn.Sequential(
+                nn.Linear(self.hidden_dim * 3, self.path_mlp_hidden),
                 nn.ReLU(),
                 nn.Dropout(params.dropout),
                 nn.Linear(self.path_mlp_hidden, self.path_hidden_dim),
             )
+            self.path_state_gru = nn.GRUCell(self.path_hidden_dim, self.path_hidden_dim)
             self.path_to_hidden = nn.Linear(self.path_hidden_dim, self.hidden_dim, bias=False)
             self.path_to_readout = nn.Linear(self.path_hidden_dim, self.readout_dim, bias=False)
             self.path_summary_net = nn.Sequential(
@@ -562,62 +561,48 @@ class GNN_auto(torch.nn.Module):
         denom = scatter(stabilized, index=index, dim=0, dim_size=dim_size, reduce='sum')
         return stabilized / (denom[index] + 1e-12)
 
-    def _compute_alp_gate(self, layer_idx, hidden, path_state, q_state, edge_batch_idxs, batch_sampled_edges):
+    def _weighted_mean(self, values, weights, index, dim_size):
+        weighted_sum = scatter(
+            weights.unsqueeze(-1) * values,
+            index=index,
+            dim=0,
+            dim_size=dim_size,
+            reduce='sum',
+        )
+        weight_sum = scatter(
+            weights,
+            index=index,
+            dim=0,
+            dim_size=dim_size,
+            reduce='sum',
+        ).unsqueeze(-1)
+        return weighted_sum / (weight_sum + 1e-12)
+
+    def _compute_alp_gate(self, hidden, path_state, q_state, edge_batch_idxs, batch_sampled_edges, rel_embed):
         if not self.use_alp:
             return None
         sub = batch_sampled_edges[:, 0]
-        rel = batch_sampled_edges[:, 1]
-        rel_embed = self.gnn_layers[layer_idx].rela_embed(rel)
-        gate_input = torch.cat(
-            [
-                hidden[sub],
-                rel_embed,
-                q_state[edge_batch_idxs],
-                path_state[sub],
-            ],
-            dim=-1,
-        )
-        return self.alp_gate(gate_input).squeeze(-1)
+        node_score = self.alp_node_score(hidden[sub]).squeeze(-1)
+        path_score = self.alp_path_score(path_state[sub]).squeeze(-1)
+        rel_score = self.alp_gate_dropout(self.alp_rel_proj(rel_embed))
+        query_score = self.alp_query_proj(q_state[edge_batch_idxs])
+        rq_score = (rel_score * query_score).sum(dim=-1) / (self.alp_hidden_dim ** 0.5)
+        return torch.sigmoid(node_score + path_score + rq_score)
 
-    def _update_path_state(self, layer_idx, path_state, q_state, edge_batch_idxs, batch_sampled_edges, omega, n_node):
+    def _update_path_state(self, layer_hidden, path_state, q_state, batch_idxs, batch_sampled_edges, omega, n_node, rel_embed):
         if not self.use_qpcr:
             return path_state
-        sub = batch_sampled_edges[:, 0]
-        rel = batch_sampled_edges[:, 1]
         obj = batch_sampled_edges[:, 2]
-        rel_embed = self.gnn_layers[layer_idx].rela_embed(rel)
-        path_delta = self.path_message_mlp(
-            torch.cat([path_state[sub], rel_embed, q_state[edge_batch_idxs]], dim=-1)
+        rel_context = self._weighted_mean(rel_embed, omega, obj, n_node)
+        path_input = self.path_node_update(
+            torch.cat([layer_hidden, rel_context, q_state[batch_idxs]], dim=-1)
         )
-        path_agg = scatter(
-            omega.unsqueeze(-1) * path_delta,
-            index=obj,
-            dim=0,
-            dim_size=n_node,
-            reduce='sum',
-        )
-        return self.path_norm(path_state + path_agg)
+        return self.path_norm(self.path_state_gru(path_input, path_state))
 
-    def _update_query_state(self, layer_idx, hidden, path_state, q_state, batch_idxs, edge_batch_idxs, batch_sampled_edges, omega, batch_size):
+    def _update_query_state(self, hidden, path_state, q_state, batch_idxs, edge_batch_idxs, omega, batch_size, rel_embed):
         if not self.use_qpcr:
             return q_state
-        rel = batch_sampled_edges[:, 1]
-        rel_embed = self.gnn_layers[layer_idx].rela_embed(rel)
-        rel_context = scatter(
-            omega.unsqueeze(-1) * rel_embed,
-            index=edge_batch_idxs,
-            dim=0,
-            dim_size=batch_size,
-            reduce='sum',
-        )
-        omega_sum = scatter(
-            omega,
-            index=edge_batch_idxs,
-            dim=0,
-            dim_size=batch_size,
-            reduce='sum',
-        ).unsqueeze(-1)
-        rel_context = rel_context / (omega_sum + 1e-12)
+        rel_context = self._weighted_mean(rel_embed, omega, edge_batch_idxs, batch_size)
 
         node_logits = self.path_summary_net(
             torch.cat([hidden, path_state, q_state[batch_idxs]], dim=-1)
@@ -703,15 +688,16 @@ class GNN_auto(torch.nn.Module):
             #     curr_nv = n_virtual
             # # ========== End Module 2 ==========
 
-            edge_gate = self._compute_alp_gate(i, hidden, path_state, q_state, edge_batch_idxs, batch_sampled_edges)
+            rel_embed = self.gnn_layers[i].rela_embed(batch_sampled_edges[:, 1])
+            edge_gate = self._compute_alp_gate(hidden, path_state, q_state, edge_batch_idxs, batch_sampled_edges, rel_embed)
             layer_hidden, edge_alpha = self.gnn_layers[i](
                 q_sub, q_rel, edge_batch_idxs, hidden, batch_sampled_edges, n_node,
-                shortcut=self.params.shortcut, edge_weights=edge_gate, return_alpha=True, q_embed=q_state
+                shortcut=self.params.shortcut, edge_weights=edge_gate, return_alpha=True, q_embed=q_state, rel_embed=rel_embed
             )
             omega = edge_alpha if edge_gate is None else edge_alpha * edge_gate
             if self.use_qpcr:
                 path_state = self._update_path_state(
-                    i, path_state, q_state, edge_batch_idxs, batch_sampled_edges, omega, n_node
+                    layer_hidden, path_state, q_state, batch_idxs, batch_sampled_edges, omega, n_node, rel_embed
                 )
                 path_hidden = self.path_to_hidden(path_state)
                 if self.use_path_fusion:
@@ -730,8 +716,8 @@ class GNN_auto(torch.nn.Module):
             h0 = h0 * (1-act_signal).unsqueeze(-1).unsqueeze(0)
             if self.use_qpcr:
                 q_state = self._update_query_state(
-                    i, hidden, path_state, q_state, batch_idxs,
-                    edge_batch_idxs, batch_sampled_edges, omega, n
+                    hidden, path_state, q_state, batch_idxs,
+                    edge_batch_idxs, omega, n, rel_embed
                 )
 
             if self.params.concatHidden: hidden_list.append(hidden)
