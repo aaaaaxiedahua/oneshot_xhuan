@@ -37,8 +37,43 @@ class BaseModel(object):
     def _build_optimizer(self):
         default_lr = float(self.args.lr)
         default_wd = float(self.args.lamb)
-        default_params = [p for p in self.model.parameters() if p.requires_grad]
-        return Adam([{'params': default_params, 'lr': default_lr, 'weight_decay': default_wd}])
+        special_groups = []
+        covered_param_ids = set()
+
+        def add_special_group(module_name, lr_attr, wd_attr):
+            module = getattr(self.model, module_name, None)
+            if module is None:
+                return
+
+            params = [p for p in module.parameters() if p.requires_grad]
+            if len(params) == 0:
+                return
+
+            for p in params:
+                covered_param_ids.add(id(p))
+
+            group_lr = float(getattr(self.args, lr_attr, -1.0))
+            if group_lr <= 0:
+                group_lr = default_lr
+
+            group_wd = float(getattr(self.args, wd_attr, -1.0))
+            if group_wd < 0:
+                group_wd = default_wd
+
+            special_groups.append({'params': params, 'lr': group_lr, 'weight_decay': group_wd})
+
+        add_special_group('path_fusion_mlp', 'path_fusion_lr', 'path_fusion_weight_decay')
+
+        default_params = [
+            p for p in self.model.parameters()
+            if p.requires_grad and id(p) not in covered_param_ids
+        ]
+
+        param_groups = []
+        if len(default_params) > 0:
+            param_groups.append({'params': default_params, 'lr': default_lr, 'weight_decay': default_wd})
+        param_groups.extend(special_groups)
+        return Adam(param_groups)
         
     def saveModelToFiles(self, args, best_metric, deleteLastFile=True):
         budget_tag = f'topk_{self.args.topk}'

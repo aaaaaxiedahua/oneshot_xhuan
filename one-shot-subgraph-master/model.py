@@ -422,6 +422,38 @@ class GNN_auto(torch.nn.Module):
         acts = {'relu': nn.ReLU(), 'tanh': torch.tanh, 'idd': lambda x:x}
         act = acts[params.act]
         self.n_extra_rel = 2 if bool(getattr(params, 'add_manual_edges', False)) else 0
+        self.use_alp = bool(getattr(params, 'use_alp', False))
+        self.use_qpcr = bool(getattr(params, 'use_qpcr', False))
+        self.use_path_fusion = bool(getattr(params, 'use_path_fusion', False))
+        if self.use_path_fusion and not self.use_qpcr:
+            raise ValueError('`use_path_fusion` requires `use_qpcr`.')
+        self.alp_hidden_dim = int(getattr(params, 'alp_hidden_dim', -1))
+        if self.alp_hidden_dim <= 0:
+            self.alp_hidden_dim = self.hidden_dim
+        self.path_hidden_dim = int(getattr(params, 'path_hidden_dim', -1))
+        if self.path_hidden_dim <= 0:
+            self.path_hidden_dim = self.hidden_dim
+        self.path_mlp_hidden = int(getattr(params, 'path_mlp_hidden', -1))
+        if self.path_mlp_hidden <= 0:
+            self.path_mlp_hidden = self.hidden_dim
+        self.query_path_hidden = int(getattr(params, 'query_path_hidden', -1))
+        if self.query_path_hidden <= 0:
+            self.query_path_hidden = self.hidden_dim
+        self.path_fusion_hidden = int(getattr(params, 'path_fusion_hidden', -1))
+        if self.path_fusion_hidden <= 0:
+            self.path_fusion_hidden = self.hidden_dim
+        self.alp_dropout = float(getattr(params, 'alp_dropout', -1.0))
+        if self.alp_dropout < 0:
+            self.alp_dropout = float(params.dropout)
+        self.path_fusion_dropout = float(getattr(params, 'path_fusion_dropout', -1.0))
+        if self.path_fusion_dropout < 0:
+            self.path_fusion_dropout = float(params.dropout)
+        self.evidence_eta = float(getattr(params, 'evidence_eta', 0.2))
+        self.query_residual = float(getattr(params, 'query_residual', 0.7))
+        if self.evidence_eta < 0:
+            raise ValueError('`evidence_eta` must be non-negative.')
+        if self.query_residual < 0 or self.query_residual > 1:
+            raise ValueError('`query_residual` must be in [0, 1].')
 
         # # ========== Module 2 ==========
         # self.use_rca = hasattr(params, 'use_rca') and params.use_rca
@@ -445,12 +477,67 @@ class GNN_auto(torch.nn.Module):
         self.dropout = nn.Dropout(params.dropout)
         self.gate = nn.GRU(self.hidden_dim, self.hidden_dim)
 
-        need_query_rela_embed = self.params.initializer == 'relation'
+        need_query_rela_embed = self.params.initializer == 'relation' or self.use_alp or self.use_qpcr
         if need_query_rela_embed:
             self.query_rela_embed = nn.Embedding(2*self.n_rel+1, self.hidden_dim)
         self.readout_dim = self.hidden_dim * (self.n_layer + 1) if self.params.concatHidden else self.hidden_dim
         if self.params.readout == 'linear':
             self.W_final = nn.Linear(self.readout_dim, 1, bias=False)
+        if self.use_alp or self.use_qpcr:
+            self.path_init_proj = nn.Linear(self.hidden_dim, self.path_hidden_dim, bias=False)
+            self.path_norm = nn.LayerNorm(self.path_hidden_dim)
+        if self.use_alp:
+            self.alp_gate = nn.Sequential(
+                nn.Linear(self.hidden_dim * 3 + self.path_hidden_dim, self.alp_hidden_dim),
+                nn.ReLU(),
+                nn.Dropout(self.alp_dropout),
+                nn.Linear(self.alp_hidden_dim, 1),
+                nn.Sigmoid(),
+            )
+            print(
+                '==> ALP: enabled '
+                f'(alp_hidden_dim={self.alp_hidden_dim}, path_hidden_dim={self.path_hidden_dim}, '
+                f'dropout={self.alp_dropout})'
+            )
+        if self.use_qpcr:
+            self.path_message_mlp = nn.Sequential(
+                nn.Linear(self.path_hidden_dim + self.hidden_dim * 2, self.path_mlp_hidden),
+                nn.ReLU(),
+                nn.Dropout(params.dropout),
+                nn.Linear(self.path_mlp_hidden, self.path_hidden_dim),
+            )
+            self.path_to_hidden = nn.Linear(self.path_hidden_dim, self.hidden_dim, bias=False)
+            self.path_to_readout = nn.Linear(self.path_hidden_dim, self.readout_dim, bias=False)
+            self.path_summary_net = nn.Sequential(
+                nn.Linear(self.hidden_dim * 2 + self.path_hidden_dim, self.query_path_hidden),
+                nn.ReLU(),
+                nn.Dropout(params.dropout),
+                nn.Linear(self.query_path_hidden, 1),
+            )
+            self.query_update_net = nn.Sequential(
+                nn.Linear(self.hidden_dim * 2 + self.path_hidden_dim, self.query_path_hidden),
+                nn.ReLU(),
+                nn.Dropout(params.dropout),
+                nn.Linear(self.query_path_hidden, self.hidden_dim),
+            )
+            self.query_norm = nn.LayerNorm(self.hidden_dim)
+            print(
+                '==> QPCR: enabled '
+                f'(path_hidden_dim={self.path_hidden_dim}, path_mlp_hidden={self.path_mlp_hidden}, '
+                f'query_path_hidden={self.query_path_hidden}, evidence_eta={self.evidence_eta}, '
+                f'query_residual={self.query_residual})'
+            )
+        if self.use_path_fusion:
+            self.path_fusion_mlp = nn.Sequential(
+                nn.Linear(self.hidden_dim * 2, self.path_fusion_hidden),
+                nn.ReLU(),
+                nn.Dropout(self.path_fusion_dropout),
+                nn.Linear(self.path_fusion_hidden, self.hidden_dim),
+            )
+            print(
+                '==> PathFusion: enabled '
+                f'(hidden={self.path_fusion_hidden}, dropout={self.path_fusion_dropout})'
+            )
 
         # # ========== Module 2: Create Relation Composer(s) ==========
         # if self.use_rca:
@@ -468,6 +555,88 @@ class GNN_auto(torch.nn.Module):
         #     else:
         #         self.relation_composer = RelationComposer(**composer_kwargs)
         # # ========== End Module 2 ==========
+
+    def _scatter_softmax(self, values, index, dim_size):
+        max_values = scatter(values, index=index, dim=0, dim_size=dim_size, reduce='max')
+        stabilized = torch.exp(values - max_values[index])
+        denom = scatter(stabilized, index=index, dim=0, dim_size=dim_size, reduce='sum')
+        return stabilized / (denom[index] + 1e-12)
+
+    def _compute_alp_gate(self, layer_idx, hidden, path_state, q_state, edge_batch_idxs, batch_sampled_edges):
+        if not self.use_alp:
+            return None
+        sub = batch_sampled_edges[:, 0]
+        rel = batch_sampled_edges[:, 1]
+        rel_embed = self.gnn_layers[layer_idx].rela_embed(rel)
+        gate_input = torch.cat(
+            [
+                hidden[sub],
+                rel_embed,
+                q_state[edge_batch_idxs],
+                path_state[sub],
+            ],
+            dim=-1,
+        )
+        return self.alp_gate(gate_input).squeeze(-1)
+
+    def _update_path_state(self, layer_idx, path_state, q_state, edge_batch_idxs, batch_sampled_edges, omega, n_node):
+        if not self.use_qpcr:
+            return path_state
+        sub = batch_sampled_edges[:, 0]
+        rel = batch_sampled_edges[:, 1]
+        obj = batch_sampled_edges[:, 2]
+        rel_embed = self.gnn_layers[layer_idx].rela_embed(rel)
+        path_delta = self.path_message_mlp(
+            torch.cat([path_state[sub], rel_embed, q_state[edge_batch_idxs]], dim=-1)
+        )
+        path_agg = scatter(
+            omega.unsqueeze(-1) * path_delta,
+            index=obj,
+            dim=0,
+            dim_size=n_node,
+            reduce='sum',
+        )
+        return self.path_norm(path_state + path_agg)
+
+    def _update_query_state(self, layer_idx, hidden, path_state, q_state, batch_idxs, edge_batch_idxs, batch_sampled_edges, omega, batch_size):
+        if not self.use_qpcr:
+            return q_state
+        rel = batch_sampled_edges[:, 1]
+        rel_embed = self.gnn_layers[layer_idx].rela_embed(rel)
+        rel_context = scatter(
+            omega.unsqueeze(-1) * rel_embed,
+            index=edge_batch_idxs,
+            dim=0,
+            dim_size=batch_size,
+            reduce='sum',
+        )
+        omega_sum = scatter(
+            omega,
+            index=edge_batch_idxs,
+            dim=0,
+            dim_size=batch_size,
+            reduce='sum',
+        ).unsqueeze(-1)
+        rel_context = rel_context / (omega_sum + 1e-12)
+
+        node_logits = self.path_summary_net(
+            torch.cat([hidden, path_state, q_state[batch_idxs]], dim=-1)
+        ).squeeze(-1)
+        node_weights = self._scatter_softmax(node_logits, batch_idxs, batch_size)
+        path_summary = scatter(
+            node_weights.unsqueeze(-1) * path_state,
+            index=batch_idxs,
+            dim=0,
+            dim_size=batch_size,
+            reduce='sum',
+        )
+
+        q_delta = self.query_update_net(
+            torch.cat([q_state, rel_context, path_summary], dim=-1)
+        )
+        q_candidate = q_state + self.evidence_eta * q_delta
+        q_next = self.query_residual * q_state + (1.0 - self.query_residual) * q_candidate
+        return self.query_norm(q_next)
 
     def _compute_scores(self, real_hidden, anchor_hidden):
         if self.params.readout == 'linear':
@@ -488,6 +657,8 @@ class GNN_auto(torch.nn.Module):
         h0 = torch.zeros((1, n_node, self.hidden_dim), device=device)
         hidden = torch.zeros(n_node, self.hidden_dim, device=device)
         q_embed = self.query_rela_embed(q_rel) if hasattr(self, 'query_rela_embed') else None
+        q_state = q_embed
+        path_state = None
 
         # # ========== Module 2: Generate virtual edges ==========
         # edge_weights = None
@@ -509,6 +680,11 @@ class GNN_auto(torch.nn.Module):
             hidden[query_sub_idxs, :] = 1
         elif self.params.initializer == 'relation':
             hidden[query_sub_idxs, :] = q_embed
+        if self.use_alp or self.use_qpcr:
+            path_state = torch.zeros((n_node, self.path_hidden_dim), device=device)
+            if q_embed is None:
+                raise ValueError('ALP/QPCR requires query relation embeddings to be available.')
+            path_state[query_sub_idxs, :] = self.path_init_proj(q_embed)
 
         if self.params.concatHidden: hidden_list = [hidden]
 
@@ -527,22 +703,43 @@ class GNN_auto(torch.nn.Module):
             #     curr_nv = n_virtual
             # # ========== End Module 2 ==========
 
-            hidden = self.gnn_layers[i](
+            edge_gate = self._compute_alp_gate(i, hidden, path_state, q_state, edge_batch_idxs, batch_sampled_edges)
+            layer_hidden, edge_alpha = self.gnn_layers[i](
                 q_sub, q_rel, edge_batch_idxs, hidden, batch_sampled_edges, n_node,
-                shortcut=self.params.shortcut, edge_weights=None
+                shortcut=self.params.shortcut, edge_weights=edge_gate, return_alpha=True, q_embed=q_state
             )
+            omega = edge_alpha if edge_gate is None else edge_alpha * edge_gate
+            if self.use_qpcr:
+                path_state = self._update_path_state(
+                    i, path_state, q_state, edge_batch_idxs, batch_sampled_edges, omega, n_node
+                )
+                path_hidden = self.path_to_hidden(path_state)
+                if self.use_path_fusion:
+                    fusion_delta = self.path_fusion_mlp(
+                        torch.cat([layer_hidden, path_hidden], dim=-1)
+                    )
+                    layer_hidden = layer_hidden + fusion_delta
+                else:
+                    layer_hidden = layer_hidden + path_hidden
 
-            act_signal = (hidden.sum(-1) == 0).detach().int()
-            hidden = self.dropout(hidden)
-            hidden, h0 = self.gate(hidden.unsqueeze(0), h0)
-            hidden = hidden.squeeze(0)
+            act_signal = (layer_hidden.sum(-1) == 0).detach().int()
+            layer_hidden = self.dropout(layer_hidden)
+            layer_hidden, h0 = self.gate(layer_hidden.unsqueeze(0), h0)
+            hidden = layer_hidden.squeeze(0)
             hidden = hidden * (1-act_signal).unsqueeze(-1)
             h0 = h0 * (1-act_signal).unsqueeze(-1).unsqueeze(0)
+            if self.use_qpcr:
+                q_state = self._update_query_state(
+                    i, hidden, path_state, q_state, batch_idxs,
+                    edge_batch_idxs, batch_sampled_edges, omega, n
+                )
 
             if self.params.concatHidden: hidden_list.append(hidden)
 
         # readout
         if self.params.concatHidden: hidden = torch.cat(hidden_list, dim=-1)
+        if self.use_qpcr:
+            hidden = hidden + self.path_to_readout(path_state)
         real_hidden = hidden[:n_real_nodes]
         anchor_hidden = hidden[query_sub_idxs][batch_idxs]
         scores = self._compute_scores(real_hidden, anchor_hidden)

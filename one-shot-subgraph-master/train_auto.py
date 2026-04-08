@@ -25,6 +25,20 @@ parser.add_argument('--add_manual_edges', action='store_true')
 parser.add_argument('--remove_1hop_edges', action='store_true')
 parser.add_argument('--only_eval', action='store_true')
 parser.add_argument('--not_shuffle_train', action='store_true')
+parser.add_argument('--use_alp', action='store_true')
+parser.add_argument('--alp_hidden_dim', type=int, default=-1)
+parser.add_argument('--alp_dropout', type=float, default=-1.0)
+parser.add_argument('--use_qpcr', action='store_true')
+parser.add_argument('--path_hidden_dim', type=int, default=-1)
+parser.add_argument('--path_mlp_hidden', type=int, default=-1)
+parser.add_argument('--query_path_hidden', type=int, default=-1)
+parser.add_argument('--evidence_eta', type=float, default=0.2)
+parser.add_argument('--query_residual', type=float, default=0.7)
+parser.add_argument('--use_path_fusion', action='store_true')
+parser.add_argument('--path_fusion_hidden', type=int, default=-1)
+parser.add_argument('--path_fusion_dropout', type=float, default=-1.0)
+parser.add_argument('--path_fusion_lr', type=float, default=-1.0)
+parser.add_argument('--path_fusion_weight_decay', type=float, default=-1.0)
 # # ========== Module 1: Relation-Path Conditioned Sampling args ==========
 # parser.add_argument('--use_rel_prior', action='store_true')         # enable path-based relation prior
 # parser.add_argument('--rel_path_topk', type=int, default=10)        # top-K relation path patterns per relation
@@ -38,6 +52,9 @@ parser.add_argument('--not_shuffle_train', action='store_true')
 # parser.add_argument('--rca_mode', type=str, default='shared')       # shared / per_layer
 # parser.add_argument('--compose_max_hop', type=int, default=2)       # max composition hops: 2 or 3
 args = parser.parse_args()
+
+if args.use_path_fusion and not args.use_qpcr:
+    raise ValueError('`--use_path_fusion` requires `--use_qpcr`.')
 
 class Options(object):
     pass

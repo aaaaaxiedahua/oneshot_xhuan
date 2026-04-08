@@ -36,6 +36,40 @@ HPO_search_space = {
         'dropout':               ('uniform', (0, 0.2)),
     }
 
+def build_alp_search_space(use_alp):
+    space = {}
+    if use_alp:
+        space['alp_hidden_dim'] = ('choice', [32, 64, 128, 256])
+        space['alp_dropout'] = ('uniform', (0.0, 0.3))
+    return space
+
+
+def build_path_state_search_space(enable):
+    space = {}
+    if enable:
+        space['path_hidden_dim'] = ('choice', [32, 64, 128, 256])
+    return space
+
+
+def build_qpcr_search_space(use_qpcr):
+    space = {}
+    if use_qpcr:
+        space['path_mlp_hidden'] = ('choice', [32, 64, 128, 256])
+        space['query_path_hidden'] = ('choice', [32, 64, 128, 256])
+        space['evidence_eta'] = ('uniform', (0.05, 0.5))
+        space['query_residual'] = ('uniform', (0.3, 0.9))
+    return space
+
+
+def build_path_fusion_search_space(use_path_fusion):
+    space = {}
+    if use_path_fusion:
+        space['path_fusion_hidden'] = ('choice', [32, 64, 128, 256])
+        space['path_fusion_dropout'] = ('uniform', (0.0, 0.3))
+        space['path_fusion_lr'] = ('choice', [1e-3, 5e-4, 1e-4, 5e-5])
+        space['path_fusion_weight_decay'] = ('uniform', (1e-6, 1e-3))
+    return space
+
 # # ========== Module 1: Relation-Path Conditioned Sampling search space ==========
 # HPO_search_space_M1 = {
 #         'rel_path_topk':         ('choice', [5, 10, 20, 50]),
@@ -79,6 +113,20 @@ parser.add_argument('--optuna_startup_trials', type=int, default=10)
 parser.add_argument('--optuna_min_resource', type=int, default=1)
 parser.add_argument('--optuna_reduction_factor', type=int, default=3)
 parser.add_argument('--not_shuffle_train', action='store_true')
+parser.add_argument('--use_alp', action='store_true')
+parser.add_argument('--alp_hidden_dim', type=int, default=-1)
+parser.add_argument('--alp_dropout', type=float, default=-1.0)
+parser.add_argument('--use_qpcr', action='store_true')
+parser.add_argument('--path_hidden_dim', type=int, default=-1)
+parser.add_argument('--path_mlp_hidden', type=int, default=-1)
+parser.add_argument('--query_path_hidden', type=int, default=-1)
+parser.add_argument('--evidence_eta', type=float, default=0.2)
+parser.add_argument('--query_residual', type=float, default=0.7)
+parser.add_argument('--use_path_fusion', action='store_true')
+parser.add_argument('--path_fusion_hidden', type=int, default=-1)
+parser.add_argument('--path_fusion_dropout', type=float, default=-1.0)
+parser.add_argument('--path_fusion_lr', type=float, default=-1.0)
+parser.add_argument('--path_fusion_weight_decay', type=float, default=-1.0)
 # # ========== Module 1: Relation-Path Conditioned Sampling args ==========
 # parser.add_argument('--use_rel_prior', action='store_true')         # enable path-based relation prior
 # parser.add_argument('--rel_path_topk', type=int, default=10)        # top-K relation path patterns per relation
@@ -92,6 +140,9 @@ parser.add_argument('--not_shuffle_train', action='store_true')
 # parser.add_argument('--rca_mode', type=str, default='shared')       # shared / per_layer
 # parser.add_argument('--compose_max_hop', type=int, default=2)       # max composition hops: 2 or 3
 args = parser.parse_args()
+
+if args.use_path_fusion and not args.use_qpcr:
+    raise ValueError('`--use_path_fusion` requires `--use_qpcr`.')
 
 
 def _sample_one_from_space(space):
@@ -231,6 +282,17 @@ if __name__ == '__main__':
     args.n_batch = args.n_tbatch = int(args.batchsize)
     
     assert args.search or args.finetune
+    if args.use_alp or args.use_qpcr:
+        HPO_search_space.update(build_path_state_search_space(args.use_alp or args.use_qpcr))
+    if args.use_alp:
+        HPO_search_space.update(build_alp_search_space(args.use_alp))
+        print('==> HPO: added ALP search space')
+    if args.use_qpcr:
+        HPO_search_space.update(build_qpcr_search_space(args.use_qpcr))
+        print('==> HPO: added QPCR search space')
+    if args.use_path_fusion:
+        HPO_search_space.update(build_path_fusion_search_space(args.use_path_fusion))
+        print('==> HPO: added PathFusion search space')
 
     # # conditionally extend search space based on enabled modules
     # if args.use_rel_prior:
@@ -279,9 +341,13 @@ if __name__ == '__main__':
         data = pkl.load(open(file, 'rb'))
         config_list, mrr_list = [], []
         skipped = 0
+        required_keys = set(HPO_search_space.keys())
         for HP_key, HP_values in data.items():
             (best_mrr, best_test_mrr, params, opts) = HP_values
             cfg = {k: v for k, v in _populate_legacy_defaults(params).items() if k in HPO_search_space}
+            if not required_keys.issubset(cfg.keys()):
+                skipped += 1
+                continue
             try:
                 cfg = _normalize_start_configs([cfg], HPO_search_space, fill_missing=False)[0]
             except Exception:
@@ -309,6 +375,21 @@ if __name__ == '__main__':
         args.concatHidden = params['concatHidden']
         args.shortcut = params['shortcut']
         args.readout = params['readout']
+        if args.use_alp or args.use_qpcr:
+            args.path_hidden_dim = int(params['path_hidden_dim'])
+        if args.use_alp:
+            args.alp_hidden_dim = int(params['alp_hidden_dim'])
+            args.alp_dropout = float(params['alp_dropout'])
+        if args.use_qpcr:
+            args.path_mlp_hidden = int(params['path_mlp_hidden'])
+            args.query_path_hidden = int(params['query_path_hidden'])
+            args.evidence_eta = float(params['evidence_eta'])
+            args.query_residual = float(params['query_residual'])
+        if args.use_path_fusion:
+            args.path_fusion_hidden = int(params['path_fusion_hidden'])
+            args.path_fusion_dropout = float(params['path_fusion_dropout'])
+            args.path_fusion_lr = float(params['path_fusion_lr'])
+            args.path_fusion_weight_decay = float(params['path_fusion_weight_decay'])
 
         # # Module 1: Relation-Path Conditioned Sampling params
         # if args.use_rel_prior:
@@ -394,8 +475,11 @@ if __name__ == '__main__':
 
             if args.useSearchLog and os.path.exists(HPO_save_path):
                 config_list, mrr_list = loadSearchLog(HPO_save_path)
-                dataset_names = [args.dataset for i in range(len(config_list))]
-                HPO_instance.pretrain(config_list, mrr_list, dataset_names=dataset_names)
+                if len(config_list) > 0:
+                    dataset_names = [args.dataset for i in range(len(config_list))]
+                    HPO_instance.pretrain(config_list, mrr_list, dataset_names=dataset_names)
+                else:
+                    print('==> warning: no compatible legacy trials found for pretraining.')
 
             max_trials, sample_num = 1e10, 1e4
             HPO_instance.runTrials(max_trials, sample_num, explore_trials=1e10, start_candidate=start_candidates)
