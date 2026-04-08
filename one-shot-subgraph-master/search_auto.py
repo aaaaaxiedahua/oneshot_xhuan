@@ -39,35 +39,27 @@ HPO_search_space = {
 def build_alp_search_space(use_alp):
     space = {}
     if use_alp:
-        space['alp_hidden_dim'] = ('choice', [32, 64, 128, 256])
+        space['alp_hidden_dim'] = ('choice', [8, 16, 32, 64])
         space['alp_dropout'] = ('uniform', (0.0, 0.3))
-    return space
-
-
-def build_path_state_search_space(enable):
-    space = {}
-    if enable:
-        space['path_hidden_dim'] = ('choice', [32, 64, 128, 256])
     return space
 
 
 def build_qpcr_search_space(use_qpcr):
     space = {}
     if use_qpcr:
-        space['path_mlp_hidden'] = ('choice', [32, 64, 128, 256])
-        space['query_path_hidden'] = ('choice', [32, 64, 128, 256])
+        space['query_path_hidden'] = ('choice', [16, 32, 64, 128])
         space['evidence_eta'] = ('uniform', (0.05, 0.5))
         space['query_residual'] = ('uniform', (0.3, 0.9))
     return space
 
 
-def build_path_fusion_search_space(use_path_fusion):
+def build_evidence_adapter_search_space(use_evidence_adapter):
     space = {}
-    if use_path_fusion:
-        space['path_fusion_hidden'] = ('choice', [32, 64, 128, 256])
-        space['path_fusion_dropout'] = ('uniform', (0.0, 0.3))
-        space['path_fusion_lr'] = ('choice', [1e-3, 5e-4, 1e-4, 5e-5])
-        space['path_fusion_weight_decay'] = ('uniform', (1e-6, 1e-3))
+    if use_evidence_adapter:
+        space['evidence_adapter_hidden'] = ('choice', [16, 32, 64, 128])
+        space['evidence_adapter_dropout'] = ('uniform', (0.0, 0.3))
+        space['evidence_adapter_lr'] = ('choice', [1e-3, 5e-4, 1e-4, 5e-5])
+        space['evidence_adapter_weight_decay'] = ('uniform', (1e-6, 1e-3))
     return space
 
 # # ========== Module 1: Relation-Path Conditioned Sampling search space ==========
@@ -117,16 +109,14 @@ parser.add_argument('--use_alp', action='store_true')
 parser.add_argument('--alp_hidden_dim', type=int, default=-1)
 parser.add_argument('--alp_dropout', type=float, default=-1.0)
 parser.add_argument('--use_qpcr', action='store_true')
-parser.add_argument('--path_hidden_dim', type=int, default=-1)
-parser.add_argument('--path_mlp_hidden', type=int, default=-1)
 parser.add_argument('--query_path_hidden', type=int, default=-1)
 parser.add_argument('--evidence_eta', type=float, default=0.2)
 parser.add_argument('--query_residual', type=float, default=0.7)
-parser.add_argument('--use_path_fusion', action='store_true')
-parser.add_argument('--path_fusion_hidden', type=int, default=-1)
-parser.add_argument('--path_fusion_dropout', type=float, default=-1.0)
-parser.add_argument('--path_fusion_lr', type=float, default=-1.0)
-parser.add_argument('--path_fusion_weight_decay', type=float, default=-1.0)
+parser.add_argument('--use_evidence_adapter', action='store_true')
+parser.add_argument('--evidence_adapter_hidden', type=int, default=-1)
+parser.add_argument('--evidence_adapter_dropout', type=float, default=-1.0)
+parser.add_argument('--evidence_adapter_lr', type=float, default=-1.0)
+parser.add_argument('--evidence_adapter_weight_decay', type=float, default=-1.0)
 # # ========== Module 1: Relation-Path Conditioned Sampling args ==========
 # parser.add_argument('--use_rel_prior', action='store_true')         # enable path-based relation prior
 # parser.add_argument('--rel_path_topk', type=int, default=10)        # top-K relation path patterns per relation
@@ -141,8 +131,8 @@ parser.add_argument('--path_fusion_weight_decay', type=float, default=-1.0)
 # parser.add_argument('--compose_max_hop', type=int, default=2)       # max composition hops: 2 or 3
 args = parser.parse_args()
 
-if args.use_path_fusion and not args.use_qpcr:
-    raise ValueError('`--use_path_fusion` requires `--use_qpcr`.')
+if args.use_evidence_adapter and not args.use_qpcr:
+    raise ValueError('`--use_evidence_adapter` requires `--use_qpcr`.')
 
 
 def _sample_one_from_space(space):
@@ -282,17 +272,15 @@ if __name__ == '__main__':
     args.n_batch = args.n_tbatch = int(args.batchsize)
     
     assert args.search or args.finetune
-    if args.use_alp or args.use_qpcr:
-        HPO_search_space.update(build_path_state_search_space(args.use_alp or args.use_qpcr))
     if args.use_alp:
         HPO_search_space.update(build_alp_search_space(args.use_alp))
         print('==> HPO: added ALP search space')
     if args.use_qpcr:
         HPO_search_space.update(build_qpcr_search_space(args.use_qpcr))
         print('==> HPO: added QPCR search space')
-    if args.use_path_fusion:
-        HPO_search_space.update(build_path_fusion_search_space(args.use_path_fusion))
-        print('==> HPO: added PathFusion search space')
+    if args.use_evidence_adapter:
+        HPO_search_space.update(build_evidence_adapter_search_space(args.use_evidence_adapter))
+        print('==> HPO: added EvidenceAdapter search space')
 
     # # conditionally extend search space based on enabled modules
     # if args.use_rel_prior:
@@ -375,21 +363,18 @@ if __name__ == '__main__':
         args.concatHidden = params['concatHidden']
         args.shortcut = params['shortcut']
         args.readout = params['readout']
-        if args.use_alp or args.use_qpcr:
-            args.path_hidden_dim = int(params['path_hidden_dim'])
         if args.use_alp:
             args.alp_hidden_dim = int(params['alp_hidden_dim'])
             args.alp_dropout = float(params['alp_dropout'])
         if args.use_qpcr:
-            args.path_mlp_hidden = int(params['path_mlp_hidden'])
             args.query_path_hidden = int(params['query_path_hidden'])
             args.evidence_eta = float(params['evidence_eta'])
             args.query_residual = float(params['query_residual'])
-        if args.use_path_fusion:
-            args.path_fusion_hidden = int(params['path_fusion_hidden'])
-            args.path_fusion_dropout = float(params['path_fusion_dropout'])
-            args.path_fusion_lr = float(params['path_fusion_lr'])
-            args.path_fusion_weight_decay = float(params['path_fusion_weight_decay'])
+        if args.use_evidence_adapter:
+            args.evidence_adapter_hidden = int(params['evidence_adapter_hidden'])
+            args.evidence_adapter_dropout = float(params['evidence_adapter_dropout'])
+            args.evidence_adapter_lr = float(params['evidence_adapter_lr'])
+            args.evidence_adapter_weight_decay = float(params['evidence_adapter_weight_decay'])
 
         # # Module 1: Relation-Path Conditioned Sampling params
         # if args.use_rel_prior:
