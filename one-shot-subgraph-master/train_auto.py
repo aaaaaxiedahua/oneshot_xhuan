@@ -25,25 +25,6 @@ parser.add_argument('--add_manual_edges', action='store_true')
 parser.add_argument('--remove_1hop_edges', action='store_true')
 parser.add_argument('--only_eval', action='store_true')
 parser.add_argument('--not_shuffle_train', action='store_true')
-parser.add_argument('--use_readout_refine', action='store_true')        # enable pair-aware fusion refine before readout
-parser.add_argument('--use_relation_refine', action='store_true')       # enable stage-2 relation refinement on coarse subgraphs
-parser.add_argument('--refine_dim', type=int, default=16)
-parser.add_argument('--refine_steps', type=int, default=2)
-parser.add_argument('--refine_eta', type=float, default=0.3)
-parser.add_argument('--final_topk', type=float, default=-1.0)           # final node ratio after relation refinement
-parser.add_argument('--use_progressive_query', action='store_true')     # enable layer-wise query state updates
-parser.add_argument('--query_update_hidden', type=int, default=64)      # hidden size of the query updater MLP
-parser.add_argument('--query_lr', type=float, default=-1.0)             # optimizer lr for query updater (-1 => use global lr)
-parser.add_argument('--query_weight_decay', type=float, default=-1.0)   # optimizer wd for query updater (-1 => use global wd)
-parser.add_argument('--use_layer_refine', action='store_true')          # query-conditioned gated FFN after each GRU update
-parser.add_argument('--layer_hidden_dim', type=int, default=-1)         # hidden size for query-conditioned layer refine
-parser.add_argument('--layer_dropout', type=float, default=-1.0)        # dropout inside layer refine (-1 => use global dropout)
-parser.add_argument('--layer_lr', type=float, default=-1.0)             # optimizer lr for layer FFNs (-1 => use global lr)
-parser.add_argument('--layer_weight_decay', type=float, default=-1.0)   # optimizer wd for layer FFNs (-1 => use global wd)
-parser.add_argument('--readout_hidden_dim', type=int, default=-1)       # hidden size for pair-aware readout refine
-parser.add_argument('--readout_dropout', type=float, default=-1.0)      # dropout inside readout refine (-1 => use global dropout)
-parser.add_argument('--readout_lr', type=float, default=-1.0)           # optimizer lr for readout refine (-1 => use global lr)
-parser.add_argument('--readout_weight_decay', type=float, default=-1.0) # optimizer wd for readout refine (-1 => use global wd)
 # # ========== Module 1: Relation-Path Conditioned Sampling args ==========
 # parser.add_argument('--use_rel_prior', action='store_true')         # enable path-based relation prior
 # parser.add_argument('--rel_path_topk', type=int, default=10)        # top-K relation path patterns per relation
@@ -61,34 +42,11 @@ args = parser.parse_args()
 class Options(object):
     pass
 
-
-def resolve_relation_refine_budget(args):
-    if not getattr(args, 'use_relation_refine', False):
-        return
-
-    coarse_topk = float(args.topk)
-    final_topk = float(getattr(args, 'final_topk', -1.0))
-
-    if final_topk <= 0:
-        final_topk = coarse_topk * 0.7
-
-    if coarse_topk <= 0:
-        raise ValueError('`topk` must be positive when `use_relation_refine=True`.')
-    if final_topk <= 0:
-        raise ValueError('`final_topk` must be positive when `use_relation_refine=True`.')
-    if final_topk - coarse_topk > 1e-12:
-        raise ValueError(
-            f'`final_topk` ({final_topk}) cannot be larger than coarse `topk` ({coarse_topk}).'
-        )
-
-    args.final_topk = float(final_topk)
-
 if __name__ == '__main__':
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     torch.set_num_threads(max(8, args.cpu))
     torch.multiprocessing.set_sharing_strategy('file_system')
-    resolve_relation_refine_budget(args)
     
     dataset = args.data_path
     dataset = dataset.split('/')
