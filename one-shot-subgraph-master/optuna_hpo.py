@@ -58,7 +58,7 @@ class OptunaTPEHyperbandHPO:
         direction: str = "maximize",
         seed: int = 1234,
         metric_name: str = "valid_mrr",
-        n_startup_trials: int = 1,
+        n_startup_trials: int = 3,
         n_ei_candidates: int = 128,
         multivariate: bool = True,
         group: bool = True,

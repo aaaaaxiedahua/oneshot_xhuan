@@ -8,6 +8,7 @@ from load_data import DataLoader
 from base_model import BaseModel
 from utils import *
 from base_HPO import RF_HPO
+from optuna_hpo import OptunaTPEHyperbandHPO
 from PPR_sampler import pprSampler
 
 HPO_search_space = {
@@ -48,6 +49,12 @@ parser.add_argument('--search', action='store_true')
 parser.add_argument('--finetune', action='store_true')
 parser.add_argument('--finetune_config', type=str, default='')
 parser.add_argument('--not_shuffle_train', action='store_true')
+parser.add_argument('--hpo_backend', type=str, choices=['legacy', 'optuna'], default='legacy')
+parser.add_argument('--max_trials', type=int, default=10000000000)
+parser.add_argument('--optuna_study_name', type=str, default='')
+parser.add_argument('--optuna_storage', type=str, default='')
+parser.add_argument('--optuna_startup_trials', type=int, default=3)
+parser.add_argument('--optuna_ei_candidates', type=int, default=128)
 parser.add_argument('--use_selective_agg', action='store_true')
 parser.add_argument('--sea_hidden_dim', type=int, default=0)
 parser.add_argument('--sea_dropout', type=float, default=0.0)
@@ -137,7 +144,7 @@ if __name__ == '__main__':
         print(f'==> load {len(config_list)} trials from file: {file}')
         return config_list, mrr_list
     
-    def run_model(params, save_path=HPO_save_path, finetune_idx=-1):       
+    def run_model(params, save_path=HPO_save_path, finetune_idx=-1, reporter=None):       
         print(params)
         args.lr = params['lr']
         args.decay_rate = params['decay_rate']
@@ -164,6 +171,8 @@ if __name__ == '__main__':
         for epoch in range(args.epoch):
             # v_mrr, v_h1, v_h10, t_mrr, t_h1, t_h10, out_str = model.train_batch()
             v_mrr, out_str = model.train_batch()
+            if reporter is not None:
+                reporter.report(epoch, v_mrr)
             
             with open(args.perf_file, 'a+') as f:
                 f.write(out_str)
@@ -180,8 +189,8 @@ if __name__ == '__main__':
             else:
                 bearing += 1
                 
-            # early stop (3 as the threshould to boost searching)
-            if bearing >= 3: 
+            # early stop (5 as the threshould to boost searching)
+            if bearing >= 5: 
                 print(f'early stopping at {epoch+1} epoch.')
                 break
         
@@ -205,16 +214,47 @@ if __name__ == '__main__':
 
     # standard HPO pipeline
     if args.search:
-        print('==> HPO search mode')
-        HPO_instance = RF_HPO(kgeModelName='redgnn', obj_function=run_model, dataset_name=args.dataset, HP_info=HPO_search_space, acq='EI')
-        
-        if args.useSearchLog and os.path.exists(HPO_save_path):
-            config_list, mrr_list = loadSearchLog(HPO_save_path)
-            dataset_names = [args.dataset for i in range(len(config_list))]
-            HPO_instance.pretrain(config_list, mrr_list, dataset_names=dataset_names)
-        
-        max_trials, sample_num = 1e10, 1e4
-        HPO_instance.runTrials(max_trials, sample_num, explore_trials=1e10)
+        print(f'==> HPO search mode ({args.hpo_backend} backend)')
+        if args.hpo_backend == 'legacy':
+            HPO_instance = RF_HPO(kgeModelName='redgnn', obj_function=run_model, dataset_name=args.dataset, HP_info=HPO_search_space, acq='EI')
+            
+            if args.useSearchLog and os.path.exists(HPO_save_path):
+                config_list, mrr_list = loadSearchLog(HPO_save_path)
+                dataset_names = [args.dataset for i in range(len(config_list))]
+                HPO_instance.pretrain(config_list, mrr_list, dataset_names=dataset_names)
+            
+            sample_num = 1e4
+            HPO_instance.runTrials(args.max_trials, sample_num, explore_trials=1e10)
+        else:
+            study_name = args.optuna_study_name if args.optuna_study_name != '' else f'redgnn-{args.dataset}'
+            storage = args.optuna_storage if args.optuna_storage != '' else None
+            HPO_instance = OptunaTPEHyperbandHPO(
+                HPO_search_space,
+                study_name=study_name,
+                direction='maximize',
+                seed=int(args.seed),
+                metric_name='valid_mrr',
+                n_startup_trials=args.optuna_startup_trials,
+                n_ei_candidates=args.optuna_ei_candidates,
+                storage=storage,
+                enable_pruner=False,
+            )
+            start_configs = None
+            if args.useSearchLog and os.path.exists(HPO_save_path):
+                config_list, _ = loadSearchLog(HPO_save_path)
+                start_configs = config_list
+                print(f'==> Optuna: enqueue {len(start_configs)} start config(s) from search log')
+
+            def objective_fn(trial, config, reporter):
+                return run_model(config, reporter=reporter)
+
+            HPO_instance.optimize(
+                objective_fn,
+                n_trials=args.max_trials,
+                start_configs=start_configs,
+            )
+            print(f'==> Optuna best valid_mrr={HPO_instance.best_value:.6f}')
+            print(HPO_instance.best_config)
         
     elif args.finetune:
         print('==> HPO finetune mode')
@@ -235,5 +275,3 @@ if __name__ == '__main__':
             print(idx, param)
             if idx == -1: break
             run_model(param, finetune_idx=idx)
-
-
