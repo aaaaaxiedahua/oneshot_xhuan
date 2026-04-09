@@ -31,7 +31,7 @@ class DataLoader(Dataset):
 
         self.n_ent = n_ent
         self.n_rel = n_rel
-        self.filters = defaultdict(set)
+        self.filters = defaultdict(lambda:set())
         self.fact_triple  = self.read_triples('facts.txt')
         self.train_triple = self.read_triples('train.txt')
         self.valid_triple = self.read_triples('valid.txt')
@@ -88,7 +88,7 @@ class DataLoader(Dataset):
             obj[answer[idx]] = 1
                     
         # subgraph sampling
-        subgraph = self.getOneSubgraph(int(sub), int(rel))
+        subgraph = self.getOneSubgraph(int(sub))
         return sub, rel, obj, subgraph
         
     def collate_fn(self, data):

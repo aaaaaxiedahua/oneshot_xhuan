@@ -3,11 +3,13 @@ import torch
 import numpy as np
 import time
 from torch.optim import Adam
-from torch.optim.lr_scheduler import ReduceLROnPlateau
+from torch.optim.lr_scheduler import ExponentialLR, ReduceLROnPlateau
 from model import *
 from utils import *
 from tqdm import tqdm
 from torch.utils.data import DataLoader
+from collections import defaultdict
+import torch.nn.functional as F
 import copy
 
 class BaseModel(object):
@@ -24,54 +26,17 @@ class BaseModel(object):
         self.trainLoader = DataLoader(loader, batch_size=args.n_batch, num_workers=args.cpu, collate_fn=loader.collate_fn, shuffle=False, prefetch_factor=args.cpu, pin_memory=True)
         self.valLoader = DataLoader(val_loader, batch_size=args.n_tbatch, num_workers=args.cpu, collate_fn=val_loader.collate_fn, shuffle=False, prefetch_factor=args.cpu, pin_memory=True)
         self.testLoader = DataLoader(test_loader, batch_size=args.n_tbatch, num_workers=args.cpu, collate_fn=test_loader.collate_fn, shuffle=False, prefetch_factor=args.cpu, pin_memory=True)
-        self.optimizer = self._build_optimizer()
-        min_group_lr = min(group['lr'] for group in self.optimizer.param_groups)
-        self.scheduler = ReduceLROnPlateau(self.optimizer, mode='max', factor=0.5, patience=2, min_lr=min_group_lr/20, verbose=True)
+        self.optimizer = Adam(self.model.parameters(), lr=args.lr, weight_decay=args.lamb)
+        self.scheduler = ReduceLROnPlateau(self.optimizer, mode='max', factor=0.5, patience=2, min_lr=args.lr/20, verbose=True)
         self.smooth = 1e-5
         self.t_time = 0
-        self.epoch_train_time = 0
         self.mean_rank_dict = {}
-        self.epoch_idx = 0
-        self.best_valid_mrr = 0.0
-
-    def _build_optimizer(self):
-        default_lr = float(self.args.lr)
-        default_wd = float(self.args.lamb)
-        covered_param_ids = set()
-        special_groups = []
-
-        adapter_module = getattr(self.model, 'evidence_adapter', None)
-        if adapter_module is not None:
-            adapter_params = [p for p in adapter_module.parameters() if p.requires_grad]
-            if len(adapter_params) > 0:
-                for p in adapter_params:
-                    covered_param_ids.add(id(p))
-                adapter_lr = float(getattr(self.args, 'evidence_adapter_lr', -1.0))
-                if adapter_lr <= 0:
-                    adapter_lr = default_lr
-                adapter_wd = float(getattr(self.args, 'evidence_adapter_weight_decay', -1.0))
-                if adapter_wd < 0:
-                    adapter_wd = default_wd
-                special_groups.append({
-                    'params': adapter_params,
-                    'lr': adapter_lr,
-                    'weight_decay': adapter_wd,
-                })
-
-        default_params = [
-            p for p in self.model.parameters()
-            if p.requires_grad and id(p) not in covered_param_ids
-        ]
-        param_groups = [{'params': default_params, 'lr': default_lr, 'weight_decay': default_wd}]
-        param_groups.extend(special_groups)
-        return Adam(param_groups)
         
     def saveModelToFiles(self, args, best_metric, deleteLastFile=True):
-        budget_tag = f'topk_{self.args.topk}'
         if args.val_num == -1:
-            savePath = f'{self.args.data_path}/saveModel/{budget_tag}_layer_{self.args.layer}_{best_metric}.pt'
+            savePath = f'{self.args.data_path}/saveModel/topk_{self.args.topk}_layer_{self.args.layer}_{best_metric}.pt'
         else:
-            savePath = f'{self.args.data_path}/saveModel/{budget_tag}_layer_{self.args.layer}_valNum_{self.args.val_num}_{best_metric}.pt'
+            savePath = f'{self.args.data_path}/saveModel/topk_{self.args.topk}_layer_{self.args.layer}_valNum_{self.args.val_num}_{best_metric}.pt'
             
         print(f'Save checkpoint to : {savePath}')
         torch.save({
@@ -86,22 +51,7 @@ class BaseModel(object):
         checkpoint = torch.load(filePath, map_location=torch.device(f'cuda:{self.args.gpu}'))
         self.model.load_state_dict(checkpoint['model_state_dict'])
         # re-build optimizter
-        self.optimizer = self._build_optimizer()
-        min_group_lr = min(group['lr'] for group in self.optimizer.param_groups)
-        self.scheduler = ReduceLROnPlateau(self.optimizer, mode='max', factor=0.5, patience=2, min_lr=min_group_lr/20, verbose=True)
-
-    def _format_epoch_summary(self, eval_info):
-        current_lr = self.optimizer.param_groups[0]['lr']
-        return (
-            f'==> Epoch {self.epoch_idx:03d}: '
-            f'lr={current_lr:.4e} '
-            f'train_epoch={self.epoch_train_time:.2f}s '
-            f'train_total={self.t_time:.2f}s '
-            f'eval={eval_info["eval_time"]:.2f}s '
-            f'best_valid={self.best_valid_mrr:.4f} '
-            f'valid={eval_info["valid_mrr"]:.4f} '
-            f'test={eval_info["test_mrr"]:.4f}'
-        )
+        self.optimizer = Adam(self.model.parameters(), lr=self.args.lr, weight_decay=self.args.lamb)
 
     def prepareData(self, batch_data):
         subs, rels, objs, batch_idxs, abs_idxs, query_sub_idxs, edge_batch_idxs, batch_sampled_edges = batch_data
@@ -128,7 +78,7 @@ class BaseModel(object):
             # loss calculation
             pos_scores = scores[[torch.arange(len(scores)).cuda(), objs.flatten()]]
             max_n = torch.max(scores, 1, keepdim=True)[0]
-            loss = torch.sum(- pos_scores + max_n + torch.log(torch.sum(torch.exp(scores - max_n),1)))
+            loss = torch.sum(- pos_scores + max_n + torch.log(torch.sum(torch.exp(scores - max_n),1))) 
 
             # loss backward
             loss.backward()
@@ -146,14 +96,11 @@ class BaseModel(object):
             reach_tails_list += reach_tails
             epoch_loss += loss.item()
             
-        self.epoch_train_time = time.time() - t_time
-        self.t_time += self.epoch_train_time
+        self.t_time += time.time() - t_time
         
         # evaluate on val/test set
-        valid_mrr, out_str, eval_info = self.evaluate()
-        self.best_valid_mrr = max(self.best_valid_mrr, valid_mrr)
+        valid_mrr, out_str = self.evaluate()    
         self.scheduler.step(valid_mrr)
-        print(self._format_epoch_summary(eval_info))
         
         # shuffle train set
         if self.args.not_shuffle_train:
@@ -162,13 +109,7 @@ class BaseModel(object):
             self.loader.shuffle_train()
             fact_data = np.concatenate([np.array(self.loader.fact_data), self.loader.idd_data], 0)
             self.train_sampler.updateEdges(fact_data)
-            # # ========== Module 1: Update adjacency lists after shuffle ==========
-            # # Rebuild adj_by_rel from the new fact partition (patterns stay the same)
-            # if hasattr(self.args, 'use_rel_prior') and self.args.use_rel_prior:
-            #     self.train_sampler.updateRelationPatterns(fact_data)
-            # # ========== End Module 1 ==========
-
-        self.epoch_idx += 1
+        
         return valid_mrr, out_str
     
     @torch.no_grad()
@@ -287,11 +228,5 @@ class BaseModel(object):
             t_mrr, t_h1, t_h10 = -1, -1, -1
             
         i_time = time.time() - i_time
-        current_lr = self.optimizer.param_groups[0]['lr']
-        out_str = '[VALID] MRR:%.4f H@1:%.4f H@10:%.4f\t [TEST] MRR:%.4f H@1:%.4f H@10:%.4f \t[TIME] train_epoch:%.4f train_total:%.4f inference:%.4f \t[LR] %.4e\n'%(v_mrr, v_h1, v_h10, t_mrr, t_h1, t_h10, self.epoch_train_time, self.t_time, i_time, current_lr)
-        eval_info = {
-            'valid_mrr': v_mrr,
-            'test_mrr': t_mrr,
-            'eval_time': i_time,
-        }
-        return v_mrr, out_str, eval_info
+        out_str = '[VALID] MRR:%.4f H@1:%.4f H@10:%.4f\t [TEST] MRR:%.4f H@1:%.4f H@10:%.4f \t[TIME] train:%.4f inference:%.4f\n'%(v_mrr, v_h1, v_h10, t_mrr, t_h1, t_h10, self.t_time, i_time)
+        return v_mrr, out_str

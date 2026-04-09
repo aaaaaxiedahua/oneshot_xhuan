@@ -11,7 +11,7 @@ from PPR_sampler import pprSampler
 parser = argparse.ArgumentParser(description="Parser for the one-shot-subgraph framework")
 parser.add_argument('--data_path', type=str, default='data/WN18RR/')
 parser.add_argument('--seed', type=str, default=1234)
-parser.add_argument('--topk', type=float, default=0.1) # coarse sampled-node ratio (for a subgraph)
+parser.add_argument('--topk', type=float, default=0.1) # number of sampled nodes (for a subgraph)
 parser.add_argument('--topm', type=float, default=-1) # number of sampled edges (for a subgraph)
 parser.add_argument('--gpu', type=int, default=0)
 parser.add_argument('--fact_ratio', type=float, default=0.75)
@@ -25,34 +25,7 @@ parser.add_argument('--add_manual_edges', action='store_true')
 parser.add_argument('--remove_1hop_edges', action='store_true')
 parser.add_argument('--only_eval', action='store_true')
 parser.add_argument('--not_shuffle_train', action='store_true')
-parser.add_argument('--use_alp', action='store_true')
-parser.add_argument('--alp_hidden_dim', type=int, default=-1)
-parser.add_argument('--alp_dropout', type=float, default=-1.0)
-parser.add_argument('--use_qpcr', action='store_true')
-parser.add_argument('--query_path_hidden', type=int, default=-1)
-parser.add_argument('--evidence_eta', type=float, default=0.2)
-parser.add_argument('--query_residual', type=float, default=0.7)
-parser.add_argument('--use_evidence_adapter', action='store_true')
-parser.add_argument('--evidence_adapter_hidden', type=int, default=-1)
-parser.add_argument('--evidence_adapter_dropout', type=float, default=-1.0)
-parser.add_argument('--evidence_adapter_lr', type=float, default=-1.0)
-parser.add_argument('--evidence_adapter_weight_decay', type=float, default=-1.0)
-# # ========== Module 1: Relation-Path Conditioned Sampling args ==========
-# parser.add_argument('--use_rel_prior', action='store_true')         # enable path-based relation prior
-# parser.add_argument('--rel_path_topk', type=int, default=10)        # top-K relation path patterns per relation
-# parser.add_argument('--fusion_mode', type=str, default='add')       # fusion: add / multiply
-# # ========== Module 2: Relation Composition Augmentation args ==========
-# parser.add_argument('--use_rca', action='store_true')               # enable RCA virtual edges
-# parser.add_argument('--compose_dim', type=int, default=32)          # embedding dim for composition
-# parser.add_argument('--max_virtual', type=int, default=50)          # max virtual edges per subgraph
-# parser.add_argument('--compose_aware', action='store_true')         # composition-aware virtual edge embedding
-# parser.add_argument('--rca_dropout', type=float, default=0.1)       # dropout in composition scorer
-# parser.add_argument('--rca_mode', type=str, default='shared')       # shared / per_layer
-# parser.add_argument('--compose_max_hop', type=int, default=2)       # max composition hops: 2 or 3
 args = parser.parse_args()
-
-if args.use_evidence_adapter and not args.use_qpcr:
-    raise ValueError('`--use_evidence_adapter` requires `--use_qpcr`.')
 
 class Options(object):
     pass
@@ -77,7 +50,7 @@ if __name__ == '__main__':
         os.makedirs(os.path.join(results_dir, dataset))
 
     opts = args
-    time = str(time.strftime("%Y-%m-%d-%H-%M-%S", time.localtime()))
+    time = str(time.strftime("%Y-%m-%d-%H:%M:%S", time.localtime()))
     opts.perf_file = os.path.join(results_dir,  dataset + '/' + time + '.txt')
     gpu = args.gpu
     torch.cuda.set_device(gpu)
@@ -114,7 +87,7 @@ if __name__ == '__main__':
         fact_homo_edges, fact_data, args.data_path, split='train', args=args)
         
     del fact_homo_edges
-
+        
     # add sampler to the data loaders
     loader.addSampler(train_sampler)
     val_loader.addSampler(test_sampler)
@@ -150,7 +123,7 @@ if __name__ == '__main__':
             
         # only do evaluation, and then exit
         if args.only_eval:
-            valid_mrr, out_str, _ = model.evaluate(verbose=True, rank_CR=False)
+            valid_mrr, out_str = model.evaluate(verbose=True, rank_CR=False)
             print(out_str)
             exit()
 
@@ -190,12 +163,8 @@ if __name__ == '__main__':
         # [VALID] MRR:0.5051 H@1:0.4355 H@10:0.6133        [TEST] MRR:0.5472 H@1:0.4847 H@10:0.6508
         params = {'lr': 0.0011, 'hidden_dim': 128, 'attn_dim': 64, 'n_layer': 8, 'act': 'relu', 'initializer': 'relation', 'concatHidden': False, 'shortcut': False, 'readout': 'linear', 'decay_rate': 0.9938, 'lamb': 0.000089, 'dropout': 0.0193}
     elif dataset == 'YAGO':
-        # [VALID] MRR:0.6117 H@1:0.5477 H@10:0.7273        [TEST] MRR:0.6064 H@1:0.5403 H@10:0.7218
+        # [VALID] MRR:0.6117 H@1:0.5477 H@10:0.7273        [TEST] MRR:0.6064 H@1:0.5403 H@10:0.7218 
         params = {'lr': 0.001, 'hidden_dim': 64, 'attn_dim': 2, 'n_layer': 8, 'act': 'relu', 'initializer': 'binary', 'concatHidden': True, 'shortcut': False, 'readout': 'linear', 'decay_rate': 0.9429713470775948, 'lamb': 0.000946516892415447, 'dropout': 0.19456805575101324}
-    elif dataset == 'family':
-        params = {'lr': 0.001, 'hidden_dim': 128, 'attn_dim': 8, 'n_layer': 6, 'act': 'relu', 'initializer': 'relation', 'concatHidden': False, 'shortcut': True, 'readout': 'multiply', 'decay_rate': 0.95, 'lamb': 0.0001, 'dropout': 0.05}
-    elif dataset == 'umls':
-        params = {'lr': 0.001, 'hidden_dim': 128, 'attn_dim': 8, 'n_layer': 6, 'act': 'relu', 'initializer': 'relation', 'concatHidden': False, 'shortcut': True, 'readout': 'multiply', 'decay_rate': 0.95, 'lamb': 0.0001, 'dropout': 0.05}
     else:
         exit()
         
