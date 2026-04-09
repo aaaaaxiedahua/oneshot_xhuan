@@ -84,8 +84,8 @@ if __name__ == '__main__':
     if not os.path.exists(os.path.join(results_dir, dataset)):
         os.makedirs(os.path.join(results_dir, dataset))
             
-    time = str(time.strftime("%Y-%m-%d-%H:%M:%S", time.localtime()))
-    args.perf_file = os.path.join(results_dir,  dataset + '/' + time + '.txt')
+    timestamp = time.strftime("%Y-%m-%d-%H-%M-%S", time.localtime())
+    args.perf_file = os.path.join(results_dir, dataset, timestamp + '.txt')
     gpu = args.gpu
     torch.cuda.set_device(gpu)
     print('==> gpu:', gpu)
