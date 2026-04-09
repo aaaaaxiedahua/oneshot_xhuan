@@ -48,6 +48,10 @@ parser.add_argument('--search', action='store_true')
 parser.add_argument('--finetune', action='store_true')
 parser.add_argument('--finetune_config', type=str, default='')
 parser.add_argument('--not_shuffle_train', action='store_true')
+parser.add_argument('--use_selective_agg', action='store_true')
+parser.add_argument('--sea_hidden_dim', type=int, default=0)
+parser.add_argument('--sea_dropout', type=float, default=0.0)
+parser.add_argument('--sea_use_target_gate', action='store_true')
 args = parser.parse_args()
 
 if __name__ == '__main__':
@@ -115,6 +119,11 @@ if __name__ == '__main__':
     val_loader.addSampler(test_sampler)
     test_loader.addSampler(test_sampler)
     HPO_save_path = f'./results/{dataset}/search_log.pkl'
+
+    if args.use_selective_agg:
+        HPO_search_space['sea_hidden_dim'] = ('choice', [32, 64, 128, 256])
+        HPO_search_space['sea_dropout'] = ('uniform', (0, 0.2))
+        print('==> HPO: added SelectiveAgg search space')
     
     def loadSearchLog(file):
         assert os.path.exists(file)
@@ -142,6 +151,10 @@ if __name__ == '__main__':
         args.concatHidden = params['concatHidden']
         args.shortcut = params['shortcut']
         args.readout = params['readout']
+        if 'sea_hidden_dim' in params:
+            args.sea_hidden_dim = int(params['sea_hidden_dim'])
+        if 'sea_dropout' in params:
+            args.sea_dropout = params['sea_dropout']
         
         # build model
         model = BaseModel(args, loaders=(loader, val_loader, test_loader), samplers=(train_sampler, test_sampler))
@@ -222,6 +235,5 @@ if __name__ == '__main__':
             print(idx, param)
             if idx == -1: break
             run_model(param, finetune_idx=idx)
-
 
 

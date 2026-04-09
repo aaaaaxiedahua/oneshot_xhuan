@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 try:
@@ -57,10 +58,14 @@ class OptunaTPEHyperbandHPO:
         direction: str = "maximize",
         seed: int = 1234,
         metric_name: str = "valid_mrr",
-        n_startup_trials: int = 10,
-        n_ei_candidates: int = 64,
+        n_startup_trials: int = 1,
+        n_ei_candidates: int = 128,
         multivariate: bool = True,
         group: bool = True,
+        storage: Optional[str] = None,
+        storage_dir: str = "results/optuna",
+        load_if_exists: bool = True,
+        enable_pruner: bool = False,
         min_resource: int = 1,
         max_resource: Any = "auto",
         reduction_factor: int = 3,
@@ -75,10 +80,15 @@ class OptunaTPEHyperbandHPO:
         self.n_ei_candidates = int(n_ei_candidates)
         self.multivariate = bool(multivariate)
         self.group = bool(group)
+        self.storage = storage
+        self.storage_dir = storage_dir
+        self.load_if_exists = bool(load_if_exists)
+        self.enable_pruner = bool(enable_pruner)
         self.min_resource = int(min_resource)
         self.max_resource = max_resource
         self.reduction_factor = int(reduction_factor)
         self.study = None
+        self.storage_url = self._resolve_storage_url()
 
     @staticmethod
     def _ensure_optuna() -> None:
@@ -96,7 +106,20 @@ class OptunaTPEHyperbandHPO:
             group=self.group,
         )
 
+    def _resolve_storage_url(self) -> Optional[str]:
+        if self.storage is not None:
+            return self.storage
+
+        safe_name = "".join(ch if ch.isalnum() or ch in ("-", "_", ".") else "-" for ch in self.study_name)
+        safe_name = safe_name.strip("-") or "optuna-study"
+        storage_dir = Path(self.storage_dir).expanduser().resolve()
+        storage_dir.mkdir(parents=True, exist_ok=True)
+        db_path = (storage_dir / f"{safe_name}.db").as_posix()
+        return f"sqlite:///{db_path}"
+
     def _build_pruner(self) -> Any:
+        if not self.enable_pruner:
+            return optuna.pruners.NopPruner()
         return optuna.pruners.HyperbandPruner(
             min_resource=self.min_resource,
             max_resource=self.max_resource,
@@ -109,6 +132,8 @@ class OptunaTPEHyperbandHPO:
             direction=self.direction,
             sampler=self._build_sampler(),
             pruner=self._build_pruner(),
+            storage=self.storage_url,
+            load_if_exists=self.load_if_exists,
         )
         return self.study
 
@@ -218,24 +243,34 @@ class OptunaTPEHyperbandHPO:
         )
         return self.study
 
+    def _completed_trials(self) -> List[Any]:
+        if self.study is None:
+            return []
+        return [
+            trial for trial in self.study.trials
+            if trial.state == optuna.trial.TrialState.COMPLETE and trial.value is not None
+        ]
+
+    def _best_completed_trial(self) -> Any:
+        complete = self._completed_trials()
+        if not complete:
+            raise RuntimeError("No completed study is available.")
+        reverse = self.direction == "maximize"
+        complete.sort(key=lambda trial: trial.value, reverse=reverse)
+        return complete[0]
+
     @property
     def best_value(self) -> float:
-        if self.study is None or self.study.best_trial is None:
-            raise RuntimeError("No completed study is available.")
-        return float(self.study.best_value)
+        return float(self._best_completed_trial().value)
 
     @property
     def best_config(self) -> Dict[str, Any]:
-        if self.study is None or self.study.best_trial is None:
-            raise RuntimeError("No completed study is available.")
-        return dict(self.study.best_trial.user_attrs.get("config", self.study.best_params))
+        best_trial = self._best_completed_trial()
+        return dict(best_trial.user_attrs.get("config", best_trial.params))
 
     def top_trials(self, k: int = 10) -> List[Dict[str, Any]]:
-        if self.study is None:
-            return []
-
         reverse = self.direction == "maximize"
-        complete = [t for t in self.study.trials if t.state == optuna.trial.TrialState.COMPLETE]
+        complete = self._completed_trials()
         complete.sort(key=lambda t: t.value, reverse=reverse)
 
         results = []

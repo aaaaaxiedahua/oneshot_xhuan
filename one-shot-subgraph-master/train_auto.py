@@ -25,6 +25,10 @@ parser.add_argument('--add_manual_edges', action='store_true')
 parser.add_argument('--remove_1hop_edges', action='store_true')
 parser.add_argument('--only_eval', action='store_true')
 parser.add_argument('--not_shuffle_train', action='store_true')
+parser.add_argument('--use_selective_agg', action='store_true')
+parser.add_argument('--sea_hidden_dim', type=int, default=0)
+parser.add_argument('--sea_dropout', type=float, default=0.0)
+parser.add_argument('--sea_use_target_gate', action='store_true')
 args = parser.parse_args()
 
 class Options(object):
@@ -113,6 +117,10 @@ if __name__ == '__main__':
         args.concatHidden = params['concatHidden']
         args.shortcut = params['shortcut']
         args.readout = params['readout']
+        if 'sea_hidden_dim' in params:
+            args.sea_hidden_dim = int(params['sea_hidden_dim'])
+        if 'sea_dropout' in params:
+            args.sea_dropout = params['sea_dropout']
         
         # build model
         model = BaseModel(args, loaders=(loader, val_loader, test_loader), samplers=(train_sampler, test_sampler))

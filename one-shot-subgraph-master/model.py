@@ -2,6 +2,28 @@ import torch
 import torch.nn as nn
 from torch_scatter import scatter
 
+class EdgeGateMLP(torch.nn.Module):
+    def __init__(self, hidden_dim, gate_hidden_dim, dropout=0.0):
+        super(EdgeGateMLP, self).__init__()
+        self.fc1 = nn.Linear(hidden_dim * 4, gate_hidden_dim)
+        self.fc2 = nn.Linear(gate_hidden_dim, 1)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, hs, ho, hr, h_qr):
+        gate_input = torch.cat([hs, ho, hr, h_qr], dim=-1)
+        gate_hidden = torch.relu(self.fc1(gate_input))
+        gate_hidden = self.dropout(gate_hidden)
+        return torch.sigmoid(self.fc2(gate_hidden))
+
+class TargetGate(torch.nn.Module):
+    def __init__(self, hidden_dim):
+        super(TargetGate, self).__init__()
+        self.fc = nn.Linear(hidden_dim * 2, 1)
+
+    def forward(self, hidden, h_qr):
+        gate_input = torch.cat([hidden, h_qr], dim=-1)
+        return torch.sigmoid(self.fc(gate_input))
+
 class GNNLayer(torch.nn.Module):
     def __init__(self, in_dim, out_dim, attn_dim, n_rel, act=lambda x:x):
         super(GNNLayer, self).__init__()
@@ -12,30 +34,55 @@ class GNNLayer(torch.nn.Module):
         self.act = act
         self.rela_embed = nn.Embedding(2*n_rel+1, in_dim)
         self.Ws_attn = nn.Linear(in_dim, attn_dim, bias=False)
+        self.Wo_attn = nn.Linear(in_dim, attn_dim, bias=False)
         self.Wr_attn = nn.Linear(in_dim, attn_dim, bias=False)
         self.Wqr_attn = nn.Linear(in_dim, attn_dim)
         self.w_alpha  = nn.Linear(attn_dim, 1)
         self.W_h = nn.Linear(in_dim, out_dim, bias=False)
-    
-    def forward(self, q_sub, q_rel, r_idx, hidden, edges, n_node, shortcut=False):
+
+    def _target_softmax(self, attn_score, obj, n_node):
+        score_max = scatter(attn_score, index=obj, dim=0, dim_size=n_node, reduce='max')[obj]
+        score_exp = torch.exp(attn_score - score_max)
+        score_sum = scatter(score_exp, index=obj, dim=0, dim_size=n_node, reduce='sum')[obj] + 1e-12
+        return (score_exp / score_sum).unsqueeze(-1)
+
+    def forward(self, q_sub, q_rel, r_idx, hidden, edges, n_node, shortcut=False,
+                node_batch_idxs=None, use_selective_agg=False, sea_gate=None,
+                sea_target_gate=None, sea_use_target_gate=False):
         # edges: [h, r, t]
         sub = edges[:,0]
         rel = edges[:,1]
         obj = edges[:,2]
         hs = hidden[sub]
+        ho = hidden[obj]
         hr = self.rela_embed(rel) # relation embedding of each edge
         h_qr = self.rela_embed(q_rel)[r_idx] # use batch_idx to get the query relation
-        
-        # message aggregation
-        message = hs * hr
-        alpha = torch.sigmoid(self.w_alpha(nn.ReLU()(self.Ws_attn(hs) + self.Wr_attn(hr) + self.Wqr_attn(h_qr))))
-        message = alpha * message        
-        message_agg = scatter(message, index=obj, dim=0, dim_size=n_node, reduce='sum') #ori
+
+        if not use_selective_agg:
+            # original message aggregation
+            message = hs * hr
+            alpha = torch.sigmoid(self.w_alpha(nn.ReLU()(self.Ws_attn(hs) + self.Wr_attn(hr) + self.Wqr_attn(h_qr))))
+            message = alpha * message
+            message_agg = scatter(message, index=obj, dim=0, dim_size=n_node, reduce='sum')
+        else:
+            raw_message = hs * hr
+            gate = sea_gate(hs, ho, hr, h_qr)
+            attn_score = self.w_alpha(
+                torch.tanh(self.Ws_attn(hs) + self.Wo_attn(ho) + self.Wr_attn(hr) + self.Wqr_attn(h_qr))
+            ).squeeze(-1)
+            alpha = self._target_softmax(attn_score, obj, n_node)
+            message = alpha * gate * raw_message
+            message_agg = scatter(message, index=obj, dim=0, dim_size=n_node, reduce='sum')
         
         # get new hidden representations
         hidden_new = self.act(self.W_h(message_agg))
-        
-        if shortcut: hidden_new = hidden_new + hidden
+
+        if use_selective_agg and sea_use_target_gate:
+            h_qn = self.rela_embed(q_rel)[node_batch_idxs]
+            tau = sea_target_gate(hidden, h_qn)
+            hidden_new = (1 - tau) * hidden + tau * hidden_new
+        elif shortcut:
+            hidden_new = hidden_new + hidden
         
         return hidden_new
 
@@ -49,6 +96,12 @@ class GNN_auto(torch.nn.Module):
         self.n_rel = params.n_rel
         self.n_ent = params.n_ent
         self.loader = loader
+        self.use_selective_agg = getattr(params, 'use_selective_agg', False)
+        self.sea_use_target_gate = getattr(params, 'sea_use_target_gate', False)
+        self.sea_hidden_dim = int(getattr(params, 'sea_hidden_dim', self.hidden_dim))
+        if self.sea_hidden_dim <= 0:
+            self.sea_hidden_dim = self.hidden_dim
+        self.sea_dropout = float(getattr(params, 'sea_dropout', 0.0))
         acts = {'relu': nn.ReLU(), 'tanh': torch.tanh, 'idd': lambda x:x}
         act = acts[params.act]
 
@@ -58,6 +111,13 @@ class GNN_auto(torch.nn.Module):
         self.gnn_layers = nn.ModuleList(self.gnn_layers)
         self.dropout = nn.Dropout(params.dropout)
         self.gate = nn.GRU(self.hidden_dim, self.hidden_dim)
+        if self.use_selective_agg:
+            self.sea_gate = EdgeGateMLP(self.hidden_dim, self.sea_hidden_dim, self.sea_dropout)
+            self.sea_target_gate = TargetGate(self.hidden_dim) if self.sea_use_target_gate else None
+            print(f'==> SEA: enabled (sea_hidden_dim={self.sea_hidden_dim}, dropout={self.sea_dropout}, target_gate={self.sea_use_target_gate})')
+        else:
+            self.sea_gate = None
+            self.sea_target_gate = None
         
         if self.params.initializer == 'relation': self.query_rela_embed = nn.Embedding(2*self.n_rel+1, self.hidden_dim)
         if self.params.readout == 'linear':
@@ -87,7 +147,9 @@ class GNN_auto(torch.nn.Module):
         for i in range(self.n_layer):
             # forward
             hidden = self.gnn_layers[i](q_sub, q_rel, edge_batch_idxs, hidden, batch_sampled_edges, n_node,
-                                        shortcut=self.params.shortcut)
+                                        shortcut=self.params.shortcut, node_batch_idxs=batch_idxs,
+                                        use_selective_agg=self.use_selective_agg, sea_gate=self.sea_gate,
+                                        sea_target_gate=self.sea_target_gate, sea_use_target_gate=self.sea_use_target_gate)
             
             # act_signal is a binary (0/1) tensor 
             # that 1 for non-activated entities and 0 for activated entities
