@@ -189,8 +189,8 @@ if __name__ == '__main__':
             else:
                 bearing += 1
                 
-            # early stop (5 as the threshould to boost searching)
-            if bearing >= 5: 
+            # early stop (3 as the threshould to boost searching)
+            if bearing >= 3: 
                 print(f'early stopping at {epoch+1} epoch.')
                 break
         
