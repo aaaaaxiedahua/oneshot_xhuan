@@ -29,6 +29,11 @@ parser.add_argument('--use_selective_agg', action='store_true')
 parser.add_argument('--sea_hidden_dim', type=int, default=0)
 parser.add_argument('--sea_dropout', type=float, default=0.0)
 parser.add_argument('--sea_use_target_gate', action='store_true')
+parser.add_argument('--use_score_fc', action='store_true')
+parser.add_argument('--score_fc_hidden_dim', type=int, default=128)
+parser.add_argument('--score_fc_dropout', type=float, default=0.05)
+parser.add_argument('--score_fc_lr', type=float, default=-1.0)
+parser.add_argument('--score_fc_weight_decay', type=float, default=-1.0)
 args = parser.parse_args()
 
 class Options(object):
@@ -121,6 +126,14 @@ if __name__ == '__main__':
             args.sea_hidden_dim = int(params['sea_hidden_dim'])
         if 'sea_dropout' in params:
             args.sea_dropout = params['sea_dropout']
+        if 'score_fc_hidden_dim' in params:
+            args.score_fc_hidden_dim = int(params['score_fc_hidden_dim'])
+        if 'score_fc_dropout' in params:
+            args.score_fc_dropout = params['score_fc_dropout']
+        if 'score_fc_lr' in params:
+            args.score_fc_lr = params['score_fc_lr']
+        if 'score_fc_weight_decay' in params:
+            args.score_fc_weight_decay = params['score_fc_weight_decay']
         
         # build model
         model = BaseModel(args, loaders=(loader, val_loader, test_loader), samplers=(train_sampler, test_sampler))

@@ -26,11 +26,24 @@ class BaseModel(object):
         self.trainLoader = DataLoader(loader, batch_size=args.n_batch, num_workers=args.cpu, collate_fn=loader.collate_fn, shuffle=False, prefetch_factor=args.cpu, pin_memory=True)
         self.valLoader = DataLoader(val_loader, batch_size=args.n_tbatch, num_workers=args.cpu, collate_fn=val_loader.collate_fn, shuffle=False, prefetch_factor=args.cpu, pin_memory=True)
         self.testLoader = DataLoader(test_loader, batch_size=args.n_tbatch, num_workers=args.cpu, collate_fn=test_loader.collate_fn, shuffle=False, prefetch_factor=args.cpu, pin_memory=True)
-        self.optimizer = Adam(self.model.parameters(), lr=args.lr, weight_decay=args.lamb)
+        self.optimizer = self._build_optimizer()
         self.scheduler = ReduceLROnPlateau(self.optimizer, mode='max', factor=0.5, patience=2, min_lr=args.lr/20, verbose=True)
         self.smooth = 1e-5
         self.t_time = 0
         self.mean_rank_dict = {}
+
+    def _build_optimizer(self):
+        if getattr(self.args, 'use_score_fc', False):
+            score_fc_lr = self.args.score_fc_lr if self.args.score_fc_lr > 0 else self.args.lr
+            score_fc_weight_decay = self.args.score_fc_weight_decay if self.args.score_fc_weight_decay >= 0 else self.args.lamb
+            score_fc_params = list(self.model.score_fc_head.parameters()) + list(self.model.score_rela_embed.parameters())
+            score_fc_param_ids = {id(param) for param in score_fc_params}
+            base_params = [param for param in self.model.parameters() if id(param) not in score_fc_param_ids]
+            return Adam([
+                {'params': base_params, 'lr': self.args.lr, 'weight_decay': self.args.lamb},
+                {'params': score_fc_params, 'lr': score_fc_lr, 'weight_decay': score_fc_weight_decay},
+            ])
+        return Adam(self.model.parameters(), lr=self.args.lr, weight_decay=self.args.lamb)
         
     def saveModelToFiles(self, args, best_metric, deleteLastFile=True):
         if args.val_num == -1:
@@ -51,7 +64,7 @@ class BaseModel(object):
         checkpoint = torch.load(filePath, map_location=torch.device(f'cuda:{self.args.gpu}'))
         self.model.load_state_dict(checkpoint['model_state_dict'])
         # re-build optimizter
-        self.optimizer = Adam(self.model.parameters(), lr=self.args.lr, weight_decay=self.args.lamb)
+        self.optimizer = self._build_optimizer()
 
     def prepareData(self, batch_data):
         subs, rels, objs, batch_idxs, abs_idxs, query_sub_idxs, edge_batch_idxs, batch_sampled_edges = batch_data

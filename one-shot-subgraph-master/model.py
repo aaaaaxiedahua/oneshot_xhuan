@@ -24,6 +24,19 @@ class TargetGate(torch.nn.Module):
         gate_input = torch.cat([hidden, h_qr], dim=-1)
         return torch.sigmoid(self.fc(gate_input))
 
+class ScoreFCHead(torch.nn.Module):
+    def __init__(self, hidden_dim, score_hidden_dim, dropout=0.0):
+        super(ScoreFCHead, self).__init__()
+        self.fc1 = nn.Linear(hidden_dim * 3, score_hidden_dim)
+        self.fc2 = nn.Linear(score_hidden_dim, 1)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, h_node, h_anchor, h_qr):
+        pair_feature = torch.cat([h_node * h_anchor, torch.abs(h_node - h_anchor), h_qr], dim=-1)
+        hidden = torch.relu(self.fc1(pair_feature))
+        hidden = self.dropout(hidden)
+        return self.fc2(hidden)
+
 class GNNLayer(torch.nn.Module):
     def __init__(self, in_dim, out_dim, attn_dim, n_rel, act=lambda x:x):
         super(GNNLayer, self).__init__()
@@ -102,6 +115,11 @@ class GNN_auto(torch.nn.Module):
         if self.sea_hidden_dim <= 0:
             self.sea_hidden_dim = self.hidden_dim
         self.sea_dropout = float(getattr(params, 'sea_dropout', 0.0))
+        self.use_score_fc = getattr(params, 'use_score_fc', False)
+        self.score_fc_hidden_dim = int(getattr(params, 'score_fc_hidden_dim', 128))
+        if self.score_fc_hidden_dim <= 0:
+            self.score_fc_hidden_dim = 128
+        self.score_fc_dropout = float(getattr(params, 'score_fc_dropout', 0.0))
         acts = {'relu': nn.ReLU(), 'tanh': torch.tanh, 'idd': lambda x:x}
         act = acts[params.act]
 
@@ -118,6 +136,13 @@ class GNN_auto(torch.nn.Module):
         else:
             self.sea_gate = None
             self.sea_target_gate = None
+        if self.use_score_fc:
+            self.score_fc_head = ScoreFCHead(self.hidden_dim, self.score_fc_hidden_dim, self.score_fc_dropout)
+            self.score_rela_embed = nn.Embedding(2*self.n_rel+1, self.hidden_dim)
+            print(f'==> ScoreFC: enabled (hidden_dim={self.score_fc_hidden_dim}, dropout={self.score_fc_dropout})')
+        else:
+            self.score_fc_head = None
+            self.score_rela_embed = None
         
         if self.params.initializer == 'relation': self.query_rela_embed = nn.Embedding(2*self.n_rel+1, self.hidden_dim)
         if self.params.readout == 'linear':
@@ -162,6 +187,8 @@ class GNN_auto(torch.nn.Module):
             
             if self.params.concatHidden: hidden_list.append(hidden)
 
+        hidden_last = hidden
+
         # readout
         if self.params.readout == 'linear':
             if self.params.concatHidden: hidden = torch.cat(hidden_list, dim=-1)
@@ -169,6 +196,12 @@ class GNN_auto(torch.nn.Module):
         elif self.params.readout == 'multiply':
             if self.params.concatHidden: hidden = torch.cat(hidden_list, dim=-1)
             scores = torch.sum(hidden * hidden[query_sub_idxs][batch_idxs], dim=-1)
+
+        if self.use_score_fc:
+            anchor_hidden = hidden_last[query_sub_idxs][batch_idxs]
+            query_hidden = self.score_rela_embed(q_rel)[batch_idxs]
+            score_fc = self.score_fc_head(hidden_last, anchor_hidden, query_hidden).squeeze(-1)
+            scores = scores + score_fc
         
         # re-indexing
         scores_all = torch.zeros((n, self.loader.n_ent)).cuda()
