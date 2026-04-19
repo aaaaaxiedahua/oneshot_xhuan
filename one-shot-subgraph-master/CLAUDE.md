@@ -71,6 +71,10 @@ There is no automated test suite. Correctness is validated by comparing MRR/Hit 
 - **`utils.py`** -- `cal_ranks` (filtered ranking), `cal_performance` (MRR/Hit metrics), `select_gpu`, `checkPath`.
 - **`base_HPO.py`** (`RF_HPO`) -- Bayesian HPO with evolutionary candidate generation and Random Forest surrogate.
 
+### Standalone / Unwired Modules
+- **`distmult.py` + `pretrain_distmult.py`** -- Standalone DistMult pretraining pipeline with its own CLI (`--data_path`, `--emb_dim`, `--neg_size`, `--reg_lambda`, etc.). Not invoked by `train_auto.py`; used to produce embeddings offline.
+- **`optuna_hpo.py`** -- Optional Optuna TPE + Hyperband HPO runner (`OptunaTPEHyperbandHPO`, `TrialReporter`). Gracefully handles missing `optuna` import. Not wired into `search_auto.py` -- intended as a replacement path for the custom `RF_HPO` in `base_HPO.py`.
+
 ### Commented-out Modules (Module 1 & Module 2)
 Large blocks of commented code exist across `model.py`, `PPR_sampler.py`, `search_auto.py`, `train_auto.py` for two experimental features that were never finalized:
 - **Module 1: Relation-Path Conditioned Sampling** -- Mines 2-hop relation path patterns, fuses path reachability with PPR. Flags: `--use_rel_prior`, `--path_lambda`, `--rel_path_topk`, `--fusion_mode`.

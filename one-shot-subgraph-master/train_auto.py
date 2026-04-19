@@ -8,6 +8,16 @@ from base_model import BaseModel
 from utils import *
 from PPR_sampler import pprSampler
 
+def str2bool(v):
+    if isinstance(v, bool):
+        return v
+    v = v.lower()
+    if v in ('true', '1', 'yes', 'y', 't'):
+        return True
+    if v in ('false', '0', 'no', 'n', 'f'):
+        return False
+    raise argparse.ArgumentTypeError('Boolean value expected.')
+
 parser = argparse.ArgumentParser(description="Parser for the one-shot-subgraph framework")
 parser.add_argument('--data_path', type=str, default='data/WN18RR/')
 parser.add_argument('--seed', type=str, default=1234)
@@ -17,7 +27,7 @@ parser.add_argument('--gpu', type=int, default=0)
 parser.add_argument('--fact_ratio', type=float, default=0.75)
 parser.add_argument('--val_num', type=int, default=-1) # how many triples are used as the validate set
 parser.add_argument('--epoch', type=int, default=200)
-parser.add_argument('--layer', type=int, default=6)
+parser.add_argument('--layer', type=int, default=None)
 parser.add_argument('--batchsize', type=int, default=16)
 parser.add_argument('--cpu', type=int, default=1)
 parser.add_argument('--weight', type=str, default='')
@@ -25,6 +35,18 @@ parser.add_argument('--add_manual_edges', action='store_true')
 parser.add_argument('--remove_1hop_edges', action='store_true')
 parser.add_argument('--only_eval', action='store_true')
 parser.add_argument('--not_shuffle_train', action='store_true')
+parser.add_argument('--lr', type=float, default=None)
+parser.add_argument('--hidden_dim', type=int, default=None)
+parser.add_argument('--attn_dim', type=int, default=None)
+parser.add_argument('--n_layer', type=int, default=None)
+parser.add_argument('--act', type=str, choices=['relu', 'idd', 'tanh'], default=None)
+parser.add_argument('--initializer', type=str, choices=['binary', 'relation'], default=None)
+parser.add_argument('--concatHidden', type=str2bool, default=None)
+parser.add_argument('--shortcut', type=str2bool, default=None)
+parser.add_argument('--readout', type=str, choices=['linear', 'multiply'], default=None)
+parser.add_argument('--decay_rate', type=float, default=None)
+parser.add_argument('--lamb', type=float, default=None)
+parser.add_argument('--dropout', type=float, default=None)
 parser.add_argument('--use_selective_agg', action='store_true')
 parser.add_argument('--sea_hidden_dim', type=int, default=0)
 parser.add_argument('--sea_dropout', type=float, default=0.0)
@@ -38,6 +60,26 @@ args = parser.parse_args()
 
 class Options(object):
     pass
+
+def apply_param_overrides(params, args):
+    override_map = {
+        'lr': args.lr,
+        'hidden_dim': args.hidden_dim,
+        'attn_dim': args.attn_dim,
+        'n_layer': args.n_layer if args.n_layer is not None else args.layer,
+        'act': args.act,
+        'initializer': args.initializer,
+        'concatHidden': args.concatHidden,
+        'shortcut': args.shortcut,
+        'readout': args.readout,
+        'decay_rate': args.decay_rate,
+        'lamb': args.lamb,
+        'dropout': args.dropout,
+    }
+    for key, value in override_map.items():
+        if value is not None:
+            params[key] = value
+    return params
 
 if __name__ == '__main__':
     np.random.seed(args.seed)
@@ -188,5 +230,6 @@ if __name__ == '__main__':
         params = {'lr': 0.001, 'hidden_dim': 64, 'attn_dim': 2, 'n_layer': 8, 'act': 'relu', 'initializer': 'binary', 'concatHidden': True, 'shortcut': False, 'readout': 'linear', 'decay_rate': 0.9429713470775948, 'lamb': 0.000946516892415447, 'dropout': 0.19456805575101324}
     else:
         exit()
-        
+
+    params = apply_param_overrides(params, args)
     run_model(params)
