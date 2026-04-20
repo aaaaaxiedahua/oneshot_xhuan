@@ -2,27 +2,54 @@ import torch
 import torch.nn as nn
 from torch_scatter import scatter
 
-class EdgeGateMLP(torch.nn.Module):
-    def __init__(self, hidden_dim, gate_hidden_dim, dropout=0.0):
-        super(EdgeGateMLP, self).__init__()
-        self.fc1 = nn.Linear(hidden_dim * 4, gate_hidden_dim)
-        self.fc2 = nn.Linear(gate_hidden_dim, 1)
-        self.dropout = nn.Dropout(dropout)
+class GlobalCalibrationSEA(torch.nn.Module):
+    def __init__(self, hidden_dim, local_hidden_dim, global_hidden_dim, dropout=0.0,
+                 global_dropout=0.0, global_eta=0.2, pool_temp=1.0):
+        super(GlobalCalibrationSEA, self).__init__()
+        self.pool_temp = max(float(pool_temp), 1e-6)
+        self.global_eta = float(global_eta)
 
-    def forward(self, hs, ho, hr, h_qr):
-        gate_input = torch.cat([hs, ho, hr, h_qr], dim=-1)
-        gate_hidden = torch.relu(self.fc1(gate_input))
-        gate_hidden = self.dropout(gate_hidden)
-        return torch.sigmoid(self.fc2(gate_hidden))
+        self.rel_fc = nn.Linear(hidden_dim * 2, local_hidden_dim)
+        self.rel_score = nn.Linear(local_hidden_dim, 1)
+        self.trans_fc = nn.Linear(hidden_dim * 3, local_hidden_dim)
+        self.trans_score = nn.Linear(local_hidden_dim, 1)
 
-class TargetGate(torch.nn.Module):
-    def __init__(self, hidden_dim):
-        super(TargetGate, self).__init__()
-        self.fc = nn.Linear(hidden_dim * 2, 1)
+        self.pool_fc = nn.Linear(hidden_dim * 2, global_hidden_dim)
+        self.pool_score = nn.Linear(global_hidden_dim, 1)
+        self.global_fc = nn.Linear(hidden_dim * 4, global_hidden_dim)
+        self.global_score = nn.Linear(global_hidden_dim, 1)
 
-    def forward(self, hidden, h_qr):
-        gate_input = torch.cat([hidden, h_qr], dim=-1)
-        return torch.sigmoid(self.fc(gate_input))
+        self.local_dropout = nn.Dropout(dropout)
+        self.global_dropout = nn.Dropout(global_dropout)
+
+    def _group_softmax(self, score, index, dim_size):
+        score_max = scatter(score, index=index, dim=0, dim_size=dim_size, reduce='max')[index]
+        score_exp = torch.exp(score - score_max)
+        score_sum = scatter(score_exp, index=index, dim=0, dim_size=dim_size, reduce='sum')[index] + 1e-12
+        return score_exp / score_sum
+
+    def forward(self, hs, ho, hr, h_qr, hidden, h_qn, edge_query_idx, node_query_idx, n_query):
+        rel_hidden = torch.tanh(self.rel_fc(torch.cat([hr, h_qr], dim=-1)))
+        rel_hidden = self.local_dropout(rel_hidden)
+        z_rel = self.rel_score(rel_hidden).squeeze(-1)
+
+        trans_hidden = torch.tanh(self.trans_fc(torch.cat([hs, ho, hr], dim=-1)))
+        trans_hidden = self.local_dropout(trans_hidden)
+        z_trans = self.trans_score(trans_hidden).squeeze(-1)
+
+        pool_hidden = torch.tanh(self.pool_fc(torch.cat([hidden, h_qn], dim=-1)))
+        pool_hidden = self.global_dropout(pool_hidden)
+        pool_logits = self.pool_score(pool_hidden).squeeze(-1) / self.pool_temp
+        pool_alpha = self._group_softmax(pool_logits, node_query_idx, n_query).unsqueeze(-1)
+        global_summary = scatter(pool_alpha * hidden, index=node_query_idx, dim=0, dim_size=n_query, reduce='sum')
+
+        edge_global = global_summary[edge_query_idx]
+        global_hidden = torch.tanh(self.global_fc(torch.cat([ho, hr, h_qr, edge_global], dim=-1)))
+        global_hidden = self.global_dropout(global_hidden)
+        z_global = self.global_score(global_hidden).squeeze(-1)
+
+        gate_logit = z_rel + z_trans + self.global_eta * z_global
+        return torch.sigmoid(gate_logit).unsqueeze(-1)
 
 class ScoreFCHead(torch.nn.Module):
     def __init__(self, hidden_dim, score_hidden_dim, dropout=0.0):
@@ -60,8 +87,7 @@ class GNNLayer(torch.nn.Module):
         return (score_exp / score_sum).unsqueeze(-1)
 
     def forward(self, q_sub, q_rel, r_idx, hidden, edges, n_node, shortcut=False,
-                node_batch_idxs=None, use_selective_agg=False, sea_gate=None,
-                sea_target_gate=None, sea_use_target_gate=False):
+                node_batch_idxs=None, use_selective_agg=False, sea_gate=None):
         # edges: [h, r, t]
         sub = edges[:,0]
         rel = edges[:,1]
@@ -79,7 +105,8 @@ class GNNLayer(torch.nn.Module):
             message_agg = scatter(message, index=obj, dim=0, dim_size=n_node, reduce='sum')
         else:
             raw_message = hs * hr
-            gate = sea_gate(hs, ho, hr, h_qr)
+            h_qn = self.rela_embed(q_rel)[node_batch_idxs]
+            gate = sea_gate(hs, ho, hr, h_qr, hidden, h_qn, r_idx, node_batch_idxs, len(q_rel))
             attn_score = self.w_alpha(
                 torch.tanh(self.Ws_attn(hs) + self.Wo_attn(ho) + self.Wr_attn(hr) + self.Wqr_attn(h_qr))
             ).squeeze(-1)
@@ -90,11 +117,7 @@ class GNNLayer(torch.nn.Module):
         # get new hidden representations
         hidden_new = self.act(self.W_h(message_agg))
 
-        if use_selective_agg and sea_use_target_gate:
-            h_qn = self.rela_embed(q_rel)[node_batch_idxs]
-            tau = sea_target_gate(hidden, h_qn)
-            hidden_new = (1 - tau) * hidden + tau * hidden_new
-        elif shortcut:
+        if shortcut:
             hidden_new = hidden_new + hidden
         
         return hidden_new
@@ -110,11 +133,18 @@ class GNN_auto(torch.nn.Module):
         self.n_ent = params.n_ent
         self.loader = loader
         self.use_selective_agg = getattr(params, 'use_selective_agg', False)
-        self.sea_use_target_gate = getattr(params, 'sea_use_target_gate', False)
         self.sea_hidden_dim = int(getattr(params, 'sea_hidden_dim', self.hidden_dim))
         if self.sea_hidden_dim <= 0:
             self.sea_hidden_dim = self.hidden_dim
         self.sea_dropout = float(getattr(params, 'sea_dropout', 0.0))
+        self.sea_global_hidden_dim = int(getattr(params, 'sea_global_hidden_dim', self.sea_hidden_dim))
+        if self.sea_global_hidden_dim <= 0:
+            self.sea_global_hidden_dim = self.sea_hidden_dim
+        self.sea_global_eta = float(getattr(params, 'sea_global_eta', 0.2))
+        self.sea_pool_temp = float(getattr(params, 'sea_pool_temp', 1.0))
+        if self.sea_pool_temp <= 0:
+            self.sea_pool_temp = 1.0
+        self.sea_global_dropout = float(getattr(params, 'sea_global_dropout', self.sea_dropout))
         self.use_score_fc = getattr(params, 'use_score_fc', False)
         self.score_fc_hidden_dim = int(getattr(params, 'score_fc_hidden_dim', 128))
         if self.score_fc_hidden_dim <= 0:
@@ -130,12 +160,23 @@ class GNN_auto(torch.nn.Module):
         self.dropout = nn.Dropout(params.dropout)
         self.gate = nn.GRU(self.hidden_dim, self.hidden_dim)
         if self.use_selective_agg:
-            self.sea_gate = EdgeGateMLP(self.hidden_dim, self.sea_hidden_dim, self.sea_dropout)
-            self.sea_target_gate = TargetGate(self.hidden_dim) if self.sea_use_target_gate else None
-            print(f'==> SEA: enabled (sea_hidden_dim={self.sea_hidden_dim}, dropout={self.sea_dropout}, target_gate={self.sea_use_target_gate})')
+            self.sea_gate = GlobalCalibrationSEA(
+                self.hidden_dim,
+                self.sea_hidden_dim,
+                self.sea_global_hidden_dim,
+                dropout=self.sea_dropout,
+                global_dropout=self.sea_global_dropout,
+                global_eta=self.sea_global_eta,
+                pool_temp=self.sea_pool_temp,
+            )
+            print(
+                f'==> SEA: enabled (sea_hidden_dim={self.sea_hidden_dim}, '
+                f'global_hidden_dim={self.sea_global_hidden_dim}, dropout={self.sea_dropout}, '
+                f'global_dropout={self.sea_global_dropout}, global_eta={self.sea_global_eta}, '
+                f'pool_temp={self.sea_pool_temp})'
+            )
         else:
             self.sea_gate = None
-            self.sea_target_gate = None
         if self.use_score_fc:
             self.score_fc_head = ScoreFCHead(self.hidden_dim, self.score_fc_hidden_dim, self.score_fc_dropout)
             self.score_rela_embed = nn.Embedding(2*self.n_rel+1, self.hidden_dim)
@@ -173,8 +214,7 @@ class GNN_auto(torch.nn.Module):
             # forward
             hidden = self.gnn_layers[i](q_sub, q_rel, edge_batch_idxs, hidden, batch_sampled_edges, n_node,
                                         shortcut=self.params.shortcut, node_batch_idxs=batch_idxs,
-                                        use_selective_agg=self.use_selective_agg, sea_gate=self.sea_gate,
-                                        sea_target_gate=self.sea_target_gate, sea_use_target_gate=self.sea_use_target_gate)
+                                        use_selective_agg=self.use_selective_agg, sea_gate=self.sea_gate)
             
             # act_signal is a binary (0/1) tensor 
             # that 1 for non-activated entities and 0 for activated entities

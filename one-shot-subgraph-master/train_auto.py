@@ -50,7 +50,10 @@ parser.add_argument('--dropout', type=float, default=None)
 parser.add_argument('--use_selective_agg', action='store_true')
 parser.add_argument('--sea_hidden_dim', type=int, default=0)
 parser.add_argument('--sea_dropout', type=float, default=0.0)
-parser.add_argument('--sea_use_target_gate', action='store_true')
+parser.add_argument('--sea_global_hidden_dim', type=int, default=0)
+parser.add_argument('--sea_global_eta', type=float, default=0.2)
+parser.add_argument('--sea_pool_temp', type=float, default=1.0)
+parser.add_argument('--sea_global_dropout', type=float, default=0.0)
 parser.add_argument('--use_score_fc', action='store_true')
 parser.add_argument('--score_fc_hidden_dim', type=int, default=128)
 parser.add_argument('--score_fc_dropout', type=float, default=0.05)
@@ -168,6 +171,14 @@ if __name__ == '__main__':
             args.sea_hidden_dim = int(params['sea_hidden_dim'])
         if 'sea_dropout' in params:
             args.sea_dropout = params['sea_dropout']
+        if 'sea_global_hidden_dim' in params:
+            args.sea_global_hidden_dim = int(params['sea_global_hidden_dim'])
+        if 'sea_global_eta' in params:
+            args.sea_global_eta = params['sea_global_eta']
+        if 'sea_pool_temp' in params:
+            args.sea_pool_temp = params['sea_pool_temp']
+        if 'sea_global_dropout' in params:
+            args.sea_global_dropout = params['sea_global_dropout']
         if 'score_fc_hidden_dim' in params:
             args.score_fc_hidden_dim = int(params['score_fc_hidden_dim'])
         if 'score_fc_dropout' in params:

@@ -58,7 +58,10 @@ parser.add_argument('--optuna_ei_candidates', type=int, default=128)
 parser.add_argument('--use_selective_agg', action='store_true')
 parser.add_argument('--sea_hidden_dim', type=int, default=0)
 parser.add_argument('--sea_dropout', type=float, default=0.0)
-parser.add_argument('--sea_use_target_gate', action='store_true')
+parser.add_argument('--sea_global_hidden_dim', type=int, default=0)
+parser.add_argument('--sea_global_eta', type=float, default=0.2)
+parser.add_argument('--sea_pool_temp', type=float, default=1.0)
+parser.add_argument('--sea_global_dropout', type=float, default=0.0)
 parser.add_argument('--use_score_fc', action='store_true')
 parser.add_argument('--score_fc_hidden_dim', type=int, default=128)
 parser.add_argument('--score_fc_dropout', type=float, default=0.05)
@@ -135,6 +138,10 @@ if __name__ == '__main__':
     if args.use_selective_agg:
         HPO_search_space['sea_hidden_dim'] = ('choice', [32, 64, 128, 256])
         HPO_search_space['sea_dropout'] = ('uniform', (0, 0.2))
+        HPO_search_space['sea_global_hidden_dim'] = ('choice', [32, 64, 128, 256])
+        HPO_search_space['sea_global_eta'] = ('choice', [0.1, 0.2, 0.5, 1.0])
+        HPO_search_space['sea_pool_temp'] = ('choice', [0.5, 1.0, 2.0])
+        HPO_search_space['sea_global_dropout'] = ('uniform', (0, 0.2))
         print('==> HPO: added SelectiveAgg search space')
     if args.use_score_fc:
         HPO_search_space['score_fc_hidden_dim'] = ('choice', [32, 64, 128, 256])
@@ -173,6 +180,14 @@ if __name__ == '__main__':
             args.sea_hidden_dim = int(params['sea_hidden_dim'])
         if 'sea_dropout' in params:
             args.sea_dropout = params['sea_dropout']
+        if 'sea_global_hidden_dim' in params:
+            args.sea_global_hidden_dim = int(params['sea_global_hidden_dim'])
+        if 'sea_global_eta' in params:
+            args.sea_global_eta = params['sea_global_eta']
+        if 'sea_pool_temp' in params:
+            args.sea_pool_temp = params['sea_pool_temp']
+        if 'sea_global_dropout' in params:
+            args.sea_global_dropout = params['sea_global_dropout']
         if 'score_fc_hidden_dim' in params:
             args.score_fc_hidden_dim = int(params['score_fc_hidden_dim'])
         if 'score_fc_dropout' in params:
