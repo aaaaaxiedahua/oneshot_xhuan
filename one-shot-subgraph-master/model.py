@@ -29,6 +29,8 @@ class GlobalCalibrationSEA(torch.nn.Module):
         return score_exp / score_sum
 
     def forward(self, hs, ho, hr, h_qr, hidden, h_qn, edge_query_idx, node_query_idx, n_query):
+        node_query_idx = node_query_idx.to(hidden.device)
+        edge_query_idx = edge_query_idx.to(hidden.device)
         rel_hidden = torch.tanh(self.rel_fc(torch.cat([hr, h_qr], dim=-1)))
         rel_hidden = self.local_dropout(rel_hidden)
         z_rel = self.rel_score(rel_hidden).squeeze(-1)
@@ -105,6 +107,7 @@ class GNNLayer(torch.nn.Module):
             message_agg = scatter(message, index=obj, dim=0, dim_size=n_node, reduce='sum')
         else:
             raw_message = hs * hr
+            node_batch_idxs = node_batch_idxs.to(hidden.device)
             h_qn = self.rela_embed(q_rel)[node_batch_idxs]
             gate = sea_gate(hs, ho, hr, h_qr, hidden, h_qn, r_idx, node_batch_idxs, len(q_rel))
             attn_score = self.w_alpha(
