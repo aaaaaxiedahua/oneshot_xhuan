@@ -136,9 +136,9 @@ if __name__ == '__main__':
     HPO_save_path = f'./results/{dataset}/search_log.pkl'
 
     if args.use_selective_agg:
-        HPO_search_space['sea_hidden_dim'] = ('choice', [32, 64, 128, 256])
+        HPO_search_space['sea_hidden_dim'] = ('choice', [32, 64, 128])
         HPO_search_space['sea_dropout'] = ('uniform', (0, 0.2))
-        HPO_search_space['sea_global_hidden_dim'] = ('choice', [32, 64, 128, 256])
+        HPO_search_space['sea_global_hidden_dim'] = ('choice', [32, 64, 128])
         HPO_search_space['sea_global_eta'] = ('choice', [0.1, 0.2, 0.5, 1.0])
         HPO_search_space['sea_pool_temp'] = ('choice', [0.5, 1.0, 2.0])
         HPO_search_space['sea_global_dropout'] = ('uniform', (0, 0.2))
