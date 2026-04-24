@@ -1,3 +1,4 @@
+import json
 import os
 import argparse
 import torch
@@ -55,6 +56,8 @@ parser.add_argument('--optuna_study_name', type=str, default='')
 parser.add_argument('--optuna_storage', type=str, default='')
 parser.add_argument('--optuna_startup_trials', type=int, default=3)
 parser.add_argument('--optuna_ei_candidates', type=int, default=128)
+parser.add_argument('--start_config', type=str, default='',
+                    help='Optional Optuna start config. Accepts either a JSON string or a path to a JSON file.')
 parser.add_argument('--use_selective_agg', action='store_true')
 parser.add_argument('--sea_hidden_dim', type=int, default=0)
 parser.add_argument('--sea_dropout', type=float, default=0.0)
@@ -68,6 +71,24 @@ parser.add_argument('--score_fc_dropout', type=float, default=0.05)
 parser.add_argument('--score_fc_lr', type=float, default=-1.0)
 parser.add_argument('--score_fc_weight_decay', type=float, default=-1.0)
 args = parser.parse_args()
+
+
+def load_manual_start_configs(start_config_arg):
+    if start_config_arg == '':
+        return []
+
+    if os.path.exists(start_config_arg):
+        with open(start_config_arg, 'r', encoding='utf-8') as f:
+            payload = json.load(f)
+    else:
+        payload = json.loads(start_config_arg)
+
+    if isinstance(payload, dict):
+        return [payload]
+    if isinstance(payload, list) and all(isinstance(item, dict) for item in payload):
+        return payload
+
+    raise ValueError('--start_config must be a JSON object, a JSON array of objects, or a path to a JSON file.')
 
 if __name__ == '__main__':
     torch.set_num_threads(8)
@@ -273,11 +294,17 @@ if __name__ == '__main__':
                 storage=storage,
                 enable_pruner=False,
             )
-            start_configs = None
+            start_configs = []
             if args.useSearchLog and os.path.exists(HPO_save_path):
                 config_list, _ = loadSearchLog(HPO_save_path)
-                start_configs = config_list
-                print(f'==> Optuna: enqueue {len(start_configs)} start config(s) from search log')
+                start_configs.extend(config_list)
+                print(f'==> Optuna: enqueue {len(config_list)} start config(s) from search log')
+            if args.start_config != '':
+                manual_start_configs = load_manual_start_configs(args.start_config)
+                start_configs.extend(manual_start_configs)
+                print(f'==> Optuna: enqueue {len(manual_start_configs)} manual start config(s)')
+            if len(start_configs) == 0:
+                start_configs = None
 
             def objective_fn(trial, config, reporter):
                 return run_model(config, reporter=reporter)
