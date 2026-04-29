@@ -35,6 +35,7 @@ parser.add_argument('--data_path', type=str, default='data/WN18RR/')
 parser.add_argument('--seed', type=str, default=1234)
 parser.add_argument('--topk', type=float, default=0.1) # number of sampled nodes (for a subgraph)
 parser.add_argument('--topm', type=float, default=-1) # number of sampled edges (for a subgraph)
+parser.add_argument('--final_topk', type=float, default=-1.0)
 parser.add_argument('--gpu', type=int, default=0)
 parser.add_argument('--fact_ratio', type=float, default=0.75)
 parser.add_argument('--val_num', type=int, default=-1)
@@ -58,18 +59,8 @@ parser.add_argument('--optuna_startup_trials', type=int, default=3)
 parser.add_argument('--optuna_ei_candidates', type=int, default=128)
 parser.add_argument('--start_config', type=str, default='',
                     help='Optional Optuna start config. Accepts either a JSON string or a path to a JSON file.')
-parser.add_argument('--use_selective_agg', action='store_true')
-parser.add_argument('--sea_hidden_dim', type=int, default=0)
-parser.add_argument('--sea_dropout', type=float, default=0.0)
-parser.add_argument('--sea_global_hidden_dim', type=int, default=0)
-parser.add_argument('--sea_global_eta', type=float, default=0.2)
-parser.add_argument('--sea_pool_temp', type=float, default=1.0)
-parser.add_argument('--sea_global_dropout', type=float, default=0.0)
-parser.add_argument('--use_score_fc', action='store_true')
-parser.add_argument('--score_fc_hidden_dim', type=int, default=128)
-parser.add_argument('--score_fc_dropout', type=float, default=0.05)
-parser.add_argument('--score_fc_lr', type=float, default=-1.0)
-parser.add_argument('--score_fc_weight_decay', type=float, default=-1.0)
+parser.add_argument('--use_rel_ppr_sampler', action='store_true')
+parser.add_argument('--rel_fuse_lambda', type=float, default=0.5)
 args = parser.parse_args()
 
 
@@ -132,6 +123,17 @@ if __name__ == '__main__':
     args.n_rel = loader.n_rel
     args.n_samp_ent = int(args.topk * loader.n_ent)
     args.n_samp_edge = int(args.topm * len(loader.fact_data)) if args.topm > 0  else -1
+    if args.use_rel_ppr_sampler:
+        if args.final_topk <= 0:
+            args.final_topk = round(args.topk * (2.0 / 3.0), 6)
+            print(f'==> relation sampler: final_topk not set, fallback to {args.final_topk}')
+        if args.final_topk >= args.topk:
+            raise ValueError('--final_topk must be smaller than --topk when --use_rel_ppr_sampler is enabled.')
+        args.n_final_samp_ent = max(1, int(args.final_topk * loader.n_ent))
+        if args.n_final_samp_ent >= args.n_samp_ent:
+            raise ValueError('--final_topk must produce fewer sampled nodes than --topk.')
+    else:
+        args.n_final_samp_ent = args.n_samp_ent
     
     # sampler for testing
     test_data = loader.double_triple(loader.all_triple)
@@ -156,20 +158,15 @@ if __name__ == '__main__':
     test_loader.addSampler(test_sampler)
     HPO_save_path = f'./results/{dataset}/search_log.pkl'
 
-    if args.use_selective_agg:
-        HPO_search_space['sea_hidden_dim'] = ('choice', [32, 64, 128])
-        HPO_search_space['sea_dropout'] = ('uniform', (0, 0.2))
-        HPO_search_space['sea_global_hidden_dim'] = ('choice', [32, 64, 128])
-        HPO_search_space['sea_global_eta'] = ('choice', [0.1, 0.2, 0.5, 1.0])
-        HPO_search_space['sea_pool_temp'] = ('choice', [0.5, 1.0, 2.0])
-        HPO_search_space['sea_global_dropout'] = ('uniform', (0, 0.2))
-        print('==> HPO: added SelectiveAgg search space')
-    if args.use_score_fc:
-        HPO_search_space['score_fc_hidden_dim'] = ('choice', [32, 64, 128, 256])
-        HPO_search_space['score_fc_dropout'] = ('uniform', (0, 0.2))
-        HPO_search_space['score_fc_lr'] = ('choice', [1e-6, 5e-6, 1e-5, 5e-5, 1e-4, 5e-4, 1e-3, 5e-3])
-        HPO_search_space['score_fc_weight_decay'] = ('choice', [0.0, 1e-7, 5e-7, 1e-6, 5e-6, 1e-5, 5e-5, 1e-4, 5e-4, 1e-3])
-        print('==> HPO: added ScoreFC search space')
+    if args.use_rel_ppr_sampler:
+        final_topk_candidates = sorted(set([
+            round(args.topk * 0.5, 6),
+            round(args.topk * (2.0 / 3.0), 6),
+            round(args.topk * 0.8, 6),
+        ]))
+        HPO_search_space['final_topk'] = ('choice', final_topk_candidates)
+        HPO_search_space['rel_fuse_lambda'] = ('choice', [0.25, 0.5, 0.75, 1.0])
+        print('==> HPO: added relation PPR sampler search space')
     
     def loadSearchLog(file):
         assert os.path.exists(file)
@@ -197,26 +194,16 @@ if __name__ == '__main__':
         args.concatHidden = params['concatHidden']
         args.shortcut = params['shortcut']
         args.readout = params['readout']
-        if 'sea_hidden_dim' in params:
-            args.sea_hidden_dim = int(params['sea_hidden_dim'])
-        if 'sea_dropout' in params:
-            args.sea_dropout = params['sea_dropout']
-        if 'sea_global_hidden_dim' in params:
-            args.sea_global_hidden_dim = int(params['sea_global_hidden_dim'])
-        if 'sea_global_eta' in params:
-            args.sea_global_eta = params['sea_global_eta']
-        if 'sea_pool_temp' in params:
-            args.sea_pool_temp = params['sea_pool_temp']
-        if 'sea_global_dropout' in params:
-            args.sea_global_dropout = params['sea_global_dropout']
-        if 'score_fc_hidden_dim' in params:
-            args.score_fc_hidden_dim = int(params['score_fc_hidden_dim'])
-        if 'score_fc_dropout' in params:
-            args.score_fc_dropout = params['score_fc_dropout']
-        if 'score_fc_lr' in params:
-            args.score_fc_lr = params['score_fc_lr']
-        if 'score_fc_weight_decay' in params:
-            args.score_fc_weight_decay = params['score_fc_weight_decay']
+        if 'final_topk' in params:
+            args.final_topk = params['final_topk']
+        if 'rel_fuse_lambda' in params:
+            args.rel_fuse_lambda = params['rel_fuse_lambda']
+        if args.use_rel_ppr_sampler:
+            args.n_final_samp_ent = max(1, int(args.final_topk * loader.n_ent))
+            train_sampler.n_final_samp_ent = args.n_final_samp_ent
+            test_sampler.n_final_samp_ent = args.n_final_samp_ent
+            train_sampler.rel_fuse_lambda = args.rel_fuse_lambda
+            test_sampler.rel_fuse_lambda = args.rel_fuse_lambda
         
         # build model
         model = BaseModel(args, loaders=(loader, val_loader, test_loader), samplers=(train_sampler, test_sampler))

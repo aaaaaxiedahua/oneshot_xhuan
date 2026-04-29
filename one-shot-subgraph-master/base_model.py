@@ -33,16 +33,6 @@ class BaseModel(object):
         self.mean_rank_dict = {}
 
     def _build_optimizer(self):
-        if getattr(self.args, 'use_score_fc', False):
-            score_fc_lr = self.args.score_fc_lr if self.args.score_fc_lr > 0 else self.args.lr
-            score_fc_weight_decay = self.args.score_fc_weight_decay if self.args.score_fc_weight_decay >= 0 else self.args.lamb
-            score_fc_params = list(self.model.score_fc_head.parameters()) + list(self.model.score_rela_embed.parameters())
-            score_fc_param_ids = {id(param) for param in score_fc_params}
-            base_params = [param for param in self.model.parameters() if id(param) not in score_fc_param_ids]
-            return Adam([
-                {'params': base_params, 'lr': self.args.lr, 'weight_decay': self.args.lamb},
-                {'params': score_fc_params, 'lr': score_fc_lr, 'weight_decay': score_fc_weight_decay},
-            ])
         return Adam(self.model.parameters(), lr=self.args.lr, weight_decay=self.args.lamb)
         
     def saveModelToFiles(self, args, best_metric, deleteLastFile=True):

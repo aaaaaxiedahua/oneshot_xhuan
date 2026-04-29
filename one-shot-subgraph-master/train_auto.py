@@ -23,6 +23,7 @@ parser.add_argument('--data_path', type=str, default='data/WN18RR/')
 parser.add_argument('--seed', type=str, default=1234)
 parser.add_argument('--topk', type=float, default=0.1) # number of sampled nodes (for a subgraph)
 parser.add_argument('--topm', type=float, default=-1) # number of sampled edges (for a subgraph)
+parser.add_argument('--final_topk', type=float, default=-1.0)
 parser.add_argument('--gpu', type=int, default=0)
 parser.add_argument('--fact_ratio', type=float, default=0.75)
 parser.add_argument('--val_num', type=int, default=-1) # how many triples are used as the validate set
@@ -47,18 +48,8 @@ parser.add_argument('--readout', type=str, choices=['linear', 'multiply'], defau
 parser.add_argument('--decay_rate', type=float, default=None)
 parser.add_argument('--lamb', type=float, default=None)
 parser.add_argument('--dropout', type=float, default=None)
-parser.add_argument('--use_selective_agg', action='store_true')
-parser.add_argument('--sea_hidden_dim', type=int, default=0)
-parser.add_argument('--sea_dropout', type=float, default=0.0)
-parser.add_argument('--sea_global_hidden_dim', type=int, default=0)
-parser.add_argument('--sea_global_eta', type=float, default=0.2)
-parser.add_argument('--sea_pool_temp', type=float, default=1.0)
-parser.add_argument('--sea_global_dropout', type=float, default=0.0)
-parser.add_argument('--use_score_fc', action='store_true')
-parser.add_argument('--score_fc_hidden_dim', type=int, default=128)
-parser.add_argument('--score_fc_dropout', type=float, default=0.05)
-parser.add_argument('--score_fc_lr', type=float, default=-1.0)
-parser.add_argument('--score_fc_weight_decay', type=float, default=-1.0)
+parser.add_argument('--use_rel_ppr_sampler', action='store_true')
+parser.add_argument('--rel_fuse_lambda', type=float, default=0.5)
 args = parser.parse_args()
 
 class Options(object):
@@ -123,6 +114,17 @@ if __name__ == '__main__':
     # number of sampled entities
     args.n_samp_ent = int(args.topk * loader.n_ent)
     args.n_samp_edge = int(args.topm * len(loader.fact_data)) if args.topm > 0  else -1
+    if args.use_rel_ppr_sampler:
+        if args.final_topk <= 0:
+            args.final_topk = round(args.topk * (2.0 / 3.0), 6)
+            print(f'==> relation sampler: final_topk not set, fallback to {args.final_topk}')
+        if args.final_topk >= args.topk:
+            raise ValueError('--final_topk must be smaller than --topk when --use_rel_ppr_sampler is enabled.')
+        args.n_final_samp_ent = max(1, int(args.final_topk * loader.n_ent))
+        if args.n_final_samp_ent >= args.n_samp_ent:
+            raise ValueError('--final_topk must produce fewer sampled nodes than --topk.')
+    else:
+        args.n_final_samp_ent = args.n_samp_ent
     print(f'==> #sampled entities:{args.n_samp_ent}, #sampled edges:{args.n_samp_edge}')
     
     # sampler for testing
@@ -167,26 +169,20 @@ if __name__ == '__main__':
         args.concatHidden = params['concatHidden']
         args.shortcut = params['shortcut']
         args.readout = params['readout']
-        if 'sea_hidden_dim' in params:
-            args.sea_hidden_dim = int(params['sea_hidden_dim'])
-        if 'sea_dropout' in params:
-            args.sea_dropout = params['sea_dropout']
-        if 'sea_global_hidden_dim' in params:
-            args.sea_global_hidden_dim = int(params['sea_global_hidden_dim'])
-        if 'sea_global_eta' in params:
-            args.sea_global_eta = params['sea_global_eta']
-        if 'sea_pool_temp' in params:
-            args.sea_pool_temp = params['sea_pool_temp']
-        if 'sea_global_dropout' in params:
-            args.sea_global_dropout = params['sea_global_dropout']
-        if 'score_fc_hidden_dim' in params:
-            args.score_fc_hidden_dim = int(params['score_fc_hidden_dim'])
-        if 'score_fc_dropout' in params:
-            args.score_fc_dropout = params['score_fc_dropout']
-        if 'score_fc_lr' in params:
-            args.score_fc_lr = params['score_fc_lr']
-        if 'score_fc_weight_decay' in params:
-            args.score_fc_weight_decay = params['score_fc_weight_decay']
+        if 'use_rel_ppr_sampler' in params:
+            args.use_rel_ppr_sampler = params['use_rel_ppr_sampler']
+        if 'rel_fuse_lambda' in params:
+            args.rel_fuse_lambda = params['rel_fuse_lambda']
+        if 'final_topk' in params:
+            args.final_topk = params['final_topk']
+        if args.use_rel_ppr_sampler:
+            args.n_final_samp_ent = max(1, int(args.final_topk * loader.n_ent))
+            if args.n_final_samp_ent >= args.n_samp_ent:
+                raise ValueError('--final_topk must produce fewer sampled nodes than --topk.')
+            train_sampler.n_final_samp_ent = args.n_final_samp_ent
+            test_sampler.n_final_samp_ent = args.n_final_samp_ent
+            train_sampler.rel_fuse_lambda = args.rel_fuse_lambda
+            test_sampler.rel_fuse_lambda = args.rel_fuse_lambda
         
         # build model
         model = BaseModel(args, loaders=(loader, val_loader, test_loader), samplers=(train_sampler, test_sampler))
