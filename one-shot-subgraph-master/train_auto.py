@@ -50,6 +50,10 @@ parser.add_argument('--lamb', type=float, default=None)
 parser.add_argument('--dropout', type=float, default=None)
 parser.add_argument('--use_rel_ppr_sampler', action='store_true')
 parser.add_argument('--rel_fuse_lambda', type=float, default=0.5)
+parser.add_argument('--use_rule_flow', action='store_true')
+parser.add_argument('--flow_hidden_dim', type=int, default=None)
+parser.add_argument('--flow_lambda', type=float, default=None)
+parser.add_argument('--flow_rho', type=float, default=None)
 args = parser.parse_args()
 
 class Options(object):
@@ -69,10 +73,15 @@ def apply_param_overrides(params, args):
         'decay_rate': args.decay_rate,
         'lamb': args.lamb,
         'dropout': args.dropout,
+        'flow_hidden_dim': args.flow_hidden_dim,
+        'flow_lambda': args.flow_lambda,
+        'flow_rho': args.flow_rho,
     }
     for key, value in override_map.items():
         if value is not None:
             params[key] = value
+    if args.use_rule_flow:
+        params['use_rule_flow'] = True
     return params
 
 if __name__ == '__main__':
@@ -169,6 +178,15 @@ if __name__ == '__main__':
         args.concatHidden = params['concatHidden']
         args.shortcut = params['shortcut']
         args.readout = params['readout']
+        args.use_rule_flow = bool(params.get('use_rule_flow', args.use_rule_flow))
+        if args.use_rule_flow:
+            args.flow_hidden_dim = int(params.get('flow_hidden_dim', args.flow_hidden_dim or args.attn_dim))
+            args.flow_lambda = float(params.get('flow_lambda', args.flow_lambda if args.flow_lambda is not None else 0.3))
+            args.flow_rho = float(params.get('flow_rho', args.flow_rho if args.flow_rho is not None else 0.5))
+        else:
+            args.flow_hidden_dim = args.flow_hidden_dim if args.flow_hidden_dim is not None else args.attn_dim
+            args.flow_lambda = args.flow_lambda if args.flow_lambda is not None else 0.3
+            args.flow_rho = args.flow_rho if args.flow_rho is not None else 0.5
         if 'use_rel_ppr_sampler' in params:
             args.use_rel_ppr_sampler = params['use_rel_ppr_sampler']
         if 'rel_fuse_lambda' in params:

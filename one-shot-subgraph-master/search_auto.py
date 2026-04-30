@@ -15,6 +15,7 @@ from PPR_sampler import pprSampler
 HPO_search_space = {
         # discrete
         'lr':                    ('choice', [1e-2, 1e-3, 1e-4, 1e-5, 1e-6]), 
+        'topk':                  ('choice', [0.09, 0.1, 0.12, 0.15]),
         'hidden_dim':            ('choice', [16, 32, 48, 64, 128, 256]),
         'attn_dim':              ('choice', [2, 4, 8, 16, 32, 64]),
         'n_layer':               ('choice', [4, 6, 8, 10]),
@@ -61,6 +62,10 @@ parser.add_argument('--start_config', type=str, default='',
                     help='Optional Optuna start config. Accepts either a JSON string or a path to a JSON file.')
 parser.add_argument('--use_rel_ppr_sampler', action='store_true')
 parser.add_argument('--rel_fuse_lambda', type=float, default=0.5)
+parser.add_argument('--use_rule_flow', action='store_true')
+parser.add_argument('--flow_hidden_dim', type=int, default=None)
+parser.add_argument('--flow_lambda', type=float, default=None)
+parser.add_argument('--flow_rho', type=float, default=None)
 args = parser.parse_args()
 
 
@@ -164,9 +169,15 @@ if __name__ == '__main__':
             round(args.topk * (2.0 / 3.0), 6),
             round(args.topk * 0.8, 6),
         ]))
-        HPO_search_space['final_topk'] = ('choice', final_topk_candidates)
+        if 'topk' not in HPO_search_space:
+            HPO_search_space['final_topk'] = ('choice', final_topk_candidates)
         HPO_search_space['rel_fuse_lambda'] = ('choice', [0.25, 0.5, 0.75, 1.0])
         print('==> HPO: added relation PPR sampler search space')
+    if args.use_rule_flow:
+        HPO_search_space['flow_hidden_dim'] = ('choice', [8, 16, 32, 64, 128])
+        HPO_search_space['flow_lambda'] = ('choice', [0.2, 0.3, 0.4, 0.5])
+        HPO_search_space['flow_rho'] = ('choice', [0.3, 0.4, 0.5, 0.6, 0.7])
+        print('==> HPO: added rule-flow search space')
     
     def loadSearchLog(file):
         assert os.path.exists(file)
@@ -183,6 +194,7 @@ if __name__ == '__main__':
     def run_model(params, save_path=HPO_save_path, finetune_idx=-1, reporter=None):       
         print(params)
         args.lr = params['lr']
+        args.topk = float(params.get('topk', args.topk))
         args.decay_rate = params['decay_rate']
         args.lamb = params['lamb']
         args.hidden_dim = int(params['hidden_dim'])
@@ -194,12 +206,30 @@ if __name__ == '__main__':
         args.concatHidden = params['concatHidden']
         args.shortcut = params['shortcut']
         args.readout = params['readout']
+        args.use_rule_flow = bool(params.get('use_rule_flow', args.use_rule_flow))
+        if args.use_rule_flow:
+            args.flow_hidden_dim = int(params.get('flow_hidden_dim', args.flow_hidden_dim or args.attn_dim))
+            args.flow_lambda = float(params.get('flow_lambda', args.flow_lambda if args.flow_lambda is not None else 0.3))
+            args.flow_rho = float(params.get('flow_rho', args.flow_rho if args.flow_rho is not None else 0.5))
+        else:
+            args.flow_hidden_dim = args.flow_hidden_dim if args.flow_hidden_dim is not None else args.attn_dim
+            args.flow_lambda = args.flow_lambda if args.flow_lambda is not None else 0.3
+            args.flow_rho = args.flow_rho if args.flow_rho is not None else 0.5
+        args.n_samp_ent = max(1, int(args.topk * loader.n_ent))
+        train_sampler.topk = args.n_samp_ent
+        test_sampler.topk = args.n_samp_ent
+        train_sampler.n_samp_ent = args.n_samp_ent
+        test_sampler.n_samp_ent = args.n_samp_ent
         if 'final_topk' in params:
             args.final_topk = params['final_topk']
         if 'rel_fuse_lambda' in params:
             args.rel_fuse_lambda = params['rel_fuse_lambda']
         if args.use_rel_ppr_sampler:
+            if args.final_topk <= 0 or args.final_topk >= args.topk:
+                args.final_topk = round(args.topk * (2.0 / 3.0), 6)
             args.n_final_samp_ent = max(1, int(args.final_topk * loader.n_ent))
+            if args.n_final_samp_ent >= args.n_samp_ent:
+                args.n_final_samp_ent = max(1, args.n_samp_ent - 1)
             train_sampler.n_final_samp_ent = args.n_final_samp_ent
             test_sampler.n_final_samp_ent = args.n_final_samp_ent
             train_sampler.rel_fuse_lambda = args.rel_fuse_lambda
