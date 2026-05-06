@@ -30,7 +30,7 @@ HPO_search_space = {
 
 parser = argparse.ArgumentParser(description="Parser")
 parser.add_argument('--data_path', type=str, default='data/WN18RR/')
-parser.add_argument('--seed', type=str, default=1234)
+parser.add_argument('--seed', type=int, default=1234)
 parser.add_argument('--topk', type=float, default=0.1)
 parser.add_argument('--topm', type=float, default=-1)
 parser.add_argument('--gpu', type=int, default=0)
@@ -88,7 +88,9 @@ def load_manual_start_configs(start_config_arg):
 
 
 if __name__ == '__main__':
-    torch.set_num_threads(8)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    torch.set_num_threads(max(1, int(args.cpu)))
     torch.multiprocessing.set_sharing_strategy('file_system')
 
     dataset = args.data_path
@@ -188,6 +190,8 @@ if __name__ == '__main__':
 
     def run_model(params, save_path=HPO_save_path, finetune_idx=-1, reporter=None):
         print(params)
+        np.random.seed(args.seed)
+        torch.manual_seed(args.seed)
         args.lr = params['lr']
         args.topk = float(params.get('topk', args.topk))
         args.decay_rate = params['decay_rate']

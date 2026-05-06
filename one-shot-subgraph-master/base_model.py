@@ -23,9 +23,18 @@ class BaseModel(object):
         self.n_samp_ent = args.n_samp_ent
         self.n_rel = loader.n_rel
         self.train_sampler, self.test_sampler = samplers
-        self.trainLoader = DataLoader(loader, batch_size=args.n_batch, num_workers=args.cpu, collate_fn=loader.collate_fn, shuffle=False, prefetch_factor=args.cpu, pin_memory=True)
-        self.valLoader = DataLoader(val_loader, batch_size=args.n_tbatch, num_workers=args.cpu, collate_fn=val_loader.collate_fn, shuffle=False, prefetch_factor=args.cpu, pin_memory=True)
-        self.testLoader = DataLoader(test_loader, batch_size=args.n_tbatch, num_workers=args.cpu, collate_fn=test_loader.collate_fn, shuffle=False, prefetch_factor=args.cpu, pin_memory=True)
+        worker_count = max(0, int(args.cpu))
+        loader_kwargs = {
+            'num_workers': worker_count,
+            'pin_memory': True,
+            'shuffle': False,
+        }
+        if worker_count > 0:
+            loader_kwargs['prefetch_factor'] = max(2, worker_count)
+
+        self.trainLoader = DataLoader(loader, batch_size=args.n_batch, collate_fn=loader.collate_fn, **loader_kwargs)
+        self.valLoader = DataLoader(val_loader, batch_size=args.n_tbatch, collate_fn=val_loader.collate_fn, **loader_kwargs)
+        self.testLoader = DataLoader(test_loader, batch_size=args.n_tbatch, collate_fn=test_loader.collate_fn, **loader_kwargs)
         self.optimizer = self._build_optimizer()
         self.scheduler = ReduceLROnPlateau(self.optimizer, mode='max', factor=0.5, patience=2, min_lr=args.lr/20, verbose=True)
         self.smooth = 1e-5
@@ -58,10 +67,15 @@ class BaseModel(object):
 
     def prepareData(self, batch_data):
         subs, rels, objs, batch_idxs, abs_idxs, query_sub_idxs, edge_batch_idxs, batch_sampled_edges = batch_data
-        subgraph_data = [batch_idxs, abs_idxs, query_sub_idxs, edge_batch_idxs.cuda(), batch_sampled_edges.cuda()]
-        subs = subs.cuda().flatten()
-        rels = rels.cuda().flatten()
-        objs = objs.cuda()
+        batch_idxs = batch_idxs.cuda(non_blocking=True)
+        abs_idxs = abs_idxs.cuda(non_blocking=True)
+        query_sub_idxs = query_sub_idxs.cuda(non_blocking=True)
+        edge_batch_idxs = edge_batch_idxs.cuda(non_blocking=True)
+        batch_sampled_edges = batch_sampled_edges.cuda(non_blocking=True)
+        subgraph_data = [batch_idxs, abs_idxs, query_sub_idxs, edge_batch_idxs, batch_sampled_edges]
+        subs = subs.cuda(non_blocking=True).flatten()
+        rels = rels.cuda(non_blocking=True).flatten()
+        objs = objs.cuda(non_blocking=True)
         return subs, rels, objs, subgraph_data
         
     def train_batch(self,):        
@@ -75,7 +89,7 @@ class BaseModel(object):
             subs, rels, objs, subgraph_data = self.prepareData(batch_data)
             
             # forward
-            self.model.zero_grad()
+            self.optimizer.zero_grad(set_to_none=True)
             scores = self.model(subs, rels, subgraph_data)
             
             # loss calculation

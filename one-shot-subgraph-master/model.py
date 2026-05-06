@@ -41,34 +41,33 @@ class GNNLayer(torch.nn.Module):
             edge_rel_out_dim = edge_rel_out_dim if edge_rel_out_dim is not None else attn_dim
             self.edge_rel_hidden_dim = edge_rel_hidden_dim
             self.edge_rel_out_dim = edge_rel_out_dim
-            self.edge_rel_head = nn.Sequential(
+            self.node_rel_proj = nn.Sequential(
                 nn.Linear(in_dim + in_dim, edge_rel_hidden_dim),
                 nn.ReLU(),
                 nn.Linear(edge_rel_hidden_dim, edge_rel_out_dim),
             )
-            self.edge_rel_tail = nn.Sequential(
-                nn.Linear(in_dim + in_dim + in_dim, edge_rel_hidden_dim),
-                nn.ReLU(),
-                nn.Linear(edge_rel_hidden_dim, edge_rel_out_dim),
-            )
+            self.edge_rel_proj = nn.Linear(in_dim + in_dim, edge_rel_out_dim, bias=False)
 
         if self.use_rel_smoothing:
             self.rel_smooth_proj = nn.Linear(in_dim, in_dim, bias=False)
 
-    def _smoothed_relation(self, hr):
+    def _smoothed_relation_bank(self):
         if not self.use_rel_smoothing:
-            return hr
+            return self.rela_embed.weight
 
         rel_bank = self.rela_embed.weight
-        smooth_logits = torch.matmul(self.rel_smooth_proj(hr), rel_bank.transpose(0, 1)) / max(self.rel_smooth_tau, 1e-6)
+        smooth_logits = torch.matmul(
+            self.rel_smooth_proj(rel_bank), rel_bank.transpose(0, 1)
+        ) / max(self.rel_smooth_tau, 1e-6)
         smooth_attn = torch.softmax(smooth_logits, dim=-1)
-        smooth_rel = torch.matmul(smooth_attn, rel_bank)
-        return (1.0 - self.rel_smooth_lambda) * hr + self.rel_smooth_lambda * smooth_rel
+        smooth_bank = torch.matmul(smooth_attn, rel_bank)
+        return (1.0 - self.rel_smooth_lambda) * rel_bank + self.rel_smooth_lambda * smooth_bank
 
     def forward(
         self,
         q_sub,
         q_rel,
+        batch_idxs,
         r_idx,
         hidden,
         edges,
@@ -79,21 +78,26 @@ class GNNLayer(torch.nn.Module):
         rel = edges[:, 1]
         obj = edges[:, 2]
         hs = hidden[sub]
-        ho = hidden[obj]
-        hr = self.rela_embed(rel)
-        h_qr = self.rela_embed(q_rel)[r_idx]
-        hr = self._smoothed_relation(hr)
+        rel_bank = self._smoothed_relation_bank()
+        hr = rel_bank[rel]
+        q_rel_bank = rel_bank[q_rel]
+        h_qr = q_rel_bank[r_idx]
 
-        alpha = torch.sigmoid(
-            self.w_alpha(
-                nn.ReLU()(self.Ws_attn(hs) + self.Wr_attn(hr) + self.Wqr_attn(h_qr))
-            )
-        )
+        alpha_input = self.Ws_attn(hs) + self.Wr_attn(hr) + self.Wqr_attn(h_qr)
+        alpha = torch.sigmoid(self.w_alpha(torch.relu(alpha_input)))
 
         if self.use_edge_reliability:
-            rel_head = self.edge_rel_head(torch.cat([hs, h_qr], dim=-1))
-            rel_tail = self.edge_rel_tail(torch.cat([ho, hr, h_qr], dim=-1))
-            reliability = torch.sigmoid(torch.sum(rel_head * rel_tail, dim=-1, keepdim=True))
+            # Project node-query states once per layer, then score each edge with
+            # a lightweight relation/query offset.
+            node_query = q_rel_bank[batch_idxs]
+            node_rel_repr = self.node_rel_proj(torch.cat([hidden, node_query], dim=-1))
+            rel_offset = self.edge_rel_proj(torch.cat([hr, h_qr], dim=-1))
+            rel_score = torch.sum(
+                node_rel_repr[sub] * (node_rel_repr[obj] + rel_offset),
+                dim=-1,
+                keepdim=True,
+            ) / (self.edge_rel_out_dim ** 0.5)
+            reliability = torch.sigmoid(rel_score)
         else:
             reliability = 1.0
 
@@ -160,8 +164,9 @@ class GNN_auto(torch.nn.Module):
         n = len(q_sub)
         batch_idxs, abs_idxs, query_sub_idxs, edge_batch_idxs, batch_sampled_edges = subgraph_data
         n_node = len(batch_idxs)
-        h0 = torch.zeros((1, n_node, self.hidden_dim)).cuda()
-        hidden = torch.zeros(n_node, self.hidden_dim).cuda()
+        device = q_rel.device
+        h0 = torch.zeros((1, n_node, self.hidden_dim), device=device)
+        hidden = torch.zeros(n_node, self.hidden_dim, device=device)
 
         if self.params.initializer == 'binary':
             hidden[query_sub_idxs, :] = 1
@@ -175,6 +180,7 @@ class GNN_auto(torch.nn.Module):
             hidden = self.gnn_layers[i](
                 q_sub,
                 q_rel,
+                batch_idxs,
                 edge_batch_idxs,
                 hidden,
                 batch_sampled_edges,
@@ -201,6 +207,6 @@ class GNN_auto(torch.nn.Module):
                 hidden = torch.cat(hidden_list, dim=-1)
             scores = torch.sum(hidden * hidden[query_sub_idxs][batch_idxs], dim=-1)
 
-        scores_all = torch.zeros((n, self.loader.n_ent)).cuda()
+        scores_all = scores.new_zeros((n, self.loader.n_ent))
         scores_all[batch_idxs, abs_idxs] = scores
         return scores_all
