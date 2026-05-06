@@ -1,4 +1,3 @@
-import math
 import torch
 import torch.nn as nn
 from torch_scatter import scatter
@@ -12,8 +11,12 @@ class GNNLayer(torch.nn.Module):
         attn_dim,
         n_rel,
         act=lambda x: x,
-        use_composed_path=False,
-        path_dim=None,
+        use_edge_reliability=False,
+        edge_rel_hidden_dim=None,
+        edge_rel_out_dim=None,
+        use_rel_smoothing=False,
+        rel_smooth_tau=1.0,
+        rel_smooth_lambda=0.1,
     ):
         super(GNNLayer, self).__init__()
         self.n_rel = n_rel
@@ -21,9 +24,10 @@ class GNNLayer(torch.nn.Module):
         self.out_dim = out_dim
         self.attn_dim = attn_dim
         self.act = act
-        self.use_composed_path = use_composed_path
-        self.path_dim = path_dim if path_dim is not None else attn_dim
-        self.path_scale = math.sqrt(max(1, self.path_dim))
+        self.use_edge_reliability = use_edge_reliability
+        self.use_rel_smoothing = use_rel_smoothing
+        self.rel_smooth_tau = rel_smooth_tau
+        self.rel_smooth_lambda = rel_smooth_lambda
 
         self.rela_embed = nn.Embedding(2 * n_rel + 1, in_dim)
         self.Ws_attn = nn.Linear(in_dim, attn_dim, bias=False)
@@ -32,13 +36,34 @@ class GNNLayer(torch.nn.Module):
         self.w_alpha = nn.Linear(attn_dim, 1)
         self.W_h = nn.Linear(in_dim, out_dim, bias=False)
 
-        if self.use_composed_path:
-            self.path_proj = nn.Linear(self.path_dim, self.path_dim, bias=False)
-            self.rel_to_path = nn.Linear(in_dim, self.path_dim, bias=False)
-            self.path_rel_inter = nn.Linear(self.path_dim, self.path_dim, bias=False)
-            self.Wc_attn = nn.Linear(self.path_dim, attn_dim, bias=False)
-            self.Wq_path_attn = nn.Linear(in_dim, self.path_dim, bias=False)
-            self.path_to_message = nn.Linear(self.path_dim, in_dim, bias=False)
+        if self.use_edge_reliability:
+            edge_rel_hidden_dim = edge_rel_hidden_dim if edge_rel_hidden_dim is not None else in_dim
+            edge_rel_out_dim = edge_rel_out_dim if edge_rel_out_dim is not None else attn_dim
+            self.edge_rel_hidden_dim = edge_rel_hidden_dim
+            self.edge_rel_out_dim = edge_rel_out_dim
+            self.edge_rel_head = nn.Sequential(
+                nn.Linear(in_dim + in_dim, edge_rel_hidden_dim),
+                nn.ReLU(),
+                nn.Linear(edge_rel_hidden_dim, edge_rel_out_dim),
+            )
+            self.edge_rel_tail = nn.Sequential(
+                nn.Linear(in_dim + in_dim + in_dim, edge_rel_hidden_dim),
+                nn.ReLU(),
+                nn.Linear(edge_rel_hidden_dim, edge_rel_out_dim),
+            )
+
+        if self.use_rel_smoothing:
+            self.rel_smooth_proj = nn.Linear(in_dim, in_dim, bias=False)
+
+    def _smoothed_relation(self, hr):
+        if not self.use_rel_smoothing:
+            return hr
+
+        rel_bank = self.rela_embed.weight
+        smooth_logits = torch.matmul(self.rel_smooth_proj(hr), rel_bank.transpose(0, 1)) / max(self.rel_smooth_tau, 1e-6)
+        smooth_attn = torch.softmax(smooth_logits, dim=-1)
+        smooth_rel = torch.matmul(smooth_attn, rel_bank)
+        return (1.0 - self.rel_smooth_lambda) * hr + self.rel_smooth_lambda * smooth_rel
 
     def forward(
         self,
@@ -49,61 +74,37 @@ class GNNLayer(torch.nn.Module):
         edges,
         n_node,
         shortcut=False,
-        path_prev=None,
     ):
-        # edges: [h, r, t]
         sub = edges[:, 0]
         rel = edges[:, 1]
         obj = edges[:, 2]
         hs = hidden[sub]
+        ho = hidden[obj]
         hr = self.rela_embed(rel)
         h_qr = self.rela_embed(q_rel)[r_idx]
+        hr = self._smoothed_relation(hr)
 
-        if self.use_composed_path:
-            if path_prev is None:
-                raise ValueError('path_prev is required when use_composed_path is enabled.')
+        alpha = torch.sigmoid(
+            self.w_alpha(
+                nn.ReLU()(self.Ws_attn(hs) + self.Wr_attn(hr) + self.Wqr_attn(h_qr))
+            )
+        )
 
-            path_sub = path_prev[sub]
-            rel_path = self.rel_to_path(hr)
-            composed_path = torch.tanh(
-                self.path_proj(path_sub)
-                + rel_path
-                + self.path_rel_inter(path_sub * rel_path)
-            )
-            local_score = self.w_alpha(
-                torch.relu(self.Ws_attn(hs) + self.Wc_attn(composed_path))
-            )
-            query_score = (
-                torch.sum(self.Wq_path_attn(h_qr) * composed_path, dim=-1, keepdim=True)
-                / self.path_scale
-            )
-            alpha = torch.sigmoid(local_score + query_score)
-            rel_message = torch.tanh(self.path_to_message(composed_path))
-            message = hs * rel_message
-            path_message = scatter(
-                alpha * composed_path,
-                index=obj,
-                dim=0,
-                dim_size=n_node,
-                reduce='sum',
-            )
+        if self.use_edge_reliability:
+            rel_head = self.edge_rel_head(torch.cat([hs, h_qr], dim=-1))
+            rel_tail = self.edge_rel_tail(torch.cat([ho, hr, h_qr], dim=-1))
+            reliability = torch.sigmoid(torch.sum(rel_head * rel_tail, dim=-1, keepdim=True))
         else:
-            message = hs * hr
-            alpha = torch.sigmoid(
-                self.w_alpha(
-                    nn.ReLU()(self.Ws_attn(hs) + self.Wr_attn(hr) + self.Wqr_attn(h_qr))
-                )
-            )
-            path_message = None
+            reliability = 1.0
 
-        message = alpha * message
+        message = reliability * alpha * (hs * hr)
         message_agg = scatter(message, index=obj, dim=0, dim_size=n_node, reduce='sum')
         hidden_new = self.act(self.W_h(message_agg))
 
         if shortcut:
             hidden_new = hidden_new + hidden
 
-        return hidden_new, path_message
+        return hidden_new
 
 
 class GNN_auto(torch.nn.Module):
@@ -116,8 +117,13 @@ class GNN_auto(torch.nn.Module):
         self.n_rel = params.n_rel
         self.n_ent = params.n_ent
         self.loader = loader
-        self.use_composed_path = bool(getattr(params, 'use_composed_path', False))
-        self.path_dim = getattr(params, 'path_dim', None) or self.attn_dim
+        self.use_edge_reliability = bool(getattr(params, 'use_edge_reliability', False))
+        self.edge_rel_hidden_dim = getattr(params, 'edge_rel_hidden_dim', None)
+        self.edge_rel_out_dim = getattr(params, 'edge_rel_out_dim', None)
+        self.use_rel_smoothing = bool(getattr(params, 'use_rel_smoothing', False))
+        self.rel_smooth_tau = float(getattr(params, 'rel_smooth_tau', 1.0))
+        self.rel_smooth_lambda = float(getattr(params, 'rel_smooth_lambda', 0.1))
+
         acts = {'relu': nn.ReLU(), 'tanh': torch.tanh, 'idd': lambda x: x}
         act = acts[params.act]
 
@@ -130,17 +136,17 @@ class GNN_auto(torch.nn.Module):
                     self.attn_dim,
                     self.n_rel,
                     act=act,
-                    use_composed_path=self.use_composed_path,
-                    path_dim=self.path_dim,
+                    use_edge_reliability=self.use_edge_reliability,
+                    edge_rel_hidden_dim=self.edge_rel_hidden_dim,
+                    edge_rel_out_dim=self.edge_rel_out_dim,
+                    use_rel_smoothing=self.use_rel_smoothing,
+                    rel_smooth_tau=self.rel_smooth_tau,
+                    rel_smooth_lambda=self.rel_smooth_lambda,
                 )
             )
         self.gnn_layers = nn.ModuleList(self.gnn_layers)
         self.dropout = nn.Dropout(params.dropout)
         self.gate = nn.GRU(self.hidden_dim, self.hidden_dim)
-
-        if self.use_composed_path:
-            self.query_path_init = nn.Embedding(2 * self.n_rel + 1, self.path_dim)
-            self.path_gate = nn.GRUCell(self.path_dim, self.path_dim)
 
         if self.params.initializer == 'relation':
             self.query_rela_embed = nn.Embedding(2 * self.n_rel + 1, self.hidden_dim)
@@ -151,18 +157,11 @@ class GNN_auto(torch.nn.Module):
                 self.W_final = nn.Linear(self.hidden_dim, 1, bias=False)
 
     def forward(self, q_sub, q_rel, subgraph_data, mode='train'):
-        """forward with extra propagation"""
         n = len(q_sub)
         batch_idxs, abs_idxs, query_sub_idxs, edge_batch_idxs, batch_sampled_edges = subgraph_data
         n_node = len(batch_idxs)
         h0 = torch.zeros((1, n_node, self.hidden_dim)).cuda()
         hidden = torch.zeros(n_node, self.hidden_dim).cuda()
-
-        if self.use_composed_path:
-            path_memory = torch.zeros(n_node, self.path_dim).cuda()
-            path_memory[query_sub_idxs, :] = self.query_path_init(q_rel)
-        else:
-            path_memory = None
 
         if self.params.initializer == 'binary':
             hidden[query_sub_idxs, :] = 1
@@ -173,7 +172,7 @@ class GNN_auto(torch.nn.Module):
             hidden_list = [hidden]
 
         for i in range(self.n_layer):
-            hidden, path_message = self.gnn_layers[i](
+            hidden = self.gnn_layers[i](
                 q_sub,
                 q_rel,
                 edge_batch_idxs,
@@ -181,16 +180,7 @@ class GNN_auto(torch.nn.Module):
                 batch_sampled_edges,
                 n_node,
                 shortcut=self.params.shortcut,
-                path_prev=path_memory,
             )
-
-            if self.use_composed_path:
-                path_next = self.path_gate(path_message, path_memory)
-                path_active = (
-                    (path_message.abs().sum(-1) > 0)
-                    | (path_memory.abs().sum(-1) > 0)
-                ).float().unsqueeze(-1)
-                path_memory = path_next * path_active
 
             act_signal = (hidden.sum(-1) == 0).detach().int()
             hidden = self.dropout(hidden)

@@ -60,8 +60,12 @@ parser.add_argument(
     default='',
     help='Optional Optuna start config. Accepts either a JSON string or a path to a JSON file.',
 )
-parser.add_argument('--use_composed_path', action='store_true')
-parser.add_argument('--path_dim', type=int, default=None)
+parser.add_argument('--use_edge_reliability', action='store_true')
+parser.add_argument('--edge_rel_hidden_dim', type=int, default=None)
+parser.add_argument('--edge_rel_out_dim', type=int, default=None)
+parser.add_argument('--use_rel_smoothing', action='store_true')
+parser.add_argument('--rel_smooth_lambda', type=float, default=None)
+parser.add_argument('--rel_smooth_tau', type=float, default=None)
 args = parser.parse_args()
 
 
@@ -161,9 +165,14 @@ if __name__ == '__main__':
     test_loader.addSampler(test_sampler)
     HPO_save_path = f'./results/{dataset}/search_log.pkl'
 
-    if args.use_composed_path:
-        HPO_search_space['path_dim'] = ('choice', [8, 16, 32, 64, 128])
-        print('==> HPO: added composed-path search space')
+    if args.use_edge_reliability:
+        HPO_search_space['edge_rel_hidden_dim'] = ('choice', [8, 16, 32, 64])
+        HPO_search_space['edge_rel_out_dim'] = ('choice', [4, 8, 16, 32, 64])
+        print('==> HPO: added edge-reliability search space')
+    if args.use_rel_smoothing:
+        HPO_search_space['rel_smooth_lambda'] = ('uniform', (0.05, 0.3))
+        HPO_search_space['rel_smooth_tau'] = ('uniform', (0.5, 2.0))
+        print('==> HPO: added relation-smoothing search space')
 
     def loadSearchLog(file):
         assert os.path.exists(file)
@@ -192,11 +201,12 @@ if __name__ == '__main__':
         args.concatHidden = params['concatHidden']
         args.shortcut = params['shortcut']
         args.readout = params['readout']
-        args.use_composed_path = bool(params.get('use_composed_path', args.use_composed_path))
-        if args.use_composed_path:
-            args.path_dim = int(params.get('path_dim', args.path_dim or args.attn_dim))
-        else:
-            args.path_dim = args.path_dim if args.path_dim is not None else args.attn_dim
+        args.use_edge_reliability = bool(params.get('use_edge_reliability', args.use_edge_reliability))
+        args.edge_rel_hidden_dim = params.get('edge_rel_hidden_dim', args.edge_rel_hidden_dim)
+        args.edge_rel_out_dim = params.get('edge_rel_out_dim', args.edge_rel_out_dim)
+        args.use_rel_smoothing = bool(params.get('use_rel_smoothing', args.use_rel_smoothing))
+        args.rel_smooth_lambda = params.get('rel_smooth_lambda', args.rel_smooth_lambda if args.rel_smooth_lambda is not None else 0.1)
+        args.rel_smooth_tau = params.get('rel_smooth_tau', args.rel_smooth_tau if args.rel_smooth_tau is not None else 1.0)
 
         args.n_samp_ent = max(1, int(args.topk * loader.n_ent))
         train_sampler.topk = args.n_samp_ent
