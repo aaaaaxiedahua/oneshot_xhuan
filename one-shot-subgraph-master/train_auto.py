@@ -49,12 +49,9 @@ parser.add_argument('--readout', type=str, choices=['linear', 'multiply'], defau
 parser.add_argument('--decay_rate', type=float, default=None)
 parser.add_argument('--lamb', type=float, default=None)
 parser.add_argument('--dropout', type=float, default=None)
-parser.add_argument('--use_edge_reliability', action='store_true')
-parser.add_argument('--edge_rel_hidden_dim', type=int, default=None)
-parser.add_argument('--edge_rel_out_dim', type=int, default=None)
-parser.add_argument('--use_rel_smoothing', action='store_true')
-parser.add_argument('--rel_smooth_lambda', type=float, default=None)
-parser.add_argument('--rel_smooth_tau', type=float, default=None)
+parser.add_argument('--use_ctx_filter', action='store_true')
+parser.add_argument('--ctx_hidden_dim', type=int, default=None)
+parser.add_argument('--spurious_lambda', type=float, default=None)
 args = parser.parse_args()
 
 
@@ -72,18 +69,14 @@ def apply_param_overrides(params, args):
         'decay_rate': args.decay_rate,
         'lamb': args.lamb,
         'dropout': args.dropout,
-        'edge_rel_hidden_dim': args.edge_rel_hidden_dim,
-        'edge_rel_out_dim': args.edge_rel_out_dim,
-        'rel_smooth_lambda': args.rel_smooth_lambda,
-        'rel_smooth_tau': args.rel_smooth_tau,
+        'ctx_hidden_dim': args.ctx_hidden_dim,
+        'spurious_lambda': args.spurious_lambda,
     }
     for key, value in override_map.items():
         if value is not None:
             params[key] = value
-    if args.use_edge_reliability:
-        params['use_edge_reliability'] = True
-    if args.use_rel_smoothing:
-        params['use_rel_smoothing'] = True
+    if args.use_ctx_filter:
+        params['use_ctx_filter'] = True
     return params
 
 
@@ -180,12 +173,9 @@ if __name__ == '__main__':
         args.concatHidden = params['concatHidden']
         args.shortcut = params['shortcut']
         args.readout = params['readout']
-        args.use_edge_reliability = bool(params.get('use_edge_reliability', args.use_edge_reliability))
-        args.edge_rel_hidden_dim = params.get('edge_rel_hidden_dim', args.edge_rel_hidden_dim)
-        args.edge_rel_out_dim = params.get('edge_rel_out_dim', args.edge_rel_out_dim)
-        args.use_rel_smoothing = bool(params.get('use_rel_smoothing', args.use_rel_smoothing))
-        args.rel_smooth_lambda = params.get('rel_smooth_lambda', args.rel_smooth_lambda if args.rel_smooth_lambda is not None else 0.1)
-        args.rel_smooth_tau = params.get('rel_smooth_tau', args.rel_smooth_tau if args.rel_smooth_tau is not None else 1.0)
+        args.use_ctx_filter = bool(params.get('use_ctx_filter', args.use_ctx_filter))
+        args.ctx_hidden_dim = params.get('ctx_hidden_dim', args.ctx_hidden_dim)
+        args.spurious_lambda = params.get('spurious_lambda', args.spurious_lambda if args.spurious_lambda is not None else 0.2)
 
         model = BaseModel(args, loaders=(loader, val_loader, test_loader), samplers=(train_sampler, test_sampler))
 

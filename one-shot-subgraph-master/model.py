@@ -11,12 +11,9 @@ class GNNLayer(torch.nn.Module):
         attn_dim,
         n_rel,
         act=lambda x: x,
-        use_edge_reliability=False,
-        edge_rel_hidden_dim=None,
-        edge_rel_out_dim=None,
-        use_rel_smoothing=False,
-        rel_smooth_tau=1.0,
-        rel_smooth_lambda=0.1,
+        use_ctx_filter=False,
+        ctx_hidden_dim=None,
+        spurious_lambda=0.2,
     ):
         super(GNNLayer, self).__init__()
         self.n_rel = n_rel
@@ -24,10 +21,8 @@ class GNNLayer(torch.nn.Module):
         self.out_dim = out_dim
         self.attn_dim = attn_dim
         self.act = act
-        self.use_edge_reliability = use_edge_reliability
-        self.use_rel_smoothing = use_rel_smoothing
-        self.rel_smooth_tau = rel_smooth_tau
-        self.rel_smooth_lambda = rel_smooth_lambda
+        self.use_ctx_filter = use_ctx_filter
+        self.spurious_lambda = spurious_lambda
 
         self.rela_embed = nn.Embedding(2 * n_rel + 1, in_dim)
         self.Ws_attn = nn.Linear(in_dim, attn_dim, bias=False)
@@ -36,32 +31,21 @@ class GNNLayer(torch.nn.Module):
         self.w_alpha = nn.Linear(attn_dim, 1)
         self.W_h = nn.Linear(in_dim, out_dim, bias=False)
 
-        if self.use_edge_reliability:
-            edge_rel_hidden_dim = edge_rel_hidden_dim if edge_rel_hidden_dim is not None else in_dim
-            edge_rel_out_dim = edge_rel_out_dim if edge_rel_out_dim is not None else attn_dim
-            self.edge_rel_hidden_dim = edge_rel_hidden_dim
-            self.edge_rel_out_dim = edge_rel_out_dim
-            self.node_rel_proj = nn.Sequential(
-                nn.Linear(in_dim + in_dim, edge_rel_hidden_dim),
+        if self.use_ctx_filter:
+            ctx_hidden_dim = ctx_hidden_dim if ctx_hidden_dim is not None else in_dim
+            self.ctx_hidden_dim = ctx_hidden_dim
+            self.ctx_rewrite = nn.Sequential(
+                nn.Linear(in_dim * 3, ctx_hidden_dim),
                 nn.ReLU(),
-                nn.Linear(edge_rel_hidden_dim, edge_rel_out_dim),
+                nn.Linear(ctx_hidden_dim, in_dim),
             )
-            self.edge_rel_proj = nn.Linear(in_dim + in_dim, edge_rel_out_dim, bias=False)
 
-        if self.use_rel_smoothing:
-            self.rel_smooth_proj = nn.Linear(in_dim, in_dim, bias=False)
-
-    def _smoothed_relation_bank(self):
-        if not self.use_rel_smoothing:
-            return self.rela_embed.weight
-
-        rel_bank = self.rela_embed.weight
-        smooth_logits = torch.matmul(
-            self.rel_smooth_proj(rel_bank), rel_bank.transpose(0, 1)
-        ) / max(self.rel_smooth_tau, 1e-6)
-        smooth_attn = torch.softmax(smooth_logits, dim=-1)
-        smooth_bank = torch.matmul(smooth_attn, rel_bank)
-        return (1.0 - self.rel_smooth_lambda) * rel_bank + self.rel_smooth_lambda * smooth_bank
+    def _compute_local_relation_context(self, obj_hidden, sub, rel):
+        rel_vocab_size = self.rela_embed.num_embeddings
+        pair_ids = sub * rel_vocab_size + rel
+        _, inverse = torch.unique(pair_ids, return_inverse=True)
+        group_ctx = scatter(obj_hidden, inverse, dim=0, reduce='mean')
+        return group_ctx[inverse]
 
     def forward(
         self,
@@ -77,31 +61,25 @@ class GNNLayer(torch.nn.Module):
         sub = edges[:, 0]
         rel = edges[:, 1]
         obj = edges[:, 2]
+
         hs = hidden[sub]
-        rel_bank = self._smoothed_relation_bank()
-        hr = rel_bank[rel]
-        q_rel_bank = rel_bank[q_rel]
-        h_qr = q_rel_bank[r_idx]
+        ho = hidden[obj]
+        hr = self.rela_embed(rel)
+        h_qr = self.rela_embed(q_rel)[r_idx]
 
         alpha_input = self.Ws_attn(hs) + self.Wr_attn(hr) + self.Wqr_attn(h_qr)
         alpha = torch.sigmoid(self.w_alpha(torch.relu(alpha_input)))
 
-        if self.use_edge_reliability:
-            # Project node-query states once per layer, then score each edge with
-            # a lightweight relation/query offset.
-            node_query = q_rel_bank[batch_idxs]
-            node_rel_repr = self.node_rel_proj(torch.cat([hidden, node_query], dim=-1))
-            rel_offset = self.edge_rel_proj(torch.cat([hr, h_qr], dim=-1))
-            rel_score = torch.sum(
-                node_rel_repr[sub] * (node_rel_repr[obj] + rel_offset),
-                dim=-1,
-                keepdim=True,
-            ) / (self.edge_rel_out_dim ** 0.5)
-            reliability = torch.sigmoid(rel_score)
-        else:
-            reliability = 1.0
+        base_message = alpha * (hs * hr)
 
-        message = reliability * alpha * (hs * hr)
+        if self.use_ctx_filter:
+            local_ctx = self._compute_local_relation_context(ho, sub, rel)
+            ctx_rel = self.ctx_rewrite(torch.cat([hr, local_ctx, h_qr], dim=-1))
+            ctx_message = alpha * (hs * ctx_rel)
+            message = (1.0 - self.spurious_lambda) * base_message + self.spurious_lambda * ctx_message
+        else:
+            message = base_message
+
         message_agg = scatter(message, index=obj, dim=0, dim_size=n_node, reduce='sum')
         hidden_new = self.act(self.W_h(message_agg))
 
@@ -121,12 +99,9 @@ class GNN_auto(torch.nn.Module):
         self.n_rel = params.n_rel
         self.n_ent = params.n_ent
         self.loader = loader
-        self.use_edge_reliability = bool(getattr(params, 'use_edge_reliability', False))
-        self.edge_rel_hidden_dim = getattr(params, 'edge_rel_hidden_dim', None)
-        self.edge_rel_out_dim = getattr(params, 'edge_rel_out_dim', None)
-        self.use_rel_smoothing = bool(getattr(params, 'use_rel_smoothing', False))
-        self.rel_smooth_tau = float(getattr(params, 'rel_smooth_tau', 1.0))
-        self.rel_smooth_lambda = float(getattr(params, 'rel_smooth_lambda', 0.1))
+        self.use_ctx_filter = bool(getattr(params, 'use_ctx_filter', False))
+        self.ctx_hidden_dim = getattr(params, 'ctx_hidden_dim', None)
+        self.spurious_lambda = float(getattr(params, 'spurious_lambda', 0.2))
 
         acts = {'relu': nn.ReLU(), 'tanh': torch.tanh, 'idd': lambda x: x}
         act = acts[params.act]
@@ -140,12 +115,9 @@ class GNN_auto(torch.nn.Module):
                     self.attn_dim,
                     self.n_rel,
                     act=act,
-                    use_edge_reliability=self.use_edge_reliability,
-                    edge_rel_hidden_dim=self.edge_rel_hidden_dim,
-                    edge_rel_out_dim=self.edge_rel_out_dim,
-                    use_rel_smoothing=self.use_rel_smoothing,
-                    rel_smooth_tau=self.rel_smooth_tau,
-                    rel_smooth_lambda=self.rel_smooth_lambda,
+                    use_ctx_filter=self.use_ctx_filter,
+                    ctx_hidden_dim=self.ctx_hidden_dim,
+                    spurious_lambda=self.spurious_lambda,
                 )
             )
         self.gnn_layers = nn.ModuleList(self.gnn_layers)

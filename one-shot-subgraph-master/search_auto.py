@@ -13,10 +13,10 @@ from optuna_hpo import OptunaTPEHyperbandHPO
 from PPR_sampler import pprSampler
 
 HPO_search_space = {
-    'lr': ('choice', [1e-2, 1e-3, 1e-4, 1e-5, 1e-6]),
-    'topk': ('choice', [0.09, 0.1, 0.12, 0.15]),
-    'hidden_dim': ('choice', [16, 32, 48, 64, 128, 256]),
-    'attn_dim': ('choice', [2, 4, 8, 16, 32, 64]),
+    'lr': ('choice', [1e-2, 5e-3, 1e-3, 5e-4, 1e-4, 5e-5]),
+    'topk': ('choice', [0.09, 0.1, 0.12, 0.13]),
+    'hidden_dim': ('choice', [32, 48, 64, 128, 256]),
+    'attn_dim': ('choice', [8, 16, 32, 64]),
     'n_layer': ('choice', [4, 6, 8, 10]),
     'act': ('choice', ['relu', 'idd', 'tanh']),
     'initializer': ('choice', ['binary', 'relation']),
@@ -60,12 +60,9 @@ parser.add_argument(
     default='',
     help='Optional Optuna start config. Accepts either a JSON string or a path to a JSON file.',
 )
-parser.add_argument('--use_edge_reliability', action='store_true')
-parser.add_argument('--edge_rel_hidden_dim', type=int, default=None)
-parser.add_argument('--edge_rel_out_dim', type=int, default=None)
-parser.add_argument('--use_rel_smoothing', action='store_true')
-parser.add_argument('--rel_smooth_lambda', type=float, default=None)
-parser.add_argument('--rel_smooth_tau', type=float, default=None)
+parser.add_argument('--use_ctx_filter', action='store_true')
+parser.add_argument('--ctx_hidden_dim', type=int, default=None)
+parser.add_argument('--spurious_lambda', type=float, default=None)
 args = parser.parse_args()
 
 
@@ -167,14 +164,10 @@ if __name__ == '__main__':
     test_loader.addSampler(test_sampler)
     HPO_save_path = f'./results/{dataset}/search_log.pkl'
 
-    if args.use_edge_reliability:
-        HPO_search_space['edge_rel_hidden_dim'] = ('choice', [8, 16, 32, 64])
-        HPO_search_space['edge_rel_out_dim'] = ('choice', [4, 8, 16, 32, 64])
-        print('==> HPO: added edge-reliability search space')
-    if args.use_rel_smoothing:
-        HPO_search_space['rel_smooth_lambda'] = ('uniform', (0.05, 0.3))
-        HPO_search_space['rel_smooth_tau'] = ('uniform', (0.5, 2.0))
-        print('==> HPO: added relation-smoothing search space')
+    if args.use_ctx_filter:
+        HPO_search_space['ctx_hidden_dim'] = ('choice', [16, 32, 64, 128])
+        HPO_search_space['spurious_lambda'] = ('uniform', (0.1, 0.5))
+        print('==> HPO: added context-filter search space')
 
     def loadSearchLog(file):
         assert os.path.exists(file)
@@ -205,12 +198,9 @@ if __name__ == '__main__':
         args.concatHidden = params['concatHidden']
         args.shortcut = params['shortcut']
         args.readout = params['readout']
-        args.use_edge_reliability = bool(params.get('use_edge_reliability', args.use_edge_reliability))
-        args.edge_rel_hidden_dim = params.get('edge_rel_hidden_dim', args.edge_rel_hidden_dim)
-        args.edge_rel_out_dim = params.get('edge_rel_out_dim', args.edge_rel_out_dim)
-        args.use_rel_smoothing = bool(params.get('use_rel_smoothing', args.use_rel_smoothing))
-        args.rel_smooth_lambda = params.get('rel_smooth_lambda', args.rel_smooth_lambda if args.rel_smooth_lambda is not None else 0.1)
-        args.rel_smooth_tau = params.get('rel_smooth_tau', args.rel_smooth_tau if args.rel_smooth_tau is not None else 1.0)
+        args.use_ctx_filter = bool(params.get('use_ctx_filter', args.use_ctx_filter))
+        args.ctx_hidden_dim = params.get('ctx_hidden_dim', args.ctx_hidden_dim)
+        args.spurious_lambda = params.get('spurious_lambda', args.spurious_lambda if args.spurious_lambda is not None else 0.2)
 
         args.n_samp_ent = max(1, int(args.topk * loader.n_ent))
         train_sampler.topk = args.n_samp_ent
