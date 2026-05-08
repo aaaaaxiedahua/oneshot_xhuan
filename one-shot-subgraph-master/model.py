@@ -40,12 +40,8 @@ class GNNLayer(torch.nn.Module):
                 nn.Linear(ctx_hidden_dim, in_dim),
             )
 
-    def _compute_local_relation_context(self, obj_hidden, sub, rel):
-        rel_vocab_size = self.rela_embed.num_embeddings
-        pair_ids = sub * rel_vocab_size + rel
-        _, inverse = torch.unique(pair_ids, return_inverse=True)
-        group_ctx = scatter(obj_hidden, inverse, dim=0, reduce='mean')
-        return group_ctx[inverse]
+    def _compute_group_local_relation_context(self, obj_hidden, group_index):
+        return scatter(obj_hidden, group_index, dim=0, reduce='mean')
 
     def forward(
         self,
@@ -57,6 +53,9 @@ class GNNLayer(torch.nn.Module):
         edges,
         n_node,
         shortcut=False,
+        group_index=None,
+        group_rel=None,
+        group_r_idx=None,
     ):
         sub = edges[:, 0]
         rel = edges[:, 1]
@@ -70,15 +69,15 @@ class GNNLayer(torch.nn.Module):
         alpha_input = self.Ws_attn(hs) + self.Wr_attn(hr) + self.Wqr_attn(h_qr)
         alpha = torch.sigmoid(self.w_alpha(torch.relu(alpha_input)))
 
-        base_message = alpha * (hs * hr)
-
         if self.use_ctx_filter:
-            local_ctx = self._compute_local_relation_context(ho, sub, rel)
-            ctx_rel = self.ctx_rewrite(torch.cat([hr, local_ctx, h_qr], dim=-1))
-            ctx_message = alpha * (hs * ctx_rel)
-            message = (1.0 - self.spurious_lambda) * base_message + self.spurious_lambda * ctx_message
+            group_local_ctx = self._compute_group_local_relation_context(ho, group_index)
+            group_hr = self.rela_embed(group_rel)
+            group_h_qr = self.rela_embed(q_rel)[group_r_idx]
+            group_ctx_rel = self.ctx_rewrite(torch.cat([group_hr, group_local_ctx, group_h_qr], dim=-1))
+            fused_rel = (1.0 - self.spurious_lambda) * hr + self.spurious_lambda * group_ctx_rel[group_index]
+            message = alpha * (hs * fused_rel)
         else:
-            message = base_message
+            message = alpha * (hs * hr)
 
         message_agg = scatter(message, index=obj, dim=0, dim_size=n_node, reduce='sum')
         hidden_new = self.act(self.W_h(message_agg))
@@ -148,6 +147,20 @@ class GNN_auto(torch.nn.Module):
         if self.params.concatHidden:
             hidden_list = [hidden]
 
+        if self.use_ctx_filter:
+            # Cache (source, relation) grouping once per sampled subgraph and reuse it in every layer.
+            rel_vocab_size = 2 * self.n_rel + 1
+            edge_sub = batch_sampled_edges[:, 0]
+            edge_rel = batch_sampled_edges[:, 1]
+            pair_ids = edge_sub * rel_vocab_size + edge_rel
+            _, group_index = torch.unique(pair_ids, return_inverse=True)
+            group_rel = scatter(edge_rel, group_index, dim=0, reduce='min').long()
+            group_r_idx = scatter(edge_batch_idxs, group_index, dim=0, reduce='min').long()
+        else:
+            group_index = None
+            group_rel = None
+            group_r_idx = None
+
         for i in range(self.n_layer):
             hidden = self.gnn_layers[i](
                 q_sub,
@@ -158,6 +171,9 @@ class GNN_auto(torch.nn.Module):
                 batch_sampled_edges,
                 n_node,
                 shortcut=self.params.shortcut,
+                group_index=group_index,
+                group_rel=group_rel,
+                group_r_idx=group_r_idx,
             )
 
             act_signal = (hidden.sum(-1) == 0).detach().int()
