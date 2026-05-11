@@ -13,7 +13,8 @@ class GNNLayer(torch.nn.Module):
         act=lambda x: x,
         use_ctx_filter=False,
         ctx_hidden_dim=None,
-        spurious_lambda=0.2,
+        ctx_gamma=0.1,
+        use_path_history=False,
     ):
         super(GNNLayer, self).__init__()
         self.n_rel = n_rel
@@ -22,26 +23,35 @@ class GNNLayer(torch.nn.Module):
         self.attn_dim = attn_dim
         self.act = act
         self.use_ctx_filter = use_ctx_filter
-        self.spurious_lambda = spurious_lambda
+        self.ctx_gamma = ctx_gamma
+        self.use_path_history = use_path_history
 
         self.rela_embed = nn.Embedding(2 * n_rel + 1, in_dim)
         self.Ws_attn = nn.Linear(in_dim, attn_dim, bias=False)
         self.Wr_attn = nn.Linear(in_dim, attn_dim, bias=False)
         self.Wqr_attn = nn.Linear(in_dim, attn_dim)
+        if self.use_path_history:
+            self.Wp_attn = nn.Linear(in_dim, attn_dim, bias=False)
+            self.path_gru = nn.GRUCell(in_dim, in_dim)
         self.w_alpha = nn.Linear(attn_dim, 1)
         self.W_h = nn.Linear(in_dim, out_dim, bias=False)
 
         if self.use_ctx_filter:
             ctx_hidden_dim = ctx_hidden_dim if ctx_hidden_dim is not None else in_dim
             self.ctx_hidden_dim = ctx_hidden_dim
-            self.ctx_rewrite = nn.Sequential(
+            self.ctx_edge_interact = nn.Sequential(
+                nn.Linear(in_dim * 4, ctx_hidden_dim),
+                nn.ReLU(),
+                nn.Linear(ctx_hidden_dim, in_dim),
+            )
+            self.ctx_relation_calibrate = nn.Sequential(
                 nn.Linear(in_dim * 3, ctx_hidden_dim),
                 nn.ReLU(),
                 nn.Linear(ctx_hidden_dim, in_dim),
             )
 
-    def _compute_group_local_relation_context(self, obj_hidden, group_index):
-        return scatter(obj_hidden, group_index, dim=0, reduce='mean')
+    def _compute_group_context(self, edge_context, group_index):
+        return scatter(edge_context, group_index, dim=0, reduce='mean')
 
     def forward(
         self,
@@ -53,6 +63,7 @@ class GNNLayer(torch.nn.Module):
         edges,
         n_node,
         shortcut=False,
+        path_state=None,
         group_index=None,
         group_rel=None,
         group_r_idx=None,
@@ -67,14 +78,19 @@ class GNNLayer(torch.nn.Module):
         h_qr = self.rela_embed(q_rel)[r_idx]
 
         alpha_input = self.Ws_attn(hs) + self.Wr_attn(hr) + self.Wqr_attn(h_qr)
+        if self.use_path_history:
+            alpha_input = alpha_input + self.Wp_attn(path_state[sub])
         alpha = torch.sigmoid(self.w_alpha(torch.relu(alpha_input)))
 
         if self.use_ctx_filter:
-            group_local_ctx = self._compute_group_local_relation_context(ho, group_index)
+            edge_context = self.ctx_edge_interact(torch.cat([hs, hr, ho, h_qr], dim=-1))
+            group_context = self._compute_group_context(edge_context, group_index)
             group_hr = self.rela_embed(group_rel)
             group_h_qr = self.rela_embed(q_rel)[group_r_idx]
-            group_ctx_rel = self.ctx_rewrite(torch.cat([group_hr, group_local_ctx, group_h_qr], dim=-1))
-            fused_rel = (1.0 - self.spurious_lambda) * hr + self.spurious_lambda * group_ctx_rel[group_index]
+            group_delta = torch.tanh(
+                self.ctx_relation_calibrate(torch.cat([group_hr, group_context, group_h_qr], dim=-1))
+            )
+            fused_rel = hr + self.ctx_gamma * group_delta[group_index]
             message = alpha * (hs * fused_rel)
         else:
             message = alpha * (hs * hr)
@@ -82,10 +98,17 @@ class GNNLayer(torch.nn.Module):
         message_agg = scatter(message, index=obj, dim=0, dim_size=n_node, reduce='sum')
         hidden_new = self.act(self.W_h(message_agg))
 
+        path_state_new = path_state
+        if self.use_path_history:
+            edge_path = self.path_gru(hr, path_state[sub])
+            alpha_sum = scatter(alpha, index=obj, dim=0, dim_size=n_node, reduce='sum')[obj].clamp_min(1e-8)
+            path_weight = alpha / alpha_sum
+            path_state_new = scatter(path_weight * edge_path, index=obj, dim=0, dim_size=n_node, reduce='sum')
+
         if shortcut:
             hidden_new = hidden_new + hidden
 
-        return hidden_new
+        return hidden_new, path_state_new
 
 
 class GNN_auto(torch.nn.Module):
@@ -100,7 +123,8 @@ class GNN_auto(torch.nn.Module):
         self.loader = loader
         self.use_ctx_filter = bool(getattr(params, 'use_ctx_filter', False))
         self.ctx_hidden_dim = getattr(params, 'ctx_hidden_dim', None)
-        self.spurious_lambda = float(getattr(params, 'spurious_lambda', 0.2))
+        self.ctx_gamma = float(getattr(params, 'ctx_gamma', 0.1))
+        self.use_path_history = bool(getattr(params, 'use_path_history', False))
 
         acts = {'relu': nn.ReLU(), 'tanh': torch.tanh, 'idd': lambda x: x}
         act = acts[params.act]
@@ -116,7 +140,8 @@ class GNN_auto(torch.nn.Module):
                     act=act,
                     use_ctx_filter=self.use_ctx_filter,
                     ctx_hidden_dim=self.ctx_hidden_dim,
-                    spurious_lambda=self.spurious_lambda,
+                    ctx_gamma=self.ctx_gamma,
+                    use_path_history=self.use_path_history,
                 )
             )
         self.gnn_layers = nn.ModuleList(self.gnn_layers)
@@ -138,6 +163,7 @@ class GNN_auto(torch.nn.Module):
         device = q_rel.device
         h0 = torch.zeros((1, n_node, self.hidden_dim), device=device)
         hidden = torch.zeros(n_node, self.hidden_dim, device=device)
+        path_state = torch.zeros(n_node, self.hidden_dim, device=device) if self.use_path_history else None
 
         if self.params.initializer == 'binary':
             hidden[query_sub_idxs, :] = 1
@@ -162,7 +188,7 @@ class GNN_auto(torch.nn.Module):
             group_r_idx = None
 
         for i in range(self.n_layer):
-            hidden = self.gnn_layers[i](
+            hidden, path_state = self.gnn_layers[i](
                 q_sub,
                 q_rel,
                 batch_idxs,
@@ -171,12 +197,15 @@ class GNN_auto(torch.nn.Module):
                 batch_sampled_edges,
                 n_node,
                 shortcut=self.params.shortcut,
+                path_state=path_state,
                 group_index=group_index,
                 group_rel=group_rel,
                 group_r_idx=group_r_idx,
             )
 
             act_signal = (hidden.sum(-1) == 0).detach().int()
+            if self.use_path_history:
+                path_state = path_state * (1 - act_signal).unsqueeze(-1)
             hidden = self.dropout(hidden)
             hidden, h0 = self.gate(hidden.unsqueeze(0), h0)
             hidden = hidden.squeeze(0)

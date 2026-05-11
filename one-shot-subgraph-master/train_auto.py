@@ -51,7 +51,8 @@ parser.add_argument('--lamb', type=float, default=None)
 parser.add_argument('--dropout', type=float, default=None)
 parser.add_argument('--use_ctx_filter', action='store_true')
 parser.add_argument('--ctx_hidden_dim', type=int, default=None)
-parser.add_argument('--spurious_lambda', type=float, default=None)
+parser.add_argument('--ctx_gamma', type=float, default=None)
+parser.add_argument('--use_path_history', action='store_true')
 args = parser.parse_args()
 
 
@@ -70,13 +71,15 @@ def apply_param_overrides(params, args):
         'lamb': args.lamb,
         'dropout': args.dropout,
         'ctx_hidden_dim': args.ctx_hidden_dim,
-        'spurious_lambda': args.spurious_lambda,
+        'ctx_gamma': args.ctx_gamma,
     }
     for key, value in override_map.items():
         if value is not None:
             params[key] = value
     if args.use_ctx_filter:
         params['use_ctx_filter'] = True
+    if args.use_path_history:
+        params['use_path_history'] = True
     return params
 
 
@@ -175,7 +178,8 @@ if __name__ == '__main__':
         args.readout = params['readout']
         args.use_ctx_filter = bool(params.get('use_ctx_filter', args.use_ctx_filter))
         args.ctx_hidden_dim = params.get('ctx_hidden_dim', args.ctx_hidden_dim)
-        args.spurious_lambda = params.get('spurious_lambda', args.spurious_lambda if args.spurious_lambda is not None else 0.2)
+        args.ctx_gamma = params.get('ctx_gamma', args.ctx_gamma if args.ctx_gamma is not None else 0.1)
+        args.use_path_history = bool(params.get('use_path_history', args.use_path_history))
 
         model = BaseModel(args, loaders=(loader, val_loader, test_loader), samplers=(train_sampler, test_sampler))
 

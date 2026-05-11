@@ -62,7 +62,8 @@ parser.add_argument(
 )
 parser.add_argument('--use_ctx_filter', action='store_true')
 parser.add_argument('--ctx_hidden_dim', type=int, default=None)
-parser.add_argument('--spurious_lambda', type=float, default=None)
+parser.add_argument('--ctx_gamma', type=float, default=None)
+parser.add_argument('--use_path_history', action='store_true')
 args = parser.parse_args()
 
 
@@ -165,8 +166,8 @@ if __name__ == '__main__':
     HPO_save_path = f'./results/{dataset}/search_log.pkl'
 
     if args.use_ctx_filter:
-        HPO_search_space['ctx_hidden_dim'] = ('choice', [16, 32, 64, 128])
-        HPO_search_space['spurious_lambda'] = ('uniform', (0.1, 0.5))
+        HPO_search_space['ctx_hidden_dim'] = ('choice', [16, 32, 64])
+        HPO_search_space['ctx_gamma'] = ('uniform', (0.03, 0.2))
         print('==> HPO: added context-filter search space')
 
     def loadSearchLog(file):
@@ -200,7 +201,8 @@ if __name__ == '__main__':
         args.readout = params['readout']
         args.use_ctx_filter = bool(params.get('use_ctx_filter', args.use_ctx_filter))
         args.ctx_hidden_dim = params.get('ctx_hidden_dim', args.ctx_hidden_dim)
-        args.spurious_lambda = params.get('spurious_lambda', args.spurious_lambda if args.spurious_lambda is not None else 0.2)
+        args.ctx_gamma = params.get('ctx_gamma', args.ctx_gamma if args.ctx_gamma is not None else 0.1)
+        args.use_path_history = bool(params.get('use_path_history', args.use_path_history))
 
         args.n_samp_ent = max(1, int(args.topk * loader.n_ent))
         train_sampler.topk = args.n_samp_ent
