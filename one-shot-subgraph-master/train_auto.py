@@ -49,10 +49,8 @@ parser.add_argument('--readout', type=str, choices=['linear', 'multiply'], defau
 parser.add_argument('--decay_rate', type=float, default=None)
 parser.add_argument('--lamb', type=float, default=None)
 parser.add_argument('--dropout', type=float, default=None)
-parser.add_argument('--use_ctx_filter', action='store_true')
-parser.add_argument('--ctx_hidden_dim', type=int, default=None)
-parser.add_argument('--ctx_gamma', type=float, default=None)
-parser.add_argument('--use_path_history', action='store_true')
+parser.add_argument('--use_evidence_fusion', action='store_true')
+parser.add_argument('--fusion_hidden_dim', type=int, default=None)
 args = parser.parse_args()
 
 
@@ -70,16 +68,13 @@ def apply_param_overrides(params, args):
         'decay_rate': args.decay_rate,
         'lamb': args.lamb,
         'dropout': args.dropout,
-        'ctx_hidden_dim': args.ctx_hidden_dim,
-        'ctx_gamma': args.ctx_gamma,
+        'fusion_hidden_dim': args.fusion_hidden_dim,
     }
     for key, value in override_map.items():
         if value is not None:
             params[key] = value
-    if args.use_ctx_filter:
-        params['use_ctx_filter'] = True
-    if args.use_path_history:
-        params['use_path_history'] = True
+    if args.use_evidence_fusion:
+        params['use_evidence_fusion'] = True
     return params
 
 
@@ -176,10 +171,8 @@ if __name__ == '__main__':
         args.concatHidden = params['concatHidden']
         args.shortcut = params['shortcut']
         args.readout = params['readout']
-        args.use_ctx_filter = bool(params.get('use_ctx_filter', args.use_ctx_filter))
-        args.ctx_hidden_dim = params.get('ctx_hidden_dim', args.ctx_hidden_dim)
-        args.ctx_gamma = params.get('ctx_gamma', args.ctx_gamma if args.ctx_gamma is not None else 0.1)
-        args.use_path_history = bool(params.get('use_path_history', args.use_path_history))
+        args.use_evidence_fusion = bool(params.get('use_evidence_fusion', args.use_evidence_fusion))
+        args.fusion_hidden_dim = params.get('fusion_hidden_dim', args.fusion_hidden_dim)
 
         model = BaseModel(args, loaders=(loader, val_loader, test_loader), samplers=(train_sampler, test_sampler))
 

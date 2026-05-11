@@ -14,7 +14,7 @@ from PPR_sampler import pprSampler
 
 HPO_search_space = {
     'lr': ('choice', [1e-2, 5e-3, 1e-3, 5e-4, 1e-4, 5e-5]),
-    'topk': ('choice', [0.09, 0.1, 0.12, 0.13]),
+    'topk': ('choice', [0.09, 0.1, 0.11, 0.12, 0.13]),
     'hidden_dim': ('choice', [32, 48, 64, 128, 256]),
     'attn_dim': ('choice', [8, 16, 32, 64]),
     'n_layer': ('choice', [4, 6, 8, 10]),
@@ -60,10 +60,8 @@ parser.add_argument(
     default='',
     help='Optional Optuna start config. Accepts either a JSON string or a path to a JSON file.',
 )
-parser.add_argument('--use_ctx_filter', action='store_true')
-parser.add_argument('--ctx_hidden_dim', type=int, default=None)
-parser.add_argument('--ctx_gamma', type=float, default=None)
-parser.add_argument('--use_path_history', action='store_true')
+parser.add_argument('--use_evidence_fusion', action='store_true')
+parser.add_argument('--fusion_hidden_dim', type=int, default=None)
 args = parser.parse_args()
 
 
@@ -165,10 +163,9 @@ if __name__ == '__main__':
     test_loader.addSampler(test_sampler)
     HPO_save_path = f'./results/{dataset}/search_log.pkl'
 
-    if args.use_ctx_filter:
-        HPO_search_space['ctx_hidden_dim'] = ('choice', [16, 32, 64])
-        HPO_search_space['ctx_gamma'] = ('uniform', (0.03, 0.2))
-        print('==> HPO: added context-filter search space')
+    if args.use_evidence_fusion:
+        HPO_search_space['fusion_hidden_dim'] = ('choice', [16, 32, 64, 128])
+        print('==> HPO: added evidence-fusion search space')
 
     def loadSearchLog(file):
         assert os.path.exists(file)
@@ -199,10 +196,8 @@ if __name__ == '__main__':
         args.concatHidden = params['concatHidden']
         args.shortcut = params['shortcut']
         args.readout = params['readout']
-        args.use_ctx_filter = bool(params.get('use_ctx_filter', args.use_ctx_filter))
-        args.ctx_hidden_dim = params.get('ctx_hidden_dim', args.ctx_hidden_dim)
-        args.ctx_gamma = params.get('ctx_gamma', args.ctx_gamma if args.ctx_gamma is not None else 0.1)
-        args.use_path_history = bool(params.get('use_path_history', args.use_path_history))
+        args.use_evidence_fusion = bool(params.get('use_evidence_fusion', args.use_evidence_fusion))
+        args.fusion_hidden_dim = params.get('fusion_hidden_dim', args.fusion_hidden_dim)
 
         args.n_samp_ent = max(1, int(args.topk * loader.n_ent))
         train_sampler.topk = args.n_samp_ent
