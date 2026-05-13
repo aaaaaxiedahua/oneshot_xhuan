@@ -68,9 +68,11 @@ class GNNLayer(torch.nn.Module):
         message = alpha * (hs * hr)
         if self.use_evidence_fusion:
             mean_alpha = scatter(alpha, index=obj, dim=0, dim_size=n_node, reduce='mean')
-            strong_mask = (alpha >= mean_alpha[obj]).float()
-            strong_agg = scatter(message * strong_mask, index=obj, dim=0, dim_size=n_node, reduce='sum')
-            weak_agg = scatter(message * (1 - strong_mask), index=obj, dim=0, dim_size=n_node, reduce='sum')
+            mean_alpha_sq = scatter(alpha * alpha, index=obj, dim=0, dim_size=n_node, reduce='mean')
+            std_alpha = torch.sqrt((mean_alpha_sq - mean_alpha * mean_alpha).clamp_min(0) + 1e-8)
+            evidence_score = torch.sigmoid((alpha - mean_alpha[obj]) / std_alpha[obj].clamp_min(1e-6))
+            strong_agg = scatter(message * evidence_score, index=obj, dim=0, dim_size=n_node, reduce='sum')
+            weak_agg = scatter(message * (1 - evidence_score), index=obj, dim=0, dim_size=n_node, reduce='sum')
             node_h_qr = self.rela_embed(q_rel)[batch_idxs]
             gate = self.evidence_gate(torch.cat([strong_agg, weak_agg, node_h_qr], dim=-1))
             message_agg = gate * strong_agg + (1 - gate) * weak_agg
