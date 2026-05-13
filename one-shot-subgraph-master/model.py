@@ -13,6 +13,7 @@ class GNNLayer(torch.nn.Module):
         act=lambda x: x,
         use_evidence_fusion=False,
         fusion_hidden_dim=None,
+        use_triple_interaction=False,
     ):
         super(GNNLayer, self).__init__()
         self.n_rel = n_rel
@@ -21,6 +22,7 @@ class GNNLayer(torch.nn.Module):
         self.attn_dim = attn_dim
         self.act = act
         self.use_evidence_fusion = use_evidence_fusion
+        self.use_triple_interaction = use_triple_interaction
 
         self.rela_embed = nn.Embedding(2 * n_rel + 1, in_dim)
         self.Ws_attn = nn.Linear(in_dim, attn_dim, bias=False)
@@ -30,6 +32,9 @@ class GNNLayer(torch.nn.Module):
             self.Wo_attn = nn.Linear(in_dim, attn_dim, bias=False)
         self.w_alpha = nn.Linear(attn_dim, 1)
         self.W_h = nn.Linear(in_dim, out_dim, bias=False)
+
+        if self.use_triple_interaction:
+            self.triple_interact_weight = nn.Parameter(torch.ones(in_dim))
 
         if self.use_evidence_fusion:
             fusion_hidden_dim = int(fusion_hidden_dim) if fusion_hidden_dim is not None else min(32, in_dim)
@@ -65,7 +70,15 @@ class GNNLayer(torch.nn.Module):
             alpha_input = alpha_input + self.Wo_attn(ho)
         alpha = torch.sigmoid(self.w_alpha(torch.relu(alpha_input)))
 
-        message = alpha * (hs * hr)
+        source_rel_msg = hs * hr
+        if self.use_triple_interaction:
+            if not self.use_evidence_fusion:
+                ho = hidden[obj]
+            triple_score = torch.sum(ho * (self.triple_interact_weight * source_rel_msg), dim=-1, keepdim=True)
+            triple_score = triple_score / (self.in_dim ** 0.5)
+            triple_gate = torch.sigmoid(triple_score)
+            source_rel_msg = (1 + triple_gate) * source_rel_msg
+        message = alpha * source_rel_msg
         if self.use_evidence_fusion:
             mean_alpha = scatter(alpha, index=obj, dim=0, dim_size=n_node, reduce='mean')
             mean_alpha_sq = scatter(alpha * alpha, index=obj, dim=0, dim_size=n_node, reduce='mean')
@@ -98,6 +111,7 @@ class GNN_auto(torch.nn.Module):
         self.loader = loader
         self.use_evidence_fusion = bool(getattr(params, 'use_evidence_fusion', False))
         self.fusion_hidden_dim = getattr(params, 'fusion_hidden_dim', None)
+        self.use_triple_interaction = bool(getattr(params, 'use_triple_interaction', False))
 
         acts = {'relu': nn.ReLU(), 'tanh': torch.tanh, 'idd': lambda x: x}
         act = acts[params.act]
@@ -113,6 +127,7 @@ class GNN_auto(torch.nn.Module):
                     act=act,
                     use_evidence_fusion=self.use_evidence_fusion,
                     fusion_hidden_dim=self.fusion_hidden_dim,
+                    use_triple_interaction=self.use_triple_interaction,
                 )
             )
         self.gnn_layers = nn.ModuleList(self.gnn_layers)

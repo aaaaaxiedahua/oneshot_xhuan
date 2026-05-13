@@ -62,6 +62,7 @@ parser.add_argument(
 )
 parser.add_argument('--use_evidence_fusion', action='store_true')
 parser.add_argument('--fusion_hidden_dim', type=int, default=None)
+parser.add_argument('--use_triple_interaction', action='store_true')
 args = parser.parse_args()
 
 
@@ -198,6 +199,7 @@ if __name__ == '__main__':
         args.readout = params['readout']
         args.use_evidence_fusion = bool(params.get('use_evidence_fusion', args.use_evidence_fusion))
         args.fusion_hidden_dim = params.get('fusion_hidden_dim', args.fusion_hidden_dim)
+        args.use_triple_interaction = bool(params.get('use_triple_interaction', args.use_triple_interaction))
 
         args.n_samp_ent = max(1, int(args.topk * loader.n_ent))
         train_sampler.topk = args.n_samp_ent
