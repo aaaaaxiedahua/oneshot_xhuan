@@ -51,7 +51,7 @@ parser.add_argument('--lamb', type=float, default=None)
 parser.add_argument('--dropout', type=float, default=None)
 parser.add_argument('--use_evidence_fusion', action='store_true')
 parser.add_argument('--fusion_hidden_dim', type=int, default=None)
-parser.add_argument('--use_triple_interaction', action='store_true')
+parser.add_argument('--use_rel_context', action='store_true')
 args = parser.parse_args()
 
 
@@ -76,8 +76,8 @@ def apply_param_overrides(params, args):
             params[key] = value
     if args.use_evidence_fusion:
         params['use_evidence_fusion'] = True
-    if args.use_triple_interaction:
-        params['use_triple_interaction'] = True
+    if args.use_rel_context:
+        params['use_rel_context'] = True
     return params
 
 
@@ -176,7 +176,7 @@ if __name__ == '__main__':
         args.readout = params['readout']
         args.use_evidence_fusion = bool(params.get('use_evidence_fusion', args.use_evidence_fusion))
         args.fusion_hidden_dim = params.get('fusion_hidden_dim', args.fusion_hidden_dim)
-        args.use_triple_interaction = bool(params.get('use_triple_interaction', args.use_triple_interaction))
+        args.use_rel_context = bool(params.get('use_rel_context', args.use_rel_context))
 
         model = BaseModel(args, loaders=(loader, val_loader, test_loader), samplers=(train_sampler, test_sampler))
 
