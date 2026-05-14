@@ -13,11 +13,11 @@ from optuna_hpo import OptunaTPEHyperbandHPO
 from PPR_sampler import pprSampler
 
 HPO_search_space = {
-    'lr': ('choice', [1e-2, 5e-3, 1e-3, 5e-4, 1e-4, 5e-5]),
-    'topk': ('choice', [0.09, 0.1, 0.11, 0.12, 0.13]),
+    'lr': ('choice', [1e-2, 5e-3, 1e-3, 5e-4, 1e-4]),
+    'topk': ('choice', [0.09, 0.1, 0.11]),
     'hidden_dim': ('choice', [32, 48, 64, 128, 256]),
     'attn_dim': ('choice', [8, 16, 32, 64]),
-    'n_layer': ('choice', [4, 6, 8, 10]),
+    'n_layer': ('choice', [4, 6, 8]),
     'act': ('choice', ['relu', 'idd', 'tanh']),
     'initializer': ('choice', ['binary', 'relation']),
     'concatHidden': ('choice', [True, False]),
@@ -60,9 +60,11 @@ parser.add_argument(
     default='',
     help='Optional Optuna start config. Accepts either a JSON string or a path to a JSON file.',
 )
-parser.add_argument('--use_evidence_fusion', action='store_true')
-parser.add_argument('--fusion_hidden_dim', type=int, default=None)
-parser.add_argument('--use_rel_context', action='store_true')
+parser.add_argument('--use_bqrf_msg', action='store_true')
+parser.add_argument('--bqrf_dim', type=int, default=None)
+parser.add_argument('--bqrf_dropout', type=float, default=None)
+parser.add_argument('--use_exp_attn', action='store_true')
+parser.add_argument('--exp_attn_dim', type=int, default=None)
 args = parser.parse_args()
 
 
@@ -164,9 +166,13 @@ if __name__ == '__main__':
     test_loader.addSampler(test_sampler)
     HPO_save_path = f'./results/{dataset}/search_log.pkl'
 
-    if args.use_evidence_fusion:
-        HPO_search_space['fusion_hidden_dim'] = ('choice', [16, 32, 64, 128])
-        print('==> HPO: added evidence-fusion search space')
+    if args.use_bqrf_msg:
+        HPO_search_space['bqrf_dim'] = ('choice', [8, 16, 32, 64])
+        HPO_search_space['bqrf_dropout'] = ('uniform', (0.0, 0.2))
+        print('==> HPO: added bottleneck query-related fusion message search space')
+    if args.use_exp_attn:
+        HPO_search_space['exp_attn_dim'] = ('choice', [8, 16, 32, 64])
+        print('==> HPO: added EXP/RUN attention aggregation search space')
 
     def loadSearchLog(file):
         assert os.path.exists(file)
@@ -197,9 +203,11 @@ if __name__ == '__main__':
         args.concatHidden = params['concatHidden']
         args.shortcut = params['shortcut']
         args.readout = params['readout']
-        args.use_evidence_fusion = bool(params.get('use_evidence_fusion', args.use_evidence_fusion))
-        args.fusion_hidden_dim = params.get('fusion_hidden_dim', args.fusion_hidden_dim)
-        args.use_rel_context = bool(params.get('use_rel_context', args.use_rel_context))
+        args.use_bqrf_msg = bool(params.get('use_bqrf_msg', args.use_bqrf_msg))
+        args.bqrf_dim = params.get('bqrf_dim', args.bqrf_dim)
+        args.bqrf_dropout = params.get('bqrf_dropout', args.bqrf_dropout)
+        args.use_exp_attn = bool(params.get('use_exp_attn', args.use_exp_attn))
+        args.exp_attn_dim = params.get('exp_attn_dim', args.exp_attn_dim)
 
         args.n_samp_ent = max(1, int(args.topk * loader.n_ent))
         train_sampler.topk = args.n_samp_ent

@@ -3,6 +3,13 @@ import torch.nn as nn
 from torch_scatter import scatter
 
 
+def scatter_softmax(src, index, dim_size):
+    max_value = scatter(src, index=index, dim=0, dim_size=dim_size, reduce='max')
+    exp_src = torch.exp(src - max_value[index])
+    normalizer = scatter(exp_src, index=index, dim=0, dim_size=dim_size, reduce='sum')
+    return exp_src / normalizer[index].clamp_min(1e-12)
+
+
 class GNNLayer(torch.nn.Module):
     def __init__(
         self,
@@ -11,9 +18,11 @@ class GNNLayer(torch.nn.Module):
         attn_dim,
         n_rel,
         act=lambda x: x,
-        use_evidence_fusion=False,
-        fusion_hidden_dim=None,
-        use_rel_context=False,
+        use_bqrf_msg=False,
+        bqrf_dim=None,
+        bqrf_dropout=0.0,
+        use_exp_attn=False,
+        exp_attn_dim=None,
     ):
         super(GNNLayer, self).__init__()
         self.n_rel = n_rel
@@ -21,30 +30,28 @@ class GNNLayer(torch.nn.Module):
         self.out_dim = out_dim
         self.attn_dim = attn_dim
         self.act = act
-        self.use_evidence_fusion = use_evidence_fusion
-        self.use_rel_context = use_rel_context
+        self.use_bqrf_msg = use_bqrf_msg
+        self.use_exp_attn = use_exp_attn
 
         self.rela_embed = nn.Embedding(2 * n_rel + 1, in_dim)
         self.Ws_attn = nn.Linear(in_dim, attn_dim, bias=False)
         self.Wr_attn = nn.Linear(in_dim, attn_dim, bias=False)
         self.Wqr_attn = nn.Linear(in_dim, attn_dim)
-        if self.use_evidence_fusion:
-            self.Wo_attn = nn.Linear(in_dim, attn_dim, bias=False)
         self.w_alpha = nn.Linear(attn_dim, 1)
         self.W_h = nn.Linear(in_dim, out_dim, bias=False)
 
-        if self.use_rel_context:
-            self.rel_context_weight = nn.Parameter(torch.ones(in_dim))
-            self.rel_context_bias = nn.Parameter(torch.zeros(in_dim))
+        if self.use_bqrf_msg:
+            bqrf_dim = int(bqrf_dim) if bqrf_dim is not None else min(32, in_dim)
+            self.bqrf_proj = nn.Linear(in_dim * 3, bqrf_dim)
+            self.bqrf_for = nn.Linear(bqrf_dim, in_dim)
+            self.bqrf_upd = nn.Linear(bqrf_dim, in_dim)
+            self.bqrf_dropout = nn.Dropout(float(bqrf_dropout))
 
-        if self.use_evidence_fusion:
-            fusion_hidden_dim = int(fusion_hidden_dim) if fusion_hidden_dim is not None else min(32, in_dim)
-            self.evidence_gate = nn.Sequential(
-                nn.Linear(in_dim * 3, fusion_hidden_dim),
-                nn.ReLU(),
-                nn.Linear(fusion_hidden_dim, in_dim),
-                nn.Sigmoid(),
-            )
+        if self.use_exp_attn:
+            exp_attn_dim = int(exp_attn_dim) if exp_attn_dim is not None else attn_dim
+            self.Wm_exp_attn = nn.Linear(in_dim, exp_attn_dim, bias=False)
+            self.Wq_exp_attn = nn.Linear(in_dim, exp_attn_dim)
+            self.w_exp_attn = nn.Linear(exp_attn_dim, 1)
 
     def forward(
         self,
@@ -65,30 +72,27 @@ class GNNLayer(torch.nn.Module):
         hr = self.rela_embed(rel)
         h_qr = self.rela_embed(q_rel)[r_idx]
 
-        alpha_input = self.Ws_attn(hs) + self.Wr_attn(hr) + self.Wqr_attn(h_qr)
-        if self.use_evidence_fusion:
-            ho = hidden[obj]
-            alpha_input = alpha_input + self.Wo_attn(ho)
-        alpha_logit = self.w_alpha(torch.relu(alpha_input))
-        alpha = torch.sigmoid(alpha_logit)
-
-        message = alpha * (hs * hr)
-        if self.use_evidence_fusion:
-            mean_logit = scatter(alpha_logit, index=obj, dim=0, dim_size=n_node, reduce='mean')
-            mean_logit_sq = scatter(alpha_logit * alpha_logit, index=obj, dim=0, dim_size=n_node, reduce='mean')
-            std_logit = torch.sqrt((mean_logit_sq - mean_logit * mean_logit).clamp_min(0) + 1e-8)
-            evidence_score = torch.sigmoid((alpha_logit - mean_logit[obj]) / std_logit[obj].clamp_min(1e-6))
-            strong_agg = scatter(message * evidence_score, index=obj, dim=0, dim_size=n_node, reduce='sum')
-            weak_agg = scatter(message * (1 - evidence_score), index=obj, dim=0, dim_size=n_node, reduce='sum')
-            node_h_qr = self.rela_embed(q_rel)[batch_idxs]
-            gate = self.evidence_gate(torch.cat([strong_agg, weak_agg, node_h_qr], dim=-1))
-            message_agg = gate * strong_agg + (1 - gate) * weak_agg
+        base_message = hs * hr
+        if self.use_bqrf_msg:
+            bqrf_input = torch.cat([hs, hr, h_qr], dim=-1)
+            z = self.bqrf_dropout(torch.relu(self.bqrf_proj(bqrf_input)))
+            gate_for = torch.sigmoid(self.bqrf_for(z))
+            gate_upd = torch.sigmoid(self.bqrf_upd(z))
+            candidate_message = torch.tanh(hr + gate_for * hs)
+            raw_message = (1 - gate_upd) * base_message + gate_upd * candidate_message
         else:
-            message_agg = scatter(message, index=obj, dim=0, dim_size=n_node, reduce='sum')
-        if self.use_rel_context:
-            rel_context = scatter(alpha * hr, index=obj, dim=0, dim_size=n_node, reduce='sum')
-            rel_gate = torch.sigmoid(self.rel_context_weight * (message_agg * rel_context) + self.rel_context_bias)
-            message_agg = rel_gate * message_agg + (1 - rel_gate) * rel_context
+            raw_message = base_message
+
+        if self.use_exp_attn:
+            alpha_logit = self.w_exp_attn(torch.relu(self.Wm_exp_attn(raw_message) + self.Wq_exp_attn(h_qr)))
+            alpha = scatter_softmax(alpha_logit, obj, n_node)
+        else:
+            alpha_input = self.Ws_attn(hs) + self.Wr_attn(hr) + self.Wqr_attn(h_qr)
+            alpha_logit = self.w_alpha(torch.relu(alpha_input))
+            alpha = torch.sigmoid(alpha_logit)
+
+        message = alpha * raw_message
+        message_agg = scatter(message, index=obj, dim=0, dim_size=n_node, reduce='sum')
         hidden_new = self.act(self.W_h(message_agg))
 
         if shortcut:
@@ -107,9 +111,12 @@ class GNN_auto(torch.nn.Module):
         self.n_rel = params.n_rel
         self.n_ent = params.n_ent
         self.loader = loader
-        self.use_evidence_fusion = bool(getattr(params, 'use_evidence_fusion', False))
-        self.fusion_hidden_dim = getattr(params, 'fusion_hidden_dim', None)
-        self.use_rel_context = bool(getattr(params, 'use_rel_context', False))
+        self.use_bqrf_msg = bool(getattr(params, 'use_bqrf_msg', False))
+        self.bqrf_dim = getattr(params, 'bqrf_dim', None)
+        self.bqrf_dropout = getattr(params, 'bqrf_dropout', 0.0)
+        self.bqrf_dropout = 0.0 if self.bqrf_dropout is None else self.bqrf_dropout
+        self.use_exp_attn = bool(getattr(params, 'use_exp_attn', False))
+        self.exp_attn_dim = getattr(params, 'exp_attn_dim', None)
 
         acts = {'relu': nn.ReLU(), 'tanh': torch.tanh, 'idd': lambda x: x}
         act = acts[params.act]
@@ -123,9 +130,11 @@ class GNN_auto(torch.nn.Module):
                     self.attn_dim,
                     self.n_rel,
                     act=act,
-                    use_evidence_fusion=self.use_evidence_fusion,
-                    fusion_hidden_dim=self.fusion_hidden_dim,
-                    use_rel_context=self.use_rel_context,
+                    use_bqrf_msg=self.use_bqrf_msg,
+                    bqrf_dim=self.bqrf_dim,
+                    bqrf_dropout=self.bqrf_dropout,
+                    use_exp_attn=self.use_exp_attn,
+                    exp_attn_dim=self.exp_attn_dim,
                 )
             )
         self.gnn_layers = nn.ModuleList(self.gnn_layers)
