@@ -18,11 +18,12 @@ class GNNLayer(torch.nn.Module):
         attn_dim,
         n_rel,
         act=lambda x: x,
-        use_bqrf_msg=False,
-        bqrf_dim=None,
-        bqrf_dropout=0.0,
         use_exp_attn=False,
         exp_attn_dim=None,
+        use_msg_filter=False,
+        msg_filter_rounds=3,
+        msg_filter_end_alpha=0.2,
+        msg_filter_hidden_dim=None,
     ):
         super(GNNLayer, self).__init__()
         self.n_rel = n_rel
@@ -30,8 +31,10 @@ class GNNLayer(torch.nn.Module):
         self.out_dim = out_dim
         self.attn_dim = attn_dim
         self.act = act
-        self.use_bqrf_msg = use_bqrf_msg
         self.use_exp_attn = use_exp_attn
+        self.use_msg_filter = use_msg_filter
+        self.msg_filter_rounds = int(msg_filter_rounds)
+        self.msg_filter_end_alpha = float(msg_filter_end_alpha)
 
         self.rela_embed = nn.Embedding(2 * n_rel + 1, in_dim)
         self.Ws_attn = nn.Linear(in_dim, attn_dim, bias=False)
@@ -40,18 +43,34 @@ class GNNLayer(torch.nn.Module):
         self.w_alpha = nn.Linear(attn_dim, 1)
         self.W_h = nn.Linear(in_dim, out_dim, bias=False)
 
-        if self.use_bqrf_msg:
-            bqrf_dim = int(bqrf_dim) if bqrf_dim is not None else min(32, in_dim)
-            self.bqrf_proj = nn.Linear(in_dim * 3, bqrf_dim)
-            self.bqrf_for = nn.Linear(bqrf_dim, in_dim)
-            self.bqrf_upd = nn.Linear(bqrf_dim, in_dim)
-            self.bqrf_dropout = nn.Dropout(float(bqrf_dropout))
-
         if self.use_exp_attn:
             exp_attn_dim = int(exp_attn_dim) if exp_attn_dim is not None else attn_dim
             self.Wm_exp_attn = nn.Linear(in_dim, exp_attn_dim, bias=False)
             self.Wq_exp_attn = nn.Linear(in_dim, exp_attn_dim)
             self.w_exp_attn = nn.Linear(exp_attn_dim, 1)
+
+        if self.use_msg_filter:
+            msg_filter_hidden_dim = int(msg_filter_hidden_dim) if msg_filter_hidden_dim is not None else min(64, in_dim)
+            self.msg_filter_score = nn.Sequential(
+                nn.Linear(in_dim * 3, msg_filter_hidden_dim),
+                nn.ReLU(),
+                nn.Linear(msg_filter_hidden_dim, in_dim),
+            )
+
+    def message_feature_filter(self, message_agg, hidden, node_h_qr):
+        filtered = message_agg
+        rounds = max(1, self.msg_filter_rounds)
+        for k in range(rounds):
+            if rounds == 1:
+                keep_ratio = self.msg_filter_end_alpha
+            else:
+                keep_ratio = 1.0 - k * (1.0 - self.msg_filter_end_alpha) / (rounds - 1)
+            keep_dim = max(1, min(self.in_dim, int(torch.ceil(filtered.new_tensor(keep_ratio * self.in_dim)).item())))
+            score = self.msg_filter_score(torch.cat([filtered, hidden, node_h_qr], dim=-1))
+            topk_idx = torch.topk(score, keep_dim, dim=-1).indices
+            mask = torch.zeros_like(score).scatter_(1, topk_idx, 1.0)
+            filtered = filtered * mask
+        return filtered
 
     def forward(
         self,
@@ -72,16 +91,7 @@ class GNNLayer(torch.nn.Module):
         hr = self.rela_embed(rel)
         h_qr = self.rela_embed(q_rel)[r_idx]
 
-        base_message = hs * hr
-        if self.use_bqrf_msg:
-            bqrf_input = torch.cat([hs, hr, h_qr], dim=-1)
-            z = self.bqrf_dropout(torch.relu(self.bqrf_proj(bqrf_input)))
-            gate_for = torch.sigmoid(self.bqrf_for(z))
-            gate_upd = torch.sigmoid(self.bqrf_upd(z))
-            candidate_message = torch.tanh(hr + gate_for * hs)
-            raw_message = (1 - gate_upd) * base_message + gate_upd * candidate_message
-        else:
-            raw_message = base_message
+        raw_message = hs * hr
 
         if self.use_exp_attn:
             alpha_logit = self.w_exp_attn(torch.relu(self.Wm_exp_attn(raw_message) + self.Wq_exp_attn(h_qr)))
@@ -93,6 +103,9 @@ class GNNLayer(torch.nn.Module):
 
         message = alpha * raw_message
         message_agg = scatter(message, index=obj, dim=0, dim_size=n_node, reduce='sum')
+        if self.use_msg_filter:
+            node_h_qr = self.rela_embed(q_rel)[batch_idxs]
+            message_agg = self.message_feature_filter(message_agg, hidden, node_h_qr)
         hidden_new = self.act(self.W_h(message_agg))
 
         if shortcut:
@@ -111,12 +124,12 @@ class GNN_auto(torch.nn.Module):
         self.n_rel = params.n_rel
         self.n_ent = params.n_ent
         self.loader = loader
-        self.use_bqrf_msg = bool(getattr(params, 'use_bqrf_msg', False))
-        self.bqrf_dim = getattr(params, 'bqrf_dim', None)
-        self.bqrf_dropout = getattr(params, 'bqrf_dropout', 0.0)
-        self.bqrf_dropout = 0.0 if self.bqrf_dropout is None else self.bqrf_dropout
         self.use_exp_attn = bool(getattr(params, 'use_exp_attn', False))
         self.exp_attn_dim = getattr(params, 'exp_attn_dim', None)
+        self.use_msg_filter = bool(getattr(params, 'use_msg_filter', False))
+        self.msg_filter_rounds = getattr(params, 'msg_filter_rounds', 3)
+        self.msg_filter_end_alpha = getattr(params, 'msg_filter_end_alpha', 0.2)
+        self.msg_filter_hidden_dim = getattr(params, 'msg_filter_hidden_dim', None)
 
         acts = {'relu': nn.ReLU(), 'tanh': torch.tanh, 'idd': lambda x: x}
         act = acts[params.act]
@@ -130,11 +143,12 @@ class GNN_auto(torch.nn.Module):
                     self.attn_dim,
                     self.n_rel,
                     act=act,
-                    use_bqrf_msg=self.use_bqrf_msg,
-                    bqrf_dim=self.bqrf_dim,
-                    bqrf_dropout=self.bqrf_dropout,
                     use_exp_attn=self.use_exp_attn,
                     exp_attn_dim=self.exp_attn_dim,
+                    use_msg_filter=self.use_msg_filter,
+                    msg_filter_rounds=self.msg_filter_rounds,
+                    msg_filter_end_alpha=self.msg_filter_end_alpha,
+                    msg_filter_hidden_dim=self.msg_filter_hidden_dim,
                 )
             )
         self.gnn_layers = nn.ModuleList(self.gnn_layers)

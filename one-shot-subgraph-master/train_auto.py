@@ -49,11 +49,12 @@ parser.add_argument('--readout', type=str, choices=['linear', 'multiply'], defau
 parser.add_argument('--decay_rate', type=float, default=None)
 parser.add_argument('--lamb', type=float, default=None)
 parser.add_argument('--dropout', type=float, default=None)
-parser.add_argument('--use_bqrf_msg', action='store_true')
-parser.add_argument('--bqrf_dim', type=int, default=None)
-parser.add_argument('--bqrf_dropout', type=float, default=None)
 parser.add_argument('--use_exp_attn', action='store_true')
 parser.add_argument('--exp_attn_dim', type=int, default=None)
+parser.add_argument('--use_msg_filter', action='store_true')
+parser.add_argument('--msg_filter_rounds', type=int, default=None)
+parser.add_argument('--msg_filter_end_alpha', type=float, default=None)
+parser.add_argument('--msg_filter_hidden_dim', type=int, default=None)
 args = parser.parse_args()
 
 
@@ -71,17 +72,18 @@ def apply_param_overrides(params, args):
         'decay_rate': args.decay_rate,
         'lamb': args.lamb,
         'dropout': args.dropout,
-        'bqrf_dim': args.bqrf_dim,
-        'bqrf_dropout': args.bqrf_dropout,
         'exp_attn_dim': args.exp_attn_dim,
+        'msg_filter_rounds': args.msg_filter_rounds,
+        'msg_filter_end_alpha': args.msg_filter_end_alpha,
+        'msg_filter_hidden_dim': args.msg_filter_hidden_dim,
     }
     for key, value in override_map.items():
         if value is not None:
             params[key] = value
-    if args.use_bqrf_msg:
-        params['use_bqrf_msg'] = True
     if args.use_exp_attn:
         params['use_exp_attn'] = True
+    if args.use_msg_filter:
+        params['use_msg_filter'] = True
     return params
 
 
@@ -178,11 +180,12 @@ if __name__ == '__main__':
         args.concatHidden = params['concatHidden']
         args.shortcut = params['shortcut']
         args.readout = params['readout']
-        args.use_bqrf_msg = bool(params.get('use_bqrf_msg', args.use_bqrf_msg))
-        args.bqrf_dim = params.get('bqrf_dim', args.bqrf_dim)
-        args.bqrf_dropout = params.get('bqrf_dropout', args.bqrf_dropout)
         args.use_exp_attn = bool(params.get('use_exp_attn', args.use_exp_attn))
         args.exp_attn_dim = params.get('exp_attn_dim', args.exp_attn_dim)
+        args.use_msg_filter = bool(params.get('use_msg_filter', args.use_msg_filter))
+        args.msg_filter_rounds = params.get('msg_filter_rounds', args.msg_filter_rounds)
+        args.msg_filter_end_alpha = params.get('msg_filter_end_alpha', args.msg_filter_end_alpha)
+        args.msg_filter_hidden_dim = params.get('msg_filter_hidden_dim', args.msg_filter_hidden_dim)
 
         model = BaseModel(args, loaders=(loader, val_loader, test_loader), samplers=(train_sampler, test_sampler))
 
