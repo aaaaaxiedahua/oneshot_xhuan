@@ -20,10 +20,6 @@ class GNNLayer(torch.nn.Module):
         act=lambda x: x,
         use_exp_attn=False,
         exp_attn_dim=None,
-        use_msg_filter=False,
-        msg_filter_rounds=3,
-        msg_filter_end_alpha=0.2,
-        msg_filter_hidden_dim=None,
     ):
         super(GNNLayer, self).__init__()
         self.n_rel = n_rel
@@ -32,9 +28,6 @@ class GNNLayer(torch.nn.Module):
         self.attn_dim = attn_dim
         self.act = act
         self.use_exp_attn = use_exp_attn
-        self.use_msg_filter = use_msg_filter
-        self.msg_filter_rounds = int(msg_filter_rounds)
-        self.msg_filter_end_alpha = float(msg_filter_end_alpha)
 
         self.rela_embed = nn.Embedding(2 * n_rel + 1, in_dim)
         self.Ws_attn = nn.Linear(in_dim, attn_dim, bias=False)
@@ -48,29 +41,6 @@ class GNNLayer(torch.nn.Module):
             self.Wm_exp_attn = nn.Linear(in_dim, exp_attn_dim, bias=False)
             self.Wq_exp_attn = nn.Linear(in_dim, exp_attn_dim)
             self.w_exp_attn = nn.Linear(exp_attn_dim, 1)
-
-        if self.use_msg_filter:
-            msg_filter_hidden_dim = int(msg_filter_hidden_dim) if msg_filter_hidden_dim is not None else min(64, in_dim)
-            self.msg_filter_score = nn.Sequential(
-                nn.Linear(in_dim * 3, msg_filter_hidden_dim),
-                nn.ReLU(),
-                nn.Linear(msg_filter_hidden_dim, in_dim),
-            )
-
-    def message_feature_filter(self, message_agg, hidden, node_h_qr):
-        filtered = message_agg
-        rounds = max(1, self.msg_filter_rounds)
-        for k in range(rounds):
-            if rounds == 1:
-                keep_ratio = self.msg_filter_end_alpha
-            else:
-                keep_ratio = 1.0 - k * (1.0 - self.msg_filter_end_alpha) / (rounds - 1)
-            keep_dim = max(1, min(self.in_dim, int(torch.ceil(filtered.new_tensor(keep_ratio * self.in_dim)).item())))
-            score = self.msg_filter_score(torch.cat([filtered, hidden, node_h_qr], dim=-1))
-            topk_idx = torch.topk(score, keep_dim, dim=-1).indices
-            mask = torch.zeros_like(score).scatter_(1, topk_idx, 1.0)
-            filtered = filtered * mask
-        return filtered
 
     def forward(
         self,
@@ -103,9 +73,6 @@ class GNNLayer(torch.nn.Module):
 
         message = alpha * raw_message
         message_agg = scatter(message, index=obj, dim=0, dim_size=n_node, reduce='sum')
-        if self.use_msg_filter:
-            node_h_qr = self.rela_embed(q_rel)[batch_idxs]
-            message_agg = self.message_feature_filter(message_agg, hidden, node_h_qr)
         hidden_new = self.act(self.W_h(message_agg))
 
         if shortcut:
@@ -126,10 +93,12 @@ class GNN_auto(torch.nn.Module):
         self.loader = loader
         self.use_exp_attn = bool(getattr(params, 'use_exp_attn', False))
         self.exp_attn_dim = getattr(params, 'exp_attn_dim', None)
-        self.use_msg_filter = bool(getattr(params, 'use_msg_filter', False))
-        self.msg_filter_rounds = getattr(params, 'msg_filter_rounds', 3)
-        self.msg_filter_end_alpha = getattr(params, 'msg_filter_end_alpha', 0.2)
-        self.msg_filter_hidden_dim = getattr(params, 'msg_filter_hidden_dim', None)
+        self.use_role_apim = bool(getattr(params, 'use_role_apim', False))
+        role_apim_dim = getattr(params, 'role_apim_dim', None)
+        role_apim_topk = getattr(params, 'role_apim_topk', None)
+        self.role_apim_dim = int(role_apim_dim) if role_apim_dim is not None else 64
+        self.role_apim_topk = int(role_apim_topk) if role_apim_topk is not None else 20
+        self.readout_dim = self.hidden_dim * (self.n_layer + 1) if params.concatHidden else self.hidden_dim
 
         acts = {'relu': nn.ReLU(), 'tanh': torch.tanh, 'idd': lambda x: x}
         act = acts[params.act]
@@ -145,10 +114,6 @@ class GNN_auto(torch.nn.Module):
                     act=act,
                     use_exp_attn=self.use_exp_attn,
                     exp_attn_dim=self.exp_attn_dim,
-                    use_msg_filter=self.use_msg_filter,
-                    msg_filter_rounds=self.msg_filter_rounds,
-                    msg_filter_end_alpha=self.msg_filter_end_alpha,
-                    msg_filter_hidden_dim=self.msg_filter_hidden_dim,
                 )
             )
         self.gnn_layers = nn.ModuleList(self.gnn_layers)
@@ -162,6 +127,33 @@ class GNN_auto(torch.nn.Module):
                 self.W_final = nn.Linear(self.hidden_dim * (self.n_layer + 1), 1, bias=False)
             else:
                 self.W_final = nn.Linear(self.hidden_dim, 1, bias=False)
+        if self.use_role_apim:
+            self.role_query_embed = nn.Embedding(2 * self.n_rel + 1, self.hidden_dim)
+            self.role_src_proj = nn.Linear(self.readout_dim + self.hidden_dim, self.role_apim_dim)
+            self.role_ans_proj = nn.Linear(self.readout_dim + self.hidden_dim, self.role_apim_dim)
+            self.role_rel_matrix = nn.Embedding(2 * self.n_rel + 1, self.role_apim_dim * self.role_apim_dim)
+
+    def topk_modes(self, mode_prob):
+        keep_dim = max(1, min(self.role_apim_dim, self.role_apim_topk))
+        if keep_dim >= self.role_apim_dim:
+            return mode_prob
+        topk_idx = torch.topk(mode_prob, keep_dim, dim=-1).indices
+        mask = torch.zeros_like(mode_prob).scatter_(1, topk_idx, 1.0)
+        return mode_prob * mask
+
+    def role_apim_readout(self, hidden, q_rel, batch_idxs, query_sub_idxs):
+        q_embed = self.role_query_embed(q_rel)[batch_idxs]
+        src_hidden = hidden[query_sub_idxs][batch_idxs]
+
+        src_mode = torch.sigmoid(self.role_src_proj(torch.cat([src_hidden, q_embed], dim=-1)))
+        ans_mode = torch.sigmoid(self.role_ans_proj(torch.cat([hidden, q_embed], dim=-1)))
+        src_mode = self.topk_modes(src_mode)
+        ans_mode = self.topk_modes(ans_mode)
+
+        rel_matrix = self.role_rel_matrix(q_rel)[batch_idxs]
+        rel_matrix = torch.tanh(rel_matrix.view(-1, self.role_apim_dim, self.role_apim_dim))
+        src_trans = torch.bmm(src_mode.unsqueeze(1), rel_matrix).squeeze(1)
+        return torch.sum(src_trans * ans_mode, dim=-1)
 
     def forward(self, q_sub, q_rel, subgraph_data, mode='train'):
         n = len(q_sub)
@@ -201,7 +193,11 @@ class GNN_auto(torch.nn.Module):
             if self.params.concatHidden:
                 hidden_list.append(hidden)
 
-        if self.params.readout == 'linear':
+        if self.use_role_apim:
+            if self.params.concatHidden:
+                hidden = torch.cat(hidden_list, dim=-1)
+            scores = self.role_apim_readout(hidden, q_rel, batch_idxs, query_sub_idxs)
+        elif self.params.readout == 'linear':
             if self.params.concatHidden:
                 hidden = torch.cat(hidden_list, dim=-1)
             scores = self.W_final(hidden).squeeze(-1)

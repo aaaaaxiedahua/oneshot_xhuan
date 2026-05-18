@@ -62,10 +62,9 @@ parser.add_argument(
 )
 parser.add_argument('--use_exp_attn', action='store_true')
 parser.add_argument('--exp_attn_dim', type=int, default=None)
-parser.add_argument('--use_msg_filter', action='store_true')
-parser.add_argument('--msg_filter_rounds', type=int, default=None)
-parser.add_argument('--msg_filter_end_alpha', type=float, default=None)
-parser.add_argument('--msg_filter_hidden_dim', type=int, default=None)
+parser.add_argument('--use_role_apim', action='store_true')
+parser.add_argument('--role_apim_dim', type=int, default=None)
+parser.add_argument('--role_apim_topk', type=int, default=None)
 args = parser.parse_args()
 
 
@@ -170,11 +169,10 @@ if __name__ == '__main__':
     if args.use_exp_attn:
         HPO_search_space['exp_attn_dim'] = ('choice', [8, 16, 32, 64])
         print('==> HPO: added EXP/RUN attention aggregation search space')
-    if args.use_msg_filter:
-        HPO_search_space['msg_filter_rounds'] = ('choice', [2, 3, 4, 5])
-        HPO_search_space['msg_filter_end_alpha'] = ('choice', [0.1, 0.2, 0.3, 0.4])
-        HPO_search_space['msg_filter_hidden_dim'] = ('choice', [32, 64, 128])
-        print('==> HPO: added message-feature filtering search space')
+    if args.use_role_apim:
+        HPO_search_space['role_apim_dim'] = ('choice', [32, 64, 128])
+        HPO_search_space['role_apim_topk'] = ('choice', [8, 16, 20, 32])
+        print('==> HPO: added query-aware role APIM readout search space')
 
     def loadSearchLog(file):
         assert os.path.exists(file)
@@ -207,10 +205,9 @@ if __name__ == '__main__':
         args.readout = params['readout']
         args.use_exp_attn = bool(params.get('use_exp_attn', args.use_exp_attn))
         args.exp_attn_dim = params.get('exp_attn_dim', args.exp_attn_dim)
-        args.use_msg_filter = bool(params.get('use_msg_filter', args.use_msg_filter))
-        args.msg_filter_rounds = params.get('msg_filter_rounds', args.msg_filter_rounds)
-        args.msg_filter_end_alpha = params.get('msg_filter_end_alpha', args.msg_filter_end_alpha)
-        args.msg_filter_hidden_dim = params.get('msg_filter_hidden_dim', args.msg_filter_hidden_dim)
+        args.use_role_apim = bool(params.get('use_role_apim', args.use_role_apim))
+        args.role_apim_dim = params.get('role_apim_dim', args.role_apim_dim)
+        args.role_apim_topk = params.get('role_apim_topk', args.role_apim_topk)
 
         args.n_samp_ent = max(1, int(args.topk * loader.n_ent))
         train_sampler.topk = args.n_samp_ent

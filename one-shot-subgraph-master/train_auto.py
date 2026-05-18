@@ -51,10 +51,9 @@ parser.add_argument('--lamb', type=float, default=None)
 parser.add_argument('--dropout', type=float, default=None)
 parser.add_argument('--use_exp_attn', action='store_true')
 parser.add_argument('--exp_attn_dim', type=int, default=None)
-parser.add_argument('--use_msg_filter', action='store_true')
-parser.add_argument('--msg_filter_rounds', type=int, default=None)
-parser.add_argument('--msg_filter_end_alpha', type=float, default=None)
-parser.add_argument('--msg_filter_hidden_dim', type=int, default=None)
+parser.add_argument('--use_role_apim', action='store_true')
+parser.add_argument('--role_apim_dim', type=int, default=None)
+parser.add_argument('--role_apim_topk', type=int, default=None)
 args = parser.parse_args()
 
 
@@ -73,17 +72,16 @@ def apply_param_overrides(params, args):
         'lamb': args.lamb,
         'dropout': args.dropout,
         'exp_attn_dim': args.exp_attn_dim,
-        'msg_filter_rounds': args.msg_filter_rounds,
-        'msg_filter_end_alpha': args.msg_filter_end_alpha,
-        'msg_filter_hidden_dim': args.msg_filter_hidden_dim,
+        'role_apim_dim': args.role_apim_dim,
+        'role_apim_topk': args.role_apim_topk,
     }
     for key, value in override_map.items():
         if value is not None:
             params[key] = value
     if args.use_exp_attn:
         params['use_exp_attn'] = True
-    if args.use_msg_filter:
-        params['use_msg_filter'] = True
+    if args.use_role_apim:
+        params['use_role_apim'] = True
     return params
 
 
@@ -182,10 +180,9 @@ if __name__ == '__main__':
         args.readout = params['readout']
         args.use_exp_attn = bool(params.get('use_exp_attn', args.use_exp_attn))
         args.exp_attn_dim = params.get('exp_attn_dim', args.exp_attn_dim)
-        args.use_msg_filter = bool(params.get('use_msg_filter', args.use_msg_filter))
-        args.msg_filter_rounds = params.get('msg_filter_rounds', args.msg_filter_rounds)
-        args.msg_filter_end_alpha = params.get('msg_filter_end_alpha', args.msg_filter_end_alpha)
-        args.msg_filter_hidden_dim = params.get('msg_filter_hidden_dim', args.msg_filter_hidden_dim)
+        args.use_role_apim = bool(params.get('use_role_apim', args.use_role_apim))
+        args.role_apim_dim = params.get('role_apim_dim', args.role_apim_dim)
+        args.role_apim_topk = params.get('role_apim_topk', args.role_apim_topk)
 
         model = BaseModel(args, loaders=(loader, val_loader, test_loader), samplers=(train_sampler, test_sampler))
 
