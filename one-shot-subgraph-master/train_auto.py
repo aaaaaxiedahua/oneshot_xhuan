@@ -54,6 +54,8 @@ parser.add_argument('--exp_attn_dim', type=int, default=None)
 parser.add_argument('--use_role_apim', action='store_true')
 parser.add_argument('--role_apim_dim', type=int, default=None)
 parser.add_argument('--role_apim_topk', type=int, default=None)
+parser.add_argument('--role_apim_score_weight', type=float, default=None)
+parser.add_argument('--role_apim_loss_weight', type=float, default=None)
 args = parser.parse_args()
 
 
@@ -74,6 +76,8 @@ def apply_param_overrides(params, args):
         'exp_attn_dim': args.exp_attn_dim,
         'role_apim_dim': args.role_apim_dim,
         'role_apim_topk': args.role_apim_topk,
+        'role_apim_score_weight': args.role_apim_score_weight,
+        'role_apim_loss_weight': args.role_apim_loss_weight,
     }
     for key, value in override_map.items():
         if value is not None:
@@ -183,6 +187,8 @@ if __name__ == '__main__':
         args.use_role_apim = bool(params.get('use_role_apim', args.use_role_apim))
         args.role_apim_dim = params.get('role_apim_dim', args.role_apim_dim)
         args.role_apim_topk = params.get('role_apim_topk', args.role_apim_topk)
+        args.role_apim_score_weight = params.get('role_apim_score_weight', args.role_apim_score_weight)
+        args.role_apim_loss_weight = params.get('role_apim_loss_weight', args.role_apim_loss_weight)
 
         model = BaseModel(args, loaders=(loader, val_loader, test_loader), samplers=(train_sampler, test_sampler))
 

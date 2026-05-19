@@ -65,6 +65,8 @@ parser.add_argument('--exp_attn_dim', type=int, default=None)
 parser.add_argument('--use_role_apim', action='store_true')
 parser.add_argument('--role_apim_dim', type=int, default=None)
 parser.add_argument('--role_apim_topk', type=int, default=None)
+parser.add_argument('--role_apim_score_weight', type=float, default=None)
+parser.add_argument('--role_apim_loss_weight', type=float, default=None)
 args = parser.parse_args()
 
 
@@ -170,8 +172,10 @@ if __name__ == '__main__':
         HPO_search_space['exp_attn_dim'] = ('choice', [8, 16, 32, 64])
         print('==> HPO: added EXP/RUN attention aggregation search space')
     if args.use_role_apim:
-        HPO_search_space['role_apim_dim'] = ('choice', [32, 64, 128])
-        HPO_search_space['role_apim_topk'] = ('choice', [8, 16, 20, 32])
+        HPO_search_space['role_apim_dim'] = ('choice', [16, 32, 64, 128])
+        HPO_search_space['role_apim_topk'] = ('choice', [5, 10, 20, 30])
+        HPO_search_space['role_apim_score_weight'] = ('choice', [0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4])
+        HPO_search_space['role_apim_loss_weight'] = ('choice', [0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4])
         print('==> HPO: added query-aware role APIM readout search space')
 
     def loadSearchLog(file):
@@ -208,6 +212,8 @@ if __name__ == '__main__':
         args.use_role_apim = bool(params.get('use_role_apim', args.use_role_apim))
         args.role_apim_dim = params.get('role_apim_dim', args.role_apim_dim)
         args.role_apim_topk = params.get('role_apim_topk', args.role_apim_topk)
+        args.role_apim_score_weight = params.get('role_apim_score_weight', args.role_apim_score_weight)
+        args.role_apim_loss_weight = params.get('role_apim_loss_weight', args.role_apim_loss_weight)
 
         args.n_samp_ent = max(1, int(args.topk * loader.n_ent))
         train_sampler.topk = args.n_samp_ent

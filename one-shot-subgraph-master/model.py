@@ -96,8 +96,10 @@ class GNN_auto(torch.nn.Module):
         self.use_role_apim = bool(getattr(params, 'use_role_apim', False))
         role_apim_dim = getattr(params, 'role_apim_dim', None)
         role_apim_topk = getattr(params, 'role_apim_topk', None)
+        role_apim_score_weight = getattr(params, 'role_apim_score_weight', None)
         self.role_apim_dim = int(role_apim_dim) if role_apim_dim is not None else 64
         self.role_apim_topk = int(role_apim_topk) if role_apim_topk is not None else 20
+        self.role_apim_score_weight = float(role_apim_score_weight) if role_apim_score_weight is not None else 0.1
         self.readout_dim = self.hidden_dim * (self.n_layer + 1) if params.concatHidden else self.hidden_dim
 
         acts = {'relu': nn.ReLU(), 'tanh': torch.tanh, 'idd': lambda x: x}
@@ -193,19 +195,23 @@ class GNN_auto(torch.nn.Module):
             if self.params.concatHidden:
                 hidden_list.append(hidden)
 
-        if self.use_role_apim:
-            if self.params.concatHidden:
-                hidden = torch.cat(hidden_list, dim=-1)
-            scores = self.role_apim_readout(hidden, q_rel, batch_idxs, query_sub_idxs)
-        elif self.params.readout == 'linear':
-            if self.params.concatHidden:
-                hidden = torch.cat(hidden_list, dim=-1)
+        role_scores = None
+        if self.params.concatHidden:
+            hidden = torch.cat(hidden_list, dim=-1)
+
+        if self.params.readout == 'linear':
             scores = self.W_final(hidden).squeeze(-1)
         elif self.params.readout == 'multiply':
-            if self.params.concatHidden:
-                hidden = torch.cat(hidden_list, dim=-1)
             scores = torch.sum(hidden * hidden[query_sub_idxs][batch_idxs], dim=-1)
+
+        if self.use_role_apim:
+            role_scores = self.role_apim_readout(hidden, q_rel, batch_idxs, query_sub_idxs)
+            scores = scores + self.role_apim_score_weight * role_scores
 
         scores_all = scores.new_zeros((n, self.loader.n_ent))
         scores_all[batch_idxs, abs_idxs] = scores
+        if self.use_role_apim and mode == 'train':
+            role_scores_all = role_scores.new_zeros((n, self.loader.n_ent))
+            role_scores_all[batch_idxs, abs_idxs] = role_scores
+            return scores_all, role_scores_all
         return scores_all

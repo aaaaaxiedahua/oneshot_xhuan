@@ -40,9 +40,17 @@ class BaseModel(object):
         self.smooth = 1e-5
         self.t_time = 0
         self.mean_rank_dict = {}
+        self.role_apim_loss_weight = float(getattr(args, 'role_apim_loss_weight', 0.1) or 0.1)
 
     def _build_optimizer(self):
         return Adam(self.model.parameters(), lr=self.args.lr, weight_decay=self.args.lamb)
+
+    @staticmethod
+    def ranking_loss(scores, objs):
+        pos_scores = scores[[torch.arange(len(scores), device=scores.device), objs.flatten()]]
+        max_n = torch.max(scores, 1, keepdim=True)[0]
+        loss = torch.sum(-pos_scores + max_n.squeeze(1) + torch.log(torch.sum(torch.exp(scores - max_n), 1)))
+        return loss, pos_scores
         
     def saveModelToFiles(self, args, best_metric, deleteLastFile=True):
         if args.val_num == -1:
@@ -90,12 +98,17 @@ class BaseModel(object):
             
             # forward
             self.optimizer.zero_grad(set_to_none=True)
-            scores = self.model(subs, rels, subgraph_data)
+            model_out = self.model(subs, rels, subgraph_data)
+            if isinstance(model_out, tuple):
+                scores, role_scores = model_out
+            else:
+                scores, role_scores = model_out, None
             
             # loss calculation
-            pos_scores = scores[[torch.arange(len(scores)).cuda(), objs.flatten()]]
-            max_n = torch.max(scores, 1, keepdim=True)[0]
-            loss = torch.sum(- pos_scores + max_n + torch.log(torch.sum(torch.exp(scores - max_n),1))) 
+            loss, pos_scores = self.ranking_loss(scores, objs)
+            if role_scores is not None:
+                role_loss, _ = self.ranking_loss(role_scores, objs)
+                loss = loss + self.role_apim_loss_weight * role_loss
 
             # loss backward
             loss.backward()
