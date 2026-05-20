@@ -49,13 +49,13 @@ parser.add_argument('--readout', type=str, choices=['linear', 'multiply'], defau
 parser.add_argument('--decay_rate', type=float, default=None)
 parser.add_argument('--lamb', type=float, default=None)
 parser.add_argument('--dropout', type=float, default=None)
-parser.add_argument('--use_exp_attn', action='store_true')
-parser.add_argument('--exp_attn_dim', type=int, default=None)
-parser.add_argument('--use_rel_context', action='store_true')
-parser.add_argument('--rel_context_dim', type=int, default=None)
-parser.add_argument('--use_eckge_readout', action='store_true')
-parser.add_argument('--eckge_hidden_dim', type=int, default=None)
-parser.add_argument('--eckge_decoder', type=str, choices=['distmult', 'transe'], default=None)
+parser.add_argument('--use_layer_expert', action='store_true')
+parser.add_argument('--layer_expert_dim', type=int, default=None)
+parser.add_argument('--layer_temperature', type=float, default=None)
+parser.add_argument('--use_evidence_pruning', action='store_true')
+parser.add_argument('--pruning_expert_dim', type=int, default=None)
+parser.add_argument('--pruning_temperature', type=float, default=None)
+parser.add_argument('--expert_balance_weight', type=float, default=None)
 args = parser.parse_args()
 
 
@@ -73,20 +73,19 @@ def apply_param_overrides(params, args):
         'decay_rate': args.decay_rate,
         'lamb': args.lamb,
         'dropout': args.dropout,
-        'exp_attn_dim': args.exp_attn_dim,
-        'rel_context_dim': args.rel_context_dim,
-        'eckge_hidden_dim': args.eckge_hidden_dim,
-        'eckge_decoder': args.eckge_decoder,
+        'layer_expert_dim': args.layer_expert_dim,
+        'layer_temperature': args.layer_temperature,
+        'pruning_expert_dim': args.pruning_expert_dim,
+        'pruning_temperature': args.pruning_temperature,
+        'expert_balance_weight': args.expert_balance_weight,
     }
     for key, value in override_map.items():
         if value is not None:
             params[key] = value
-    if args.use_exp_attn:
-        params['use_exp_attn'] = True
-    if args.use_rel_context:
-        params['use_rel_context'] = True
-    if args.use_eckge_readout:
-        params['use_eckge_readout'] = True
+    if args.use_layer_expert:
+        params['use_layer_expert'] = True
+    if args.use_evidence_pruning:
+        params['use_evidence_pruning'] = True
     return params
 
 
@@ -183,13 +182,13 @@ if __name__ == '__main__':
         args.concatHidden = params['concatHidden']
         args.shortcut = params['shortcut']
         args.readout = params['readout']
-        args.use_exp_attn = bool(params.get('use_exp_attn', args.use_exp_attn))
-        args.exp_attn_dim = params.get('exp_attn_dim', args.exp_attn_dim)
-        args.use_rel_context = bool(params.get('use_rel_context', args.use_rel_context))
-        args.rel_context_dim = params.get('rel_context_dim', args.rel_context_dim)
-        args.use_eckge_readout = bool(params.get('use_eckge_readout', args.use_eckge_readout))
-        args.eckge_hidden_dim = params.get('eckge_hidden_dim', args.eckge_hidden_dim)
-        args.eckge_decoder = params.get('eckge_decoder', args.eckge_decoder)
+        args.use_layer_expert = bool(params.get('use_layer_expert', args.use_layer_expert))
+        args.layer_expert_dim = params.get('layer_expert_dim', args.layer_expert_dim)
+        args.layer_temperature = params.get('layer_temperature', args.layer_temperature)
+        args.use_evidence_pruning = bool(params.get('use_evidence_pruning', args.use_evidence_pruning))
+        args.pruning_expert_dim = params.get('pruning_expert_dim', args.pruning_expert_dim)
+        args.pruning_temperature = params.get('pruning_temperature', args.pruning_temperature)
+        args.expert_balance_weight = params.get('expert_balance_weight', args.expert_balance_weight)
 
         model = BaseModel(args, loaders=(loader, val_loader, test_loader), samplers=(train_sampler, test_sampler))
 

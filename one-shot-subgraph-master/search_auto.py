@@ -60,13 +60,13 @@ parser.add_argument(
     default='',
     help='Optional Optuna start config. Accepts either a JSON string or a path to a JSON file.',
 )
-parser.add_argument('--use_exp_attn', action='store_true')
-parser.add_argument('--exp_attn_dim', type=int, default=None)
-parser.add_argument('--use_rel_context', action='store_true')
-parser.add_argument('--rel_context_dim', type=int, default=None)
-parser.add_argument('--use_eckge_readout', action='store_true')
-parser.add_argument('--eckge_hidden_dim', type=int, default=None)
-parser.add_argument('--eckge_decoder', type=str, choices=['distmult', 'transe'], default=None)
+parser.add_argument('--use_layer_expert', action='store_true')
+parser.add_argument('--layer_expert_dim', type=int, default=None)
+parser.add_argument('--layer_temperature', type=float, default=None)
+parser.add_argument('--use_evidence_pruning', action='store_true')
+parser.add_argument('--pruning_expert_dim', type=int, default=None)
+parser.add_argument('--pruning_temperature', type=float, default=None)
+parser.add_argument('--expert_balance_weight', type=float, default=None)
 args = parser.parse_args()
 
 
@@ -168,16 +168,17 @@ if __name__ == '__main__':
     test_loader.addSampler(test_sampler)
     HPO_save_path = f'./results/{dataset}/search_log.pkl'
 
-    if args.use_exp_attn:
-        HPO_search_space['exp_attn_dim'] = ('choice', [8, 16, 32, 64])
-        print('==> HPO: added EXP/RUN attention aggregation search space')
-    if args.use_rel_context:
-        HPO_search_space['rel_context_dim'] = ('choice', [16, 32, 64, 128])
-        print('==> HPO: added query-level relation context search space')
-    if args.use_eckge_readout:
-        HPO_search_space['eckge_hidden_dim'] = ('choice', [16, 32, 64, 128])
-        HPO_search_space['eckge_decoder'] = ('choice', ['distmult', 'transe'])
-        print('==> HPO: added evidence-conditioned KGE readout search space')
+    if args.use_layer_expert:
+        HPO_search_space['layer_expert_dim'] = ('choice', [16, 32, 64, 128])
+        HPO_search_space['layer_temperature'] = ('choice', [0.5, 1.0, 1.5, 2.0, 2.5])
+        print('==> HPO: added query-adaptive layer expert search space')
+    if args.use_evidence_pruning:
+        HPO_search_space['pruning_expert_dim'] = ('choice', [16, 32, 64, 128])
+        HPO_search_space['pruning_temperature'] = ('choice', [0.5, 1.0, 1.5, 2.0, 2.5])
+        print('==> HPO: added query-adaptive evidence pruning search space')
+    if args.use_layer_expert or args.use_evidence_pruning:
+        HPO_search_space['expert_balance_weight'] = ('choice', [0.0001, 0.0005, 0.001, 0.005, 0.01])
+        print('==> HPO: added expert balance loss search space')
 
     def loadSearchLog(file):
         assert os.path.exists(file)
@@ -208,13 +209,13 @@ if __name__ == '__main__':
         args.concatHidden = params['concatHidden']
         args.shortcut = params['shortcut']
         args.readout = params['readout']
-        args.use_exp_attn = bool(params.get('use_exp_attn', args.use_exp_attn))
-        args.exp_attn_dim = params.get('exp_attn_dim', args.exp_attn_dim)
-        args.use_rel_context = bool(params.get('use_rel_context', args.use_rel_context))
-        args.rel_context_dim = params.get('rel_context_dim', args.rel_context_dim)
-        args.use_eckge_readout = bool(params.get('use_eckge_readout', args.use_eckge_readout))
-        args.eckge_hidden_dim = params.get('eckge_hidden_dim', args.eckge_hidden_dim)
-        args.eckge_decoder = params.get('eckge_decoder', args.eckge_decoder)
+        args.use_layer_expert = bool(params.get('use_layer_expert', args.use_layer_expert))
+        args.layer_expert_dim = params.get('layer_expert_dim', args.layer_expert_dim)
+        args.layer_temperature = params.get('layer_temperature', args.layer_temperature)
+        args.use_evidence_pruning = bool(params.get('use_evidence_pruning', args.use_evidence_pruning))
+        args.pruning_expert_dim = params.get('pruning_expert_dim', args.pruning_expert_dim)
+        args.pruning_temperature = params.get('pruning_temperature', args.pruning_temperature)
+        args.expert_balance_weight = params.get('expert_balance_weight', args.expert_balance_weight)
 
         args.n_samp_ent = max(1, int(args.topk * loader.n_ent))
         train_sampler.topk = args.n_samp_ent
