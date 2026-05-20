@@ -52,6 +52,7 @@ class GNNLayer(torch.nn.Module):
         edges,
         n_node,
         shortcut=False,
+        q_rel_embed_override=None,
     ):
         sub = edges[:, 0]
         rel = edges[:, 1]
@@ -59,7 +60,10 @@ class GNNLayer(torch.nn.Module):
 
         hs = hidden[sub]
         hr = self.rela_embed(rel)
-        h_qr = self.rela_embed(q_rel)[r_idx]
+        if q_rel_embed_override is None:
+            h_qr = self.rela_embed(q_rel)[r_idx]
+        else:
+            h_qr = q_rel_embed_override[r_idx]
 
         raw_message = hs * hr
 
@@ -93,13 +97,13 @@ class GNN_auto(torch.nn.Module):
         self.loader = loader
         self.use_exp_attn = bool(getattr(params, 'use_exp_attn', False))
         self.exp_attn_dim = getattr(params, 'exp_attn_dim', None)
-        self.use_role_apim = bool(getattr(params, 'use_role_apim', False))
-        role_apim_dim = getattr(params, 'role_apim_dim', None)
-        role_apim_topk = getattr(params, 'role_apim_topk', None)
-        role_apim_score_weight = getattr(params, 'role_apim_score_weight', None)
-        self.role_apim_dim = int(role_apim_dim) if role_apim_dim is not None else 64
-        self.role_apim_topk = int(role_apim_topk) if role_apim_topk is not None else 20
-        self.role_apim_score_weight = float(role_apim_score_weight) if role_apim_score_weight is not None else 0.1
+        self.use_rel_context = bool(getattr(params, 'use_rel_context', False))
+        self.use_eckge_readout = bool(getattr(params, 'use_eckge_readout', False))
+        rel_context_dim = getattr(params, 'rel_context_dim', None)
+        eckge_hidden_dim = getattr(params, 'eckge_hidden_dim', None)
+        self.rel_context_dim = int(rel_context_dim) if rel_context_dim is not None else 32
+        self.eckge_hidden_dim = int(eckge_hidden_dim) if eckge_hidden_dim is not None else 32
+        self.eckge_decoder = getattr(params, 'eckge_decoder', None) or 'distmult'
         self.readout_dim = self.hidden_dim * (self.n_layer + 1) if params.concatHidden else self.hidden_dim
 
         acts = {'relu': nn.ReLU(), 'tanh': torch.tanh, 'idd': lambda x: x}
@@ -129,33 +133,55 @@ class GNN_auto(torch.nn.Module):
                 self.W_final = nn.Linear(self.hidden_dim * (self.n_layer + 1), 1, bias=False)
             else:
                 self.W_final = nn.Linear(self.hidden_dim, 1, bias=False)
-        if self.use_role_apim:
-            self.role_query_embed = nn.Embedding(2 * self.n_rel + 1, self.hidden_dim)
-            self.role_src_proj = nn.Linear(self.readout_dim + self.hidden_dim, self.role_apim_dim)
-            self.role_ans_proj = nn.Linear(self.readout_dim + self.hidden_dim, self.role_apim_dim)
-            self.role_rel_matrix = nn.Embedding(2 * self.n_rel + 1, self.role_apim_dim * self.role_apim_dim)
+        if self.use_rel_context or self.use_eckge_readout:
+            self.rel_context_embed = nn.Embedding(2 * self.n_rel + 1, self.hidden_dim)
 
-    def topk_modes(self, mode_prob):
-        keep_dim = max(1, min(self.role_apim_dim, self.role_apim_topk))
-        if keep_dim >= self.role_apim_dim:
-            return mode_prob
-        topk_idx = torch.topk(mode_prob, keep_dim, dim=-1).indices
-        mask = torch.zeros_like(mode_prob).scatter_(1, topk_idx, 1.0)
-        return mode_prob * mask
+        if self.use_rel_context:
+            self.rel_ctx_query_proj = nn.Linear(self.hidden_dim, self.rel_context_dim, bias=False)
+            self.rel_ctx_edge_proj = nn.Linear(self.hidden_dim, self.rel_context_dim, bias=False)
+            self.rel_ctx_score = nn.Linear(self.rel_context_dim, 1)
+            self.rel_ctx_gate = nn.Linear(self.hidden_dim * 3, self.hidden_dim)
 
-    def role_apim_readout(self, hidden, q_rel, batch_idxs, query_sub_idxs):
-        q_embed = self.role_query_embed(q_rel)[batch_idxs]
-        src_hidden = hidden[query_sub_idxs][batch_idxs]
+        if self.use_eckge_readout:
+            self.eckge_context = nn.Sequential(
+                nn.Linear(self.hidden_dim * 3, self.eckge_hidden_dim),
+                nn.ReLU(),
+                nn.Linear(self.eckge_hidden_dim, self.hidden_dim),
+                nn.Tanh(),
+            )
+            self.eckge_gate = nn.Sequential(
+                nn.Linear(self.hidden_dim * 3, self.eckge_hidden_dim),
+                nn.ReLU(),
+                nn.Linear(self.eckge_hidden_dim, self.hidden_dim),
+                nn.Sigmoid(),
+            )
 
-        src_mode = torch.sigmoid(self.role_src_proj(torch.cat([src_hidden, q_embed], dim=-1)))
-        ans_mode = torch.sigmoid(self.role_ans_proj(torch.cat([hidden, q_embed], dim=-1)))
-        src_mode = self.topk_modes(src_mode)
-        ans_mode = self.topk_modes(ans_mode)
+    def query_relation_context(self, q_rel, batch_sampled_edges, edge_batch_idxs, n_query):
+        q_base = self.rel_context_embed(q_rel)
+        if not self.use_rel_context:
+            return q_base
 
-        rel_matrix = self.role_rel_matrix(q_rel)[batch_idxs]
-        rel_matrix = torch.tanh(rel_matrix.view(-1, self.role_apim_dim, self.role_apim_dim))
-        src_trans = torch.bmm(src_mode.unsqueeze(1), rel_matrix).squeeze(1)
-        return torch.sum(src_trans * ans_mode, dim=-1)
+        edge_rel = batch_sampled_edges[:, 1]
+        edge_rel_embed = self.rel_context_embed(edge_rel)
+        edge_query_embed = q_base[edge_batch_idxs]
+        attn_input = self.rel_ctx_query_proj(edge_query_embed) + self.rel_ctx_edge_proj(edge_rel_embed)
+        attn_logit = self.rel_ctx_score(torch.relu(attn_input))
+        attn = scatter_softmax(attn_logit, edge_batch_idxs, n_query)
+        rel_context = scatter(attn * edge_rel_embed, index=edge_batch_idxs, dim=0, dim_size=n_query, reduce='sum')
+
+        gate = torch.sigmoid(self.rel_ctx_gate(torch.cat([q_base, rel_context, q_base * rel_context], dim=-1)))
+        return (1 - gate) * q_base + gate * rel_context
+
+    def eckge_readout(self, node_hidden, q_rel_context, batch_idxs, query_sub_idxs):
+        q_context = q_rel_context[batch_idxs]
+        cand_context = self.eckge_context(torch.cat([node_hidden, q_context, node_hidden * q_context], dim=-1))
+        gate = self.eckge_gate(torch.cat([q_context, cand_context, q_context * cand_context], dim=-1))
+        dynamic_rel = (1 - gate) * q_context + gate * cand_context
+
+        src_hidden = node_hidden[query_sub_idxs][batch_idxs]
+        if self.eckge_decoder == 'transe':
+            return -torch.norm(src_hidden + dynamic_rel - node_hidden, p=1, dim=-1)
+        return torch.sum(src_hidden * dynamic_rel * node_hidden, dim=-1)
 
     def forward(self, q_sub, q_rel, subgraph_data, mode='train'):
         n = len(q_sub)
@@ -170,6 +196,10 @@ class GNN_auto(torch.nn.Module):
         elif self.params.initializer == 'relation':
             hidden[query_sub_idxs, :] = self.query_rela_embed(q_rel)
 
+        q_rel_context = None
+        if self.use_rel_context or self.use_eckge_readout:
+            q_rel_context = self.query_relation_context(q_rel, batch_sampled_edges, edge_batch_idxs, n)
+
         if self.params.concatHidden:
             hidden_list = [hidden]
 
@@ -183,6 +213,7 @@ class GNN_auto(torch.nn.Module):
                 batch_sampled_edges,
                 n_node,
                 shortcut=self.params.shortcut,
+                q_rel_embed_override=q_rel_context if self.use_rel_context else None,
             )
 
             act_signal = (hidden.sum(-1) == 0).detach().int()
@@ -195,23 +226,17 @@ class GNN_auto(torch.nn.Module):
             if self.params.concatHidden:
                 hidden_list.append(hidden)
 
-        role_scores = None
+        node_hidden = hidden
         if self.params.concatHidden:
             hidden = torch.cat(hidden_list, dim=-1)
 
-        if self.params.readout == 'linear':
+        if self.use_eckge_readout:
+            scores = self.eckge_readout(node_hidden, q_rel_context, batch_idxs, query_sub_idxs)
+        elif self.params.readout == 'linear':
             scores = self.W_final(hidden).squeeze(-1)
         elif self.params.readout == 'multiply':
             scores = torch.sum(hidden * hidden[query_sub_idxs][batch_idxs], dim=-1)
 
-        if self.use_role_apim:
-            role_scores = self.role_apim_readout(hidden, q_rel, batch_idxs, query_sub_idxs)
-            scores = scores + self.role_apim_score_weight * role_scores
-
         scores_all = scores.new_zeros((n, self.loader.n_ent))
         scores_all[batch_idxs, abs_idxs] = scores
-        if self.use_role_apim and mode == 'train':
-            role_scores_all = role_scores.new_zeros((n, self.loader.n_ent))
-            role_scores_all[batch_idxs, abs_idxs] = role_scores
-            return scores_all, role_scores_all
         return scores_all

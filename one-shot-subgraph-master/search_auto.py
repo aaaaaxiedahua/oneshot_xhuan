@@ -62,11 +62,11 @@ parser.add_argument(
 )
 parser.add_argument('--use_exp_attn', action='store_true')
 parser.add_argument('--exp_attn_dim', type=int, default=None)
-parser.add_argument('--use_role_apim', action='store_true')
-parser.add_argument('--role_apim_dim', type=int, default=None)
-parser.add_argument('--role_apim_topk', type=int, default=None)
-parser.add_argument('--role_apim_score_weight', type=float, default=None)
-parser.add_argument('--role_apim_loss_weight', type=float, default=None)
+parser.add_argument('--use_rel_context', action='store_true')
+parser.add_argument('--rel_context_dim', type=int, default=None)
+parser.add_argument('--use_eckge_readout', action='store_true')
+parser.add_argument('--eckge_hidden_dim', type=int, default=None)
+parser.add_argument('--eckge_decoder', type=str, choices=['distmult', 'transe'], default=None)
 args = parser.parse_args()
 
 
@@ -171,12 +171,13 @@ if __name__ == '__main__':
     if args.use_exp_attn:
         HPO_search_space['exp_attn_dim'] = ('choice', [8, 16, 32, 64])
         print('==> HPO: added EXP/RUN attention aggregation search space')
-    if args.use_role_apim:
-        HPO_search_space['role_apim_dim'] = ('choice', [16, 32, 64, 128])
-        HPO_search_space['role_apim_topk'] = ('choice', [5, 10, 20, 30])
-        HPO_search_space['role_apim_score_weight'] = ('choice', [0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4])
-        HPO_search_space['role_apim_loss_weight'] = ('choice', [0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4])
-        print('==> HPO: added query-aware role APIM readout search space')
+    if args.use_rel_context:
+        HPO_search_space['rel_context_dim'] = ('choice', [16, 32, 64, 128])
+        print('==> HPO: added query-level relation context search space')
+    if args.use_eckge_readout:
+        HPO_search_space['eckge_hidden_dim'] = ('choice', [16, 32, 64, 128])
+        HPO_search_space['eckge_decoder'] = ('choice', ['distmult', 'transe'])
+        print('==> HPO: added evidence-conditioned KGE readout search space')
 
     def loadSearchLog(file):
         assert os.path.exists(file)
@@ -209,11 +210,11 @@ if __name__ == '__main__':
         args.readout = params['readout']
         args.use_exp_attn = bool(params.get('use_exp_attn', args.use_exp_attn))
         args.exp_attn_dim = params.get('exp_attn_dim', args.exp_attn_dim)
-        args.use_role_apim = bool(params.get('use_role_apim', args.use_role_apim))
-        args.role_apim_dim = params.get('role_apim_dim', args.role_apim_dim)
-        args.role_apim_topk = params.get('role_apim_topk', args.role_apim_topk)
-        args.role_apim_score_weight = params.get('role_apim_score_weight', args.role_apim_score_weight)
-        args.role_apim_loss_weight = params.get('role_apim_loss_weight', args.role_apim_loss_weight)
+        args.use_rel_context = bool(params.get('use_rel_context', args.use_rel_context))
+        args.rel_context_dim = params.get('rel_context_dim', args.rel_context_dim)
+        args.use_eckge_readout = bool(params.get('use_eckge_readout', args.use_eckge_readout))
+        args.eckge_hidden_dim = params.get('eckge_hidden_dim', args.eckge_hidden_dim)
+        args.eckge_decoder = params.get('eckge_decoder', args.eckge_decoder)
 
         args.n_samp_ent = max(1, int(args.topk * loader.n_ent))
         train_sampler.topk = args.n_samp_ent

@@ -51,11 +51,11 @@ parser.add_argument('--lamb', type=float, default=None)
 parser.add_argument('--dropout', type=float, default=None)
 parser.add_argument('--use_exp_attn', action='store_true')
 parser.add_argument('--exp_attn_dim', type=int, default=None)
-parser.add_argument('--use_role_apim', action='store_true')
-parser.add_argument('--role_apim_dim', type=int, default=None)
-parser.add_argument('--role_apim_topk', type=int, default=None)
-parser.add_argument('--role_apim_score_weight', type=float, default=None)
-parser.add_argument('--role_apim_loss_weight', type=float, default=None)
+parser.add_argument('--use_rel_context', action='store_true')
+parser.add_argument('--rel_context_dim', type=int, default=None)
+parser.add_argument('--use_eckge_readout', action='store_true')
+parser.add_argument('--eckge_hidden_dim', type=int, default=None)
+parser.add_argument('--eckge_decoder', type=str, choices=['distmult', 'transe'], default=None)
 args = parser.parse_args()
 
 
@@ -74,18 +74,19 @@ def apply_param_overrides(params, args):
         'lamb': args.lamb,
         'dropout': args.dropout,
         'exp_attn_dim': args.exp_attn_dim,
-        'role_apim_dim': args.role_apim_dim,
-        'role_apim_topk': args.role_apim_topk,
-        'role_apim_score_weight': args.role_apim_score_weight,
-        'role_apim_loss_weight': args.role_apim_loss_weight,
+        'rel_context_dim': args.rel_context_dim,
+        'eckge_hidden_dim': args.eckge_hidden_dim,
+        'eckge_decoder': args.eckge_decoder,
     }
     for key, value in override_map.items():
         if value is not None:
             params[key] = value
     if args.use_exp_attn:
         params['use_exp_attn'] = True
-    if args.use_role_apim:
-        params['use_role_apim'] = True
+    if args.use_rel_context:
+        params['use_rel_context'] = True
+    if args.use_eckge_readout:
+        params['use_eckge_readout'] = True
     return params
 
 
@@ -184,11 +185,11 @@ if __name__ == '__main__':
         args.readout = params['readout']
         args.use_exp_attn = bool(params.get('use_exp_attn', args.use_exp_attn))
         args.exp_attn_dim = params.get('exp_attn_dim', args.exp_attn_dim)
-        args.use_role_apim = bool(params.get('use_role_apim', args.use_role_apim))
-        args.role_apim_dim = params.get('role_apim_dim', args.role_apim_dim)
-        args.role_apim_topk = params.get('role_apim_topk', args.role_apim_topk)
-        args.role_apim_score_weight = params.get('role_apim_score_weight', args.role_apim_score_weight)
-        args.role_apim_loss_weight = params.get('role_apim_loss_weight', args.role_apim_loss_weight)
+        args.use_rel_context = bool(params.get('use_rel_context', args.use_rel_context))
+        args.rel_context_dim = params.get('rel_context_dim', args.rel_context_dim)
+        args.use_eckge_readout = bool(params.get('use_eckge_readout', args.use_eckge_readout))
+        args.eckge_hidden_dim = params.get('eckge_hidden_dim', args.eckge_hidden_dim)
+        args.eckge_decoder = params.get('eckge_decoder', args.eckge_decoder)
 
         model = BaseModel(args, loaders=(loader, val_loader, test_loader), samplers=(train_sampler, test_sampler))
 
