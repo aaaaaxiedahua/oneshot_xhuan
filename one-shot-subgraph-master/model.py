@@ -18,6 +18,12 @@ class GNNLayer(torch.nn.Module):
         attn_dim,
         n_rel,
         act=lambda x: x,
+        use_hier_attn=False,
+        use_high_order=False,
+        high_hidden_dim=32,
+        high_topk=8,
+        high_dropout=0.0,
+        high_lambda=0.7,
     ):
         super(GNNLayer, self).__init__()
         self.n_rel = n_rel
@@ -25,6 +31,10 @@ class GNNLayer(torch.nn.Module):
         self.out_dim = out_dim
         self.attn_dim = attn_dim
         self.act = act
+        self.use_hier_attn = use_hier_attn
+        self.use_high_order = use_high_order
+        self.high_topk = high_topk
+        self.high_lambda = high_lambda
 
         self.rela_embed = nn.Embedding(2 * n_rel + 1, in_dim)
         self.Ws_attn = nn.Linear(in_dim, attn_dim, bias=False)
@@ -32,6 +42,87 @@ class GNNLayer(torch.nn.Module):
         self.Wqr_attn = nn.Linear(in_dim, attn_dim)
         self.w_alpha = nn.Linear(attn_dim, 1)
         self.W_h = nn.Linear(in_dim, out_dim, bias=False)
+
+        if self.use_hier_attn:
+            self.Wo_rel_attn = nn.Linear(in_dim, attn_dim, bias=False)
+            self.Wr_rel_attn = nn.Linear(in_dim, attn_dim, bias=False)
+            self.Wq_rel_attn = nn.Linear(in_dim, attn_dim)
+            self.w_rel_alpha = nn.Linear(attn_dim, 1)
+            self.Wx_ent_attn = nn.Linear(in_dim, attn_dim, bias=False)
+            self.Wr_ent_attn = nn.Linear(in_dim, attn_dim, bias=False)
+            self.Wq_ent_attn = nn.Linear(in_dim, attn_dim)
+            self.w_ent_alpha = nn.Linear(attn_dim, 1)
+
+        if self.use_high_order:
+            self.high_first = nn.Sequential(
+                nn.Linear(in_dim * 3, high_hidden_dim),
+                nn.ReLU(),
+                nn.Dropout(high_dropout),
+                nn.Linear(high_hidden_dim, in_dim, bias=False),
+            )
+            self.high_second = nn.Sequential(
+                nn.Linear(in_dim * 4, high_hidden_dim),
+                nn.ReLU(),
+                nn.Dropout(high_dropout),
+                nn.Linear(high_hidden_dim, in_dim, bias=False),
+            )
+
+    @staticmethod
+    def grouped_topk_mask(score, group_index, k):
+        if k <= 0 or score.numel() == 0:
+            return torch.ones_like(score, dtype=torch.bool)
+        order_score = torch.argsort(score, descending=True)
+        sorted_group_by_score = group_index[order_score]
+        order_group = torch.argsort(sorted_group_by_score)
+        order = order_score[order_group]
+        sorted_group = group_index[order]
+        pos = torch.arange(score.numel(), device=score.device)
+        is_new = torch.ones_like(sorted_group, dtype=torch.bool)
+        is_new[1:] = sorted_group[1:] != sorted_group[:-1]
+        start_pos = torch.zeros_like(pos)
+        start_pos[is_new] = pos[is_new]
+        start_pos = torch.cummax(start_pos, dim=0).values
+        rank = pos - start_pos
+        keep = torch.zeros_like(score, dtype=torch.bool)
+        keep[order[rank < k]] = True
+        return keep
+
+    def hierarchical_attention(self, hs, hr, h_qr, hidden_obj, rel, obj, n_node):
+        n_relation = 2 * self.n_rel + 1
+        group_key = obj * n_relation + rel
+        unique_group, inverse = torch.unique(group_key, sorted=False, return_inverse=True)
+        n_group = unique_group.shape[0]
+
+        rel_input = self.Wo_rel_attn(hidden_obj) + self.Wr_rel_attn(hr) + self.Wq_rel_attn(h_qr)
+        rel_logit_edge = self.w_rel_alpha(torch.tanh(rel_input)).squeeze(-1)
+        rel_logit_group = scatter(rel_logit_edge, index=inverse, dim=0, dim_size=n_group, reduce='max')
+        group_obj = scatter(obj, index=inverse, dim=0, dim_size=n_group, reduce='max')
+        rel_alpha_group = scatter_softmax(rel_logit_group.unsqueeze(-1), group_obj, n_node).squeeze(-1)
+
+        ent_input = self.Wx_ent_attn(hs) + self.Wr_ent_attn(hr) + self.Wq_ent_attn(h_qr)
+        ent_logit = self.w_ent_alpha(torch.tanh(ent_input))
+        ent_alpha = scatter_softmax(ent_logit, inverse, n_group)
+        return rel_alpha_group[inverse].unsqueeze(-1) * ent_alpha
+
+    def high_order_update(self, hidden, hs, hr, h_qr, rel, sub, obj, alpha, pair_hidden, n_node):
+        alpha_score = alpha.squeeze(-1).detach()
+        keep_first = self.grouped_topk_mask(alpha_score, obj, self.high_topk)
+        first_input = torch.cat([hs, hr, h_qr], dim=-1)
+        first_msg = self.high_first(first_input) * alpha * keep_first.unsqueeze(-1).float()
+        high_mid = scatter(first_msg, index=obj, dim=0, dim_size=n_node, reduce='sum')
+
+        keep_second = self.grouped_topk_mask(alpha_score, obj, self.high_topk)
+        valid_second = keep_second & (torch.norm(high_mid[sub], p=2, dim=-1) > 0)
+        second_input = torch.cat([high_mid[sub], hidden[sub], hr, h_qr], dim=-1)
+        second_msg = self.high_second(second_input) * alpha * valid_second.unsqueeze(-1).float()
+        high_agg = scatter(second_msg, index=obj, dim=0, dim_size=n_node, reduce='sum')
+        high_hidden = self.act(self.W_h(high_agg))
+
+        has_high = scatter(valid_second.float(), index=obj, dim=0, dim_size=n_node, reduce='sum') > 0
+        deviation = torch.norm(high_hidden - pair_hidden, p=2, dim=-1, keepdim=True)
+        beta = self.high_lambda / (self.high_lambda + deviation.clamp_min(1e-12))
+        beta = beta * has_high.unsqueeze(-1).float()
+        return (1 - beta) * pair_hidden + beta * high_hidden
 
     def forward(
         self,
@@ -58,9 +149,12 @@ class GNNLayer(torch.nn.Module):
 
         raw_message = hs * hr
 
-        alpha_input = self.Ws_attn(hs) + self.Wr_attn(hr) + self.Wqr_attn(h_qr)
-        alpha_logit = self.w_alpha(torch.relu(alpha_input))
-        alpha = torch.sigmoid(alpha_logit)
+        if self.use_hier_attn:
+            alpha = self.hierarchical_attention(hs, hr, h_qr, hidden[obj], rel, obj, n_node)
+        else:
+            alpha_input = self.Ws_attn(hs) + self.Wr_attn(hr) + self.Wqr_attn(h_qr)
+            alpha_logit = self.w_alpha(torch.relu(alpha_input))
+            alpha = torch.sigmoid(alpha_logit)
 
         message = alpha * raw_message
         message_agg = scatter(message, index=obj, dim=0, dim_size=n_node, reduce='sum')
@@ -68,6 +162,9 @@ class GNNLayer(torch.nn.Module):
 
         if shortcut:
             hidden_new = hidden_new + hidden
+
+        if self.use_high_order:
+            hidden_new = self.high_order_update(hidden, hs, hr, h_qr, rel, sub, obj, alpha, hidden_new, n_node)
 
         return hidden_new
 
@@ -82,16 +179,16 @@ class GNN_auto(torch.nn.Module):
         self.n_rel = params.n_rel
         self.n_ent = params.n_ent
         self.loader = loader
-        self.use_layer_expert = bool(getattr(params, 'use_layer_expert', False))
-        self.use_evidence_pruning = bool(getattr(params, 'use_evidence_pruning', False))
-        layer_expert_dim = getattr(params, 'layer_expert_dim', None)
-        pruning_expert_dim = getattr(params, 'pruning_expert_dim', None)
-        layer_temperature = getattr(params, 'layer_temperature', None)
-        pruning_temperature = getattr(params, 'pruning_temperature', None)
-        self.layer_expert_dim = int(layer_expert_dim) if layer_expert_dim is not None else 32
-        self.pruning_expert_dim = int(pruning_expert_dim) if pruning_expert_dim is not None else 32
-        self.layer_temperature = float(layer_temperature) if layer_temperature is not None else 1.0
-        self.pruning_temperature = float(pruning_temperature) if pruning_temperature is not None else 1.0
+        self.use_high_order = bool(getattr(params, 'use_high_order', False))
+        self.use_hier_attn = bool(getattr(params, 'use_hier_attn', False))
+        high_hidden_dim = getattr(params, 'high_hidden_dim', None)
+        high_topk = getattr(params, 'high_topk', None)
+        high_dropout = getattr(params, 'high_dropout', None)
+        high_lambda = getattr(params, 'high_lambda', None)
+        self.high_hidden_dim = int(high_hidden_dim) if high_hidden_dim is not None else 32
+        self.high_topk = int(high_topk) if high_topk is not None else 8
+        self.high_dropout = float(high_dropout) if high_dropout is not None else 0.05
+        self.high_lambda = float(high_lambda) if high_lambda is not None else 0.7
         self.readout_dim = self.hidden_dim * (self.n_layer + 1) if params.concatHidden else self.hidden_dim
 
         acts = {'relu': nn.ReLU(), 'tanh': torch.tanh, 'idd': lambda x: x}
@@ -106,6 +203,12 @@ class GNN_auto(torch.nn.Module):
                     self.attn_dim,
                     self.n_rel,
                     act=act,
+                    use_hier_attn=self.use_hier_attn,
+                    use_high_order=self.use_high_order,
+                    high_hidden_dim=self.high_hidden_dim,
+                    high_topk=self.high_topk,
+                    high_dropout=self.high_dropout,
+                    high_lambda=self.high_lambda,
                 )
             )
         self.gnn_layers = nn.ModuleList(self.gnn_layers)
@@ -115,41 +218,10 @@ class GNN_auto(torch.nn.Module):
         if self.params.initializer == 'relation':
             self.query_rela_embed = nn.Embedding(2 * self.n_rel + 1, self.hidden_dim)
         if self.params.readout == 'linear':
-            if self.params.concatHidden and not self.use_layer_expert:
+            if self.params.concatHidden:
                 self.W_final = nn.Linear(self.hidden_dim * (self.n_layer + 1), 1, bias=False)
             else:
                 self.W_final = nn.Linear(self.hidden_dim, 1, bias=False)
-
-        if self.use_layer_expert or self.use_evidence_pruning:
-            self.expert_query_embed = nn.Embedding(2 * self.n_rel + 1, self.hidden_dim)
-
-        if self.use_layer_expert:
-            self.layer_context = nn.Sequential(
-                nn.Linear(self.hidden_dim * 3, self.layer_expert_dim),
-                nn.Tanh(),
-            )
-            self.layer_experts = nn.Parameter(torch.empty(self.n_layer + 1, self.layer_expert_dim))
-            nn.init.xavier_uniform_(self.layer_experts)
-
-        if self.use_evidence_pruning:
-            self.pruning_context = nn.Sequential(
-                nn.Linear(self.hidden_dim * 3, self.pruning_expert_dim),
-                nn.Tanh(),
-            )
-            self.pruning_beta = nn.Sequential(
-                nn.Linear(self.pruning_expert_dim + self.hidden_dim, self.pruning_expert_dim),
-                nn.ReLU(),
-                nn.Linear(self.pruning_expert_dim, 3),
-            )
-            self.pruning_score = nn.Linear(self.hidden_dim, 1)
-
-    @staticmethod
-    def cv_squared(usage):
-        usage = usage.float()
-        return (usage.std(unbiased=False) / usage.mean().clamp_min(1e-12)).pow(2)
-
-    def build_expert_context(self, query_hidden, q_embed, context_layer):
-        return context_layer(torch.cat([query_hidden, q_embed, query_hidden * q_embed], dim=-1))
 
     def forward(self, q_sub, q_rel, subgraph_data, mode='train'):
         n = len(q_sub)
@@ -164,23 +236,10 @@ class GNN_auto(torch.nn.Module):
         elif self.params.initializer == 'relation':
             hidden[query_sub_idxs, :] = self.query_rela_embed(q_rel)
 
-        expert_balance_loss = hidden.new_tensor(0.0)
-        query_expert_embed = None
-        layer_context = None
-        pruning_context = None
-        query_initial_hidden = hidden[query_sub_idxs]
-        if self.use_layer_expert or self.use_evidence_pruning:
-            query_expert_embed = self.expert_query_embed(q_rel)
-        if self.use_layer_expert:
-            layer_context = self.build_expert_context(query_initial_hidden, query_expert_embed, self.layer_context)
-        if self.use_evidence_pruning:
-            pruning_context = self.build_expert_context(query_initial_hidden, query_expert_embed, self.pruning_context)
-
-        if self.params.concatHidden or self.use_layer_expert:
+        if self.params.concatHidden:
             hidden_list = [hidden]
 
         for i in range(self.n_layer):
-            prev_hidden = hidden
             hidden_new = self.gnn_layers[i](
                 q_sub,
                 q_rel,
@@ -192,24 +251,6 @@ class GNN_auto(torch.nn.Module):
                 shortcut=self.params.shortcut,
             )
 
-            if self.use_evidence_pruning:
-                q_context = pruning_context[batch_idxs]
-                score_evidence = self.pruning_score(prev_hidden).squeeze(-1)
-                message_evidence = torch.norm(hidden_new, p=2, dim=-1)
-                relation_evidence = torch.nn.functional.cosine_similarity(
-                    prev_hidden,
-                    query_expert_embed[batch_idxs],
-                    dim=-1,
-                    eps=1e-8,
-                )
-                expert_logits = self.pruning_beta(torch.cat([q_context, prev_hidden], dim=-1))
-                expert_weights = torch.softmax(expert_logits / max(self.pruning_temperature, 1e-6), dim=-1)
-                evidence = torch.stack([score_evidence, message_evidence, relation_evidence], dim=-1)
-                pruning_gate = torch.sigmoid(torch.sum(expert_weights * evidence, dim=-1)).unsqueeze(-1)
-                hidden_new = pruning_gate * hidden_new + (1 - pruning_gate) * prev_hidden
-                expert_usage = expert_weights.sum(dim=0)
-                expert_balance_loss = expert_balance_loss + self.cv_squared(expert_usage)
-
             act_signal = (hidden_new.sum(-1) == 0).detach().int()
             hidden = self.dropout(hidden_new)
             hidden, h0 = self.gate(hidden.unsqueeze(0), h0)
@@ -217,17 +258,10 @@ class GNN_auto(torch.nn.Module):
             hidden = hidden * (1 - act_signal).unsqueeze(-1)
             h0 = h0 * (1 - act_signal).unsqueeze(-1).unsqueeze(0)
 
-            if self.params.concatHidden or self.use_layer_expert:
+            if self.params.concatHidden:
                 hidden_list.append(hidden)
 
-        if self.use_layer_expert:
-            layer_logits = torch.matmul(layer_context, self.layer_experts.t())
-            layer_weights = torch.softmax(layer_logits / max(self.layer_temperature, 1e-6), dim=-1)
-            hidden_stack = torch.stack(hidden_list, dim=1)
-            node_layer_weights = layer_weights[batch_idxs]
-            hidden = torch.sum(node_layer_weights.unsqueeze(-1) * hidden_stack, dim=1)
-            expert_balance_loss = expert_balance_loss + self.cv_squared(layer_weights.sum(dim=0))
-        elif self.params.concatHidden:
+        if self.params.concatHidden:
             hidden = torch.cat(hidden_list, dim=-1)
 
         if self.params.readout == 'linear':
@@ -237,6 +271,4 @@ class GNN_auto(torch.nn.Module):
 
         scores_all = scores.new_zeros((n, self.loader.n_ent))
         scores_all[batch_idxs, abs_idxs] = scores
-        if mode == 'train' and (self.use_layer_expert or self.use_evidence_pruning):
-            return scores_all, expert_balance_loss
         return scores_all

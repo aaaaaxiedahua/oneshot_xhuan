@@ -40,7 +40,6 @@ class BaseModel(object):
         self.smooth = 1e-5
         self.t_time = 0
         self.mean_rank_dict = {}
-        self.expert_balance_weight = float(getattr(args, 'expert_balance_weight', 0.0) or 0.0)
 
     def _build_optimizer(self):
         return Adam(self.model.parameters(), lr=self.args.lr, weight_decay=self.args.lamb)
@@ -98,16 +97,10 @@ class BaseModel(object):
             
             # forward
             self.optimizer.zero_grad(set_to_none=True)
-            model_out = self.model(subs, rels, subgraph_data)
-            if isinstance(model_out, tuple):
-                scores, expert_balance_loss = model_out
-            else:
-                scores, expert_balance_loss = model_out, None
+            scores = self.model(subs, rels, subgraph_data)
             
             # loss calculation
             loss, pos_scores = self.ranking_loss(scores, objs)
-            if expert_balance_loss is not None and self.expert_balance_weight > 0:
-                loss = loss + self.expert_balance_weight * expert_balance_loss
 
             # loss backward
             loss.backward()

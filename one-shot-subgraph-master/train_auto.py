@@ -49,13 +49,12 @@ parser.add_argument('--readout', type=str, choices=['linear', 'multiply'], defau
 parser.add_argument('--decay_rate', type=float, default=None)
 parser.add_argument('--lamb', type=float, default=None)
 parser.add_argument('--dropout', type=float, default=None)
-parser.add_argument('--use_layer_expert', action='store_true')
-parser.add_argument('--layer_expert_dim', type=int, default=None)
-parser.add_argument('--layer_temperature', type=float, default=None)
-parser.add_argument('--use_evidence_pruning', action='store_true')
-parser.add_argument('--pruning_expert_dim', type=int, default=None)
-parser.add_argument('--pruning_temperature', type=float, default=None)
-parser.add_argument('--expert_balance_weight', type=float, default=None)
+parser.add_argument('--use_high_order', action='store_true')
+parser.add_argument('--high_hidden_dim', type=int, default=None)
+parser.add_argument('--high_topk', type=int, default=None)
+parser.add_argument('--high_dropout', type=float, default=None)
+parser.add_argument('--high_lambda', type=float, default=None)
+parser.add_argument('--use_hier_attn', action='store_true')
 args = parser.parse_args()
 
 
@@ -73,19 +72,18 @@ def apply_param_overrides(params, args):
         'decay_rate': args.decay_rate,
         'lamb': args.lamb,
         'dropout': args.dropout,
-        'layer_expert_dim': args.layer_expert_dim,
-        'layer_temperature': args.layer_temperature,
-        'pruning_expert_dim': args.pruning_expert_dim,
-        'pruning_temperature': args.pruning_temperature,
-        'expert_balance_weight': args.expert_balance_weight,
+        'high_hidden_dim': args.high_hidden_dim,
+        'high_topk': args.high_topk,
+        'high_dropout': args.high_dropout,
+        'high_lambda': args.high_lambda,
     }
     for key, value in override_map.items():
         if value is not None:
             params[key] = value
-    if args.use_layer_expert:
-        params['use_layer_expert'] = True
-    if args.use_evidence_pruning:
-        params['use_evidence_pruning'] = True
+    if args.use_high_order:
+        params['use_high_order'] = True
+    if args.use_hier_attn:
+        params['use_hier_attn'] = True
     return params
 
 
@@ -182,13 +180,12 @@ if __name__ == '__main__':
         args.concatHidden = params['concatHidden']
         args.shortcut = params['shortcut']
         args.readout = params['readout']
-        args.use_layer_expert = bool(params.get('use_layer_expert', args.use_layer_expert))
-        args.layer_expert_dim = params.get('layer_expert_dim', args.layer_expert_dim)
-        args.layer_temperature = params.get('layer_temperature', args.layer_temperature)
-        args.use_evidence_pruning = bool(params.get('use_evidence_pruning', args.use_evidence_pruning))
-        args.pruning_expert_dim = params.get('pruning_expert_dim', args.pruning_expert_dim)
-        args.pruning_temperature = params.get('pruning_temperature', args.pruning_temperature)
-        args.expert_balance_weight = params.get('expert_balance_weight', args.expert_balance_weight)
+        args.use_high_order = bool(params.get('use_high_order', args.use_high_order))
+        args.high_hidden_dim = params.get('high_hidden_dim', args.high_hidden_dim)
+        args.high_topk = params.get('high_topk', args.high_topk)
+        args.high_dropout = params.get('high_dropout', args.high_dropout)
+        args.high_lambda = params.get('high_lambda', args.high_lambda)
+        args.use_hier_attn = bool(params.get('use_hier_attn', args.use_hier_attn))
 
         model = BaseModel(args, loaders=(loader, val_loader, test_loader), samplers=(train_sampler, test_sampler))
 

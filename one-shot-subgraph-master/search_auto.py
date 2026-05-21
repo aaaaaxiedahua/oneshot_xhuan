@@ -60,13 +60,12 @@ parser.add_argument(
     default='',
     help='Optional Optuna start config. Accepts either a JSON string or a path to a JSON file.',
 )
-parser.add_argument('--use_layer_expert', action='store_true')
-parser.add_argument('--layer_expert_dim', type=int, default=None)
-parser.add_argument('--layer_temperature', type=float, default=None)
-parser.add_argument('--use_evidence_pruning', action='store_true')
-parser.add_argument('--pruning_expert_dim', type=int, default=None)
-parser.add_argument('--pruning_temperature', type=float, default=None)
-parser.add_argument('--expert_balance_weight', type=float, default=None)
+parser.add_argument('--use_high_order', action='store_true')
+parser.add_argument('--high_hidden_dim', type=int, default=None)
+parser.add_argument('--high_topk', type=int, default=None)
+parser.add_argument('--high_dropout', type=float, default=None)
+parser.add_argument('--high_lambda', type=float, default=None)
+parser.add_argument('--use_hier_attn', action='store_true')
 args = parser.parse_args()
 
 
@@ -168,17 +167,14 @@ if __name__ == '__main__':
     test_loader.addSampler(test_sampler)
     HPO_save_path = f'./results/{dataset}/search_log.pkl'
 
-    if args.use_layer_expert:
-        HPO_search_space['layer_expert_dim'] = ('choice', [16, 32, 64, 128])
-        HPO_search_space['layer_temperature'] = ('choice', [0.5, 1.0, 1.5, 2.0, 2.5])
-        print('==> HPO: added query-adaptive layer expert search space')
-    if args.use_evidence_pruning:
-        HPO_search_space['pruning_expert_dim'] = ('choice', [16, 32, 64, 128])
-        HPO_search_space['pruning_temperature'] = ('choice', [0.5, 1.0, 1.5, 2.0, 2.5])
-        print('==> HPO: added query-adaptive evidence pruning search space')
-    if args.use_layer_expert or args.use_evidence_pruning:
-        HPO_search_space['expert_balance_weight'] = ('choice', [0.0001, 0.0005, 0.001, 0.005, 0.01])
-        print('==> HPO: added expert balance loss search space')
+    if args.use_high_order:
+        HPO_search_space['high_hidden_dim'] = ('choice', [16, 32, 64, 128])
+        HPO_search_space['high_topk'] = ('choice', [4, 8, 16, 32])
+        HPO_search_space['high_dropout'] = ('uniform', (0.0, 0.2))
+        HPO_search_space['high_lambda'] = ('choice', [0.5, 0.6, 0.7, 0.8])
+        print('==> HPO: added implicit high-order evidence search space')
+    if args.use_hier_attn:
+        print('==> HPO: hierarchical relation-entity attention enabled (uses attn_dim)')
 
     def loadSearchLog(file):
         assert os.path.exists(file)
@@ -209,13 +205,12 @@ if __name__ == '__main__':
         args.concatHidden = params['concatHidden']
         args.shortcut = params['shortcut']
         args.readout = params['readout']
-        args.use_layer_expert = bool(params.get('use_layer_expert', args.use_layer_expert))
-        args.layer_expert_dim = params.get('layer_expert_dim', args.layer_expert_dim)
-        args.layer_temperature = params.get('layer_temperature', args.layer_temperature)
-        args.use_evidence_pruning = bool(params.get('use_evidence_pruning', args.use_evidence_pruning))
-        args.pruning_expert_dim = params.get('pruning_expert_dim', args.pruning_expert_dim)
-        args.pruning_temperature = params.get('pruning_temperature', args.pruning_temperature)
-        args.expert_balance_weight = params.get('expert_balance_weight', args.expert_balance_weight)
+        args.use_high_order = bool(params.get('use_high_order', args.use_high_order))
+        args.high_hidden_dim = params.get('high_hidden_dim', args.high_hidden_dim)
+        args.high_topk = params.get('high_topk', args.high_topk)
+        args.high_dropout = params.get('high_dropout', args.high_dropout)
+        args.high_lambda = params.get('high_lambda', args.high_lambda)
+        args.use_hier_attn = bool(params.get('use_hier_attn', args.use_hier_attn))
 
         args.n_samp_ent = max(1, int(args.topk * loader.n_ent))
         train_sampler.topk = args.n_samp_ent
