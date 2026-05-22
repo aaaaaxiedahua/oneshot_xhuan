@@ -60,12 +60,11 @@ parser.add_argument(
     default='',
     help='Optional Optuna start config. Accepts either a JSON string or a path to a JSON file.',
 )
-parser.add_argument('--use_high_order', action='store_true')
-parser.add_argument('--high_hidden_dim', type=int, default=None)
-parser.add_argument('--high_topk', type=int, default=None)
-parser.add_argument('--high_dropout', type=float, default=None)
-parser.add_argument('--high_lambda', type=float, default=None)
-parser.add_argument('--use_hier_attn', action='store_true')
+parser.add_argument('--use_qmgf', action='store_true')
+parser.add_argument('--qmgf_hidden_dim', type=int, default=None)
+parser.add_argument('--qmgf_temperature', type=float, default=None)
+parser.add_argument('--use_ltsb', action='store_true')
+parser.add_argument('--type_bias_weight', type=float, default=None)
 args = parser.parse_args()
 
 
@@ -167,14 +166,14 @@ if __name__ == '__main__':
     test_loader.addSampler(test_sampler)
     HPO_save_path = f'./results/{dataset}/search_log.pkl'
 
-    if args.use_high_order:
-        HPO_search_space['high_hidden_dim'] = ('choice', [16, 32, 64, 128])
-        HPO_search_space['high_topk'] = ('choice', [4, 8, 16, 32])
-        HPO_search_space['high_dropout'] = ('uniform', (0.0, 0.2))
-        HPO_search_space['high_lambda'] = ('choice', [0.5, 0.6, 0.7, 0.8])
-        print('==> HPO: added implicit high-order evidence search space')
-    if args.use_hier_attn:
-        print('==> HPO: hierarchical relation-entity attention enabled (uses attn_dim)')
+    if args.use_qmgf:
+        HPO_search_space['concatHidden'] = ('choice', [False])
+        HPO_search_space['qmgf_hidden_dim'] = ('choice', [16, 32, 64, 128])
+        HPO_search_space['qmgf_temperature'] = ('choice', [0.5, 1.0, 1.5, 2.0])
+        print('==> HPO: added query-adaptive multi-granularity fusion search space')
+    if args.use_ltsb:
+        HPO_search_space['type_bias_weight'] = ('choice', [0.05, 0.1, 0.2, 0.3])
+        print('==> HPO: added latent type-aware score bias search space')
 
     def loadSearchLog(file):
         assert os.path.exists(file)
@@ -205,12 +204,13 @@ if __name__ == '__main__':
         args.concatHidden = params['concatHidden']
         args.shortcut = params['shortcut']
         args.readout = params['readout']
-        args.use_high_order = bool(params.get('use_high_order', args.use_high_order))
-        args.high_hidden_dim = params.get('high_hidden_dim', args.high_hidden_dim)
-        args.high_topk = params.get('high_topk', args.high_topk)
-        args.high_dropout = params.get('high_dropout', args.high_dropout)
-        args.high_lambda = params.get('high_lambda', args.high_lambda)
-        args.use_hier_attn = bool(params.get('use_hier_attn', args.use_hier_attn))
+        args.use_qmgf = bool(params.get('use_qmgf', args.use_qmgf))
+        if args.use_qmgf:
+            args.concatHidden = False
+        args.qmgf_hidden_dim = params.get('qmgf_hidden_dim', args.qmgf_hidden_dim)
+        args.qmgf_temperature = params.get('qmgf_temperature', args.qmgf_temperature)
+        args.use_ltsb = bool(params.get('use_ltsb', args.use_ltsb))
+        args.type_bias_weight = params.get('type_bias_weight', args.type_bias_weight)
 
         args.n_samp_ent = max(1, int(args.topk * loader.n_ent))
         train_sampler.topk = args.n_samp_ent
